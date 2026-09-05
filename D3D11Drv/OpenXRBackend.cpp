@@ -9,11 +9,18 @@
 
 // OpenXR headers are vendored (External/openxr/include). We late-bind the
 // loader, so no openxr_loader.lib at link time and mono never touches it.
+// The 32-bit build compiles with 4-byte packing (UE1 binary compat, see
+// OBJECT_ALIGNMENT), but the OpenXR ABI is naturally aligned: a 64-bit member
+// that lands on a non-8-aligned offset (XrViewLocateInfo::displayTime/space,
+// XrSwapchainSubImage::swapchain) would then sit 4 bytes below where the
+// runtime reads it. Force natural alignment like Precomp.h does for Win32/D3D.
+#pragma pack(push, 8)
 #define XR_NO_PROTOTYPES
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#pragma pack(pop)
 
 namespace
 {
