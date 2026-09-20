@@ -365,16 +365,24 @@ UBOOL UVulkanRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL F
 		FullscreenState.Enabled = false;
 	}
 
-	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), NewX, NewY, NewColorBytes))
-		return 0;
-
-	if (Fullscreen && !FullscreenState.Enabled) // Entering fullscreen
+	// Save the windowed state before resizing the viewport, not after: the
+	// engine's own fullscreen handling moves and restyles the window as part of
+	// the resize, so reading it afterwards saves the fullscreen geometry as the
+	// one to go back to - and the window then never comes back down, leaving the
+	// game rendering a small viewport into a still fullscreen sized window.
+	const bool enteringFullscreen = Fullscreen && !FullscreenState.Enabled;
+	if (enteringFullscreen)
 	{
-		// Save old state
 		GetWindowRect((HWND)Viewport->GetWindow(), &FullscreenState.WindowPos);
 		FullscreenState.Style = GetWindowLong((HWND)Viewport->GetWindow(), GWL_STYLE);
 		FullscreenState.ExStyle = GetWindowLong((HWND)Viewport->GetWindow(), GWL_EXSTYLE);
+	}
 
+	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), NewX, NewY, NewColorBytes))
+		return 0;
+
+	if (enteringFullscreen)
+	{
 		// Find primary monitor resolution
 		HDC screenDC = GetDC(0);
 		int screenWidth = GetDeviceCaps(screenDC, HORZRES);
@@ -794,7 +802,13 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 		SDLVulkanGetDrawableSizeCompat(window, &windowWidth, &windowHeight);
 #endif
 
-		SubmitAndWait(Blit ? true : false, windowWidth, windowHeight, Viewport->IsFullscreen());
+		// Mid transition between windowed and fullscreen the window can have no
+		// client area at all. Presenting to that builds a zero sized swap chain
+		// and divides by zero working out the letterbox, so sit the frame out
+		// and present again once the window has a size.
+		bool canPresent = Blit && windowWidth > 0 && windowHeight > 0 && Viewport->SizeX > 0 && Viewport->SizeY > 0;
+
+		SubmitAndWait(canPresent, windowWidth, windowHeight, Viewport->IsFullscreen());
 
 		Batch.Pipeline = nullptr;
 
@@ -850,6 +864,11 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 	}
 	catch (std::exception& e)
 	{
+		// Whatever went wrong, this frame is over: leaving IsLocked set would
+		// have the next Flush try to end a render pass that was never begun,
+		// turning one bad frame into a permanently black screen.
+		IsLocked = false;
+
 		// TCHAR is wchar_t in the 469 SDK but char in the Deus Ex one.
 		static std::basic_string<TCHAR> err;
 		err = appFromAnsi(e.what());
