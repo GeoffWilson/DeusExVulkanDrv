@@ -1815,8 +1815,20 @@ void UVulkanRenderDevice::SetSceneNode(FSceneNode* Frame)
 
 	CurrentFrame = Frame;
 	Aspect = Frame->FY / Frame->FX;
+
+	// The engine projects a point as Point.X * Frame->Proj.Z / Point.Z + FX15
+	// (see FVertex::Project), so Frame->Proj.Z carries the field of view this
+	// scene node is actually being rendered with. Taking it from the player
+	// instead only agrees while the player is the camera: Deus Ex shoots its
+	// cinematics through a camera with its own FOV, and the mismatch scales the
+	// whole scene, pushing the actors out of frame. Fall back to the player's
+	// FOV where the engine gives no usable projection, such as an ortho
+	// viewport in the editor.
 	APlayerPawn* ViewActor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
-	RProjZ = (float)appTan(radians(ViewActor ? ViewActor->FovAngle : 90.0f) * 0.5);
+	if (Frame->Proj.Z > 0.0f)
+		RProjZ = Frame->FX / (2.0f * Frame->Proj.Z);
+	else
+		RProjZ = (float)appTan(radians(ViewActor ? ViewActor->FovAngle : 90.0f) * 0.5);
 	RFX2 = 2.0f * RProjZ / Frame->FX;
 	RFY2 = 2.0f * RProjZ * Aspect / Frame->FY;
 
