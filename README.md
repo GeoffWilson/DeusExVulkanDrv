@@ -249,9 +249,18 @@ different project, not a feature port. Performance work is equally moot: the
 game is bound by its own engine long before the GPU, which is why it will run
 at several hundred frames per second uncapped.
 
-That leaves one idea not taken up yet:
+That leaves two ideas not taken up yet:
 
-1. **sRGB textures and linear lighting**, as XOpenGL's `UsesRGBTextures` does.
+1. **Recovering from a lost device.** `VK_ERROR_DEVICE_LOST` currently takes the
+   process with it - hard enough that the log loses its tail, so there is not
+   even a line saying what happened. It arrives from a driver timeout, a GPU
+   reset, or memory pressure severe enough that an eviction cannot be satisfied,
+   none of which are the game doing anything wrong. Recovering means tearing the
+   device down and rebuilding everything hanging off it - swap chain, render
+   passes, pipelines, samplers, the whole texture cache - and the engine has to
+   be told to precache its textures again afterwards. Worth doing properly or
+   not at all; at the very least it should say what happened before it goes.
+2. **sRGB textures and linear lighting**, as XOpenGL's `UsesRGBTextures` does.
    This changes how the game looks rather than sharpening it, so it belongs
    behind a setting that defaults to off.
 
