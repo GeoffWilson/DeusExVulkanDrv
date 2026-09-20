@@ -48,8 +48,11 @@ CommandBufferManager::~CommandBufferManager()
 void CommandBufferManager::BeginFrame()
 {
 	VkFence currentFence = RenderFinishedFences[CurrentFrameIndex]->fence;
-	vkWaitForFences(renderer->Device.get()->device, 1, &currentFence, VK_TRUE, std::numeric_limits<uint64_t>::max());
-	vkResetFences(renderer->Device.get()->device, 1, &currentFence);
+	// An ignored result here is how a lost device turns into a hang: the fence
+	// this frame is waiting on will never be signalled, and without the check
+	// nothing ever says why.
+	CheckVulkanError(vkWaitForFences(renderer->Device.get()->device, 1, &currentFence, VK_TRUE, std::numeric_limits<uint64_t>::max()), "vkWaitForFences failed");
+	CheckVulkanError(vkResetFences(renderer->Device.get()->device, 1, &currentFence), "vkResetFences failed");
 
 	// Safely clear old Vulkan objects now that the GPU is 100% done with this frame index
 	FrameDeleteLists[CurrentFrameIndex] = std::make_unique<DeleteList>();
@@ -75,8 +78,8 @@ void CommandBufferManager::WaitForTransfer()
 		QueueSubmit()
 			.AddCommandBuffer(TransferCommands.get())
 			.Execute(renderer->Device.get(), renderer->Device.get()->GraphicsQueue, RenderFinishedFence.get());
-		vkWaitForFences(renderer->Device.get()->device, 1, &RenderFinishedFence->fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
-		vkResetFences(renderer->Device.get()->device, 1, &RenderFinishedFence->fence);
+		CheckVulkanError(vkWaitForFences(renderer->Device.get()->device, 1, &RenderFinishedFence->fence, VK_TRUE, std::numeric_limits<uint64_t>::max()), "vkWaitForFences failed");
+		CheckVulkanError(vkResetFences(renderer->Device.get()->device, 1, &RenderFinishedFence->fence), "vkResetFences failed");
 
 		TransferCommands->begin();
 	}

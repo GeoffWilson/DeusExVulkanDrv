@@ -92,6 +92,11 @@ public:
 	HWND WindowHandle = 0;
 #endif
 
+	// The instance and the surface outlive a lost device. Keeping them means a
+	// rebuild does not have to go back to the window, which on the SDL side
+	// would mean resizing the viewport again mid-frame.
+	std::shared_ptr<VulkanInstance> Instance;
+	std::shared_ptr<VulkanSurface> Surface;
 	std::shared_ptr<VulkanDevice> Device;
 
 	std::unique_ptr<CommandBufferManager> Commands;
@@ -136,6 +141,10 @@ public:
 
 	INT VkDeviceIndex;
 	BITFIELD VkDebug;
+	// Frames after which to fake a lost device, once, then clear itself. For
+	// exercising the recovery path, which otherwise only ever runs the first
+	// time something goes badly wrong on someone else's machine.
+	INT VkTestDeviceLoss;
 	BITFIELD VkExclusiveFullscreen;
 
 	void RunBloomPass();
@@ -220,6 +229,13 @@ private:
 
 	bool IsLocked = false;
 	FLOAT LastRenderScale = -1.0f;
+
+	// Device loss recovery. DeviceLostCount is not just for the log: a device
+	// that dies repeatedly is a device that is not coming back, and retrying
+	// forever would replace a crash with a hang.
+	bool DeviceLost = false;
+	int DeviceLostCount = 0;
+	static const int MaxDeviceLostRecoveries = 3;
 	BITFIELD UsingSRGBTextures = 0;
 	std::chrono::steady_clock::time_point NextFrameTime;
 
@@ -228,6 +244,12 @@ private:
 	ivec4 GetTextureIndexes(DWORD PolyFlags, CachedTexture* tex, CachedTexture* lightmap, CachedTexture* macrotex, CachedTexture* detailtex);
 	void DrawBatch(VulkanCommandBuffer* cmdbuffer);
 	void SubmitAndWait(bool present, int presentWidth, int presentHeight, bool presentFullscreen);
+
+	bool CreateVulkanDevice();
+	void CreateDeviceResources();
+	void ReleaseDeviceResources();
+	bool RecoverFromDeviceLoss();
+	void BeginFrame(FPlane ScreenClear);
 
 	vec4 ApplyInverseGamma(vec4 color);
 

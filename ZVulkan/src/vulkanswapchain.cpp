@@ -263,6 +263,10 @@ int VulkanSwapChain::AcquireImage(VulkanSemaphore* semaphore, VulkanFence* fence
 	{
 		return -1;
 	}
+	else if (result == VK_ERROR_DEVICE_LOST)
+	{
+		throw VulkanDeviceLostError("vkAcquireNextImageKHR failed: device lost");
+	}
 	else
 	{
 		VulkanError("Failed to acquire next image!");
@@ -323,7 +327,7 @@ void VulkanSwapChain::QueuePresent(int imageIndex, VulkanSemaphore* semaphore, u
 	}
 	else if (result == VK_ERROR_DEVICE_LOST)
 	{
-		VulkanError("vkQueuePresentKHR failed: device lost");
+		throw VulkanDeviceLostError("vkQueuePresentKHR failed: device lost");
 	}
 	else
 	{

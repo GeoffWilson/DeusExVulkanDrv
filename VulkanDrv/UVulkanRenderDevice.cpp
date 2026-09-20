@@ -125,6 +125,7 @@ void UVulkanRenderDevice::StaticConstructor()
 
 	VkDeviceIndex = 0;
 	VkDebug = 0;
+	VkTestDeviceLoss = 0;
 	VkExclusiveFullscreen = 0;
 
 #if defined(OLDUNREAL469SDK)
@@ -174,6 +175,7 @@ void UVulkanRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDeviceIndex"), RF_Public) UIntProperty(CPP_PROPERTY(VkDeviceIndex), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDebug"), RF_Public) UBoolProperty(CPP_PROPERTY(VkDebug), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VkTestDeviceLoss"), RF_Public) UIntProperty(CPP_PROPERTY(VkTestDeviceLoss), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkExclusiveFullscreen"), RF_Public) UBoolProperty(CPP_PROPERTY(VkExclusiveFullscreen), TEXT("Display"), CPF_Config);
 
 	unguard;
@@ -199,17 +201,14 @@ UBOOL UVulkanRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT N
 	{
 
 #ifdef WIN32
-		auto instance = VulkanInstanceBuilder()
+		Instance = VulkanInstanceBuilder()
 			.RequireSurfaceExtensions()
 			.DebugLayer(VkDebug)
 			.Create();
 
-		auto deviceBuilder = VulkanDeviceBuilder();
-
-		auto surface = VulkanSurfaceBuilder()
+		Surface = VulkanSurfaceBuilder()
 			.Win32Window((HWND)Viewport->GetWindow())
-			.Create(instance);
-		deviceBuilder.Surface(surface);
+			.Create(Instance);
 #else
 		// SDLDrv doesn't create the window until you call ResizeViewport
 		if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Vulkan) : (BLIT_HardwarePaint | BLIT_Vulkan), NewX, NewY, NewColorBytes))
@@ -236,53 +235,25 @@ UBOOL UVulkanRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT N
 			instanceBuilder.RequireExtension(name);
 		}
 
-		auto instance = instanceBuilder.Create();
-		auto deviceBuilder = VulkanDeviceBuilder();
+		Instance = instanceBuilder.Create();
 
 		VkSurfaceKHR surfaceHandle = {};
-		if (!SDLVulkanCreateSurfaceCompat(window, instance->Instance, &surfaceHandle))
+		if (!SDLVulkanCreateSurfaceCompat(window, Instance->Instance, &surfaceHandle))
 		{
 			debugf(TEXT("Couldn't create Vulkan surface: %ls"), appFromAnsi(SDL_GetError()));
 			return 0;
 		}
 
-		auto surface = std::make_shared<VulkanSurface>(instance, surfaceHandle);
-		deviceBuilder.Surface(surface);
+		Surface = std::make_shared<VulkanSurface>(Instance, surfaceHandle);
 #endif
 
-		deviceBuilder.RequireExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
-		deviceBuilder.RequireExtension(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
-
-		// Lets FPSLimit pace against when a frame actually reached the screen
-		// rather than when we finished submitting it. Optional: not every driver
-		// has it, and Wine did not when this was written.
-		deviceBuilder.OptionalExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
-		deviceBuilder.OptionalExtension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-		deviceBuilder.SelectDevice(VkDeviceIndex);
-
-		Device = deviceBuilder.Create(instance);
-
-		bool supportsBindless =
-			Device->EnabledFeatures.DescriptorIndexing.descriptorBindingPartiallyBound &&
-			Device->EnabledFeatures.DescriptorIndexing.runtimeDescriptorArray &&
-			Device->EnabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing;
-
-		if (!supportsBindless)
+		if (!CreateVulkanDevice())
 		{
-			debugf(TEXT("VulkanDrv requires a GPU that supports bindless textures!"));
 			Exit();
 			return 0;
 		}
 
-		Buffers.reset(new BufferManager(this));
-		Commands.reset(new CommandBufferManager(this));
-		Samplers.reset(new SamplerManager(this));
-		Textures.reset(new TextureManager(this));
-		Shaders.reset(new ShaderManager(this));
-		Uploads.reset(new UploadManager(this));
-		DescriptorSets.reset(new DescriptorSetManager(this));
-		RenderPasses.reset(new RenderPassManager(this));
-		Framebuffers.reset(new FramebufferManager(this));
+		CreateDeviceResources();
 
 		const auto& props = Device->PhysicalDevice.Properties.Properties;
 
@@ -479,6 +450,62 @@ void UVulkanRenderDevice::Exit()
 {
 	guard(UVulkanRenderDevice::Exit);
 
+	ReleaseDeviceResources();
+
+	Device.reset();
+	Surface.reset();
+	Instance.reset();
+
+	unguard;
+}
+
+bool UVulkanRenderDevice::CreateVulkanDevice()
+{
+	auto deviceBuilder = VulkanDeviceBuilder();
+	deviceBuilder.Surface(Surface);
+	deviceBuilder.RequireExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+	deviceBuilder.RequireExtension(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
+
+	// Lets FPSLimit pace against when a frame actually reached the screen
+	// rather than when we finished submitting it. Optional: not every driver
+	// has it, and Wine did not when this was written.
+	deviceBuilder.OptionalExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+	deviceBuilder.OptionalExtension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+	deviceBuilder.SelectDevice(VkDeviceIndex);
+
+	Device = deviceBuilder.Create(Instance);
+
+	bool supportsBindless =
+		Device->EnabledFeatures.DescriptorIndexing.descriptorBindingPartiallyBound &&
+		Device->EnabledFeatures.DescriptorIndexing.runtimeDescriptorArray &&
+		Device->EnabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing;
+
+	if (!supportsBindless)
+	{
+		debugf(TEXT("VulkanDrv requires a GPU that supports bindless textures!"));
+		return false;
+	}
+
+	return true;
+}
+
+void UVulkanRenderDevice::CreateDeviceResources()
+{
+	Buffers.reset(new BufferManager(this));
+	Commands.reset(new CommandBufferManager(this));
+	Samplers.reset(new SamplerManager(this));
+	Textures.reset(new TextureManager(this));
+	Shaders.reset(new ShaderManager(this));
+	Uploads.reset(new UploadManager(this));
+	DescriptorSets.reset(new DescriptorSetManager(this));
+	RenderPasses.reset(new RenderPassManager(this));
+	Framebuffers.reset(new FramebufferManager(this));
+}
+
+void UVulkanRenderDevice::ReleaseDeviceResources()
+{
+	// A lost device answers this immediately with an error rather than
+	// blocking, so it is safe on the recovery path as well as the exit one.
 	if (Device) vkDeviceWaitIdle(Device->device);
 
 	Framebuffers.reset();
@@ -490,10 +517,58 @@ void UVulkanRenderDevice::Exit()
 	Textures.reset();
 	Samplers.reset();
 	Commands.reset();
+}
 
-	Device.reset();
+// Throw the dead device away and build another one from the instance and
+// surface, which a device loss does not invalidate.
+//
+// Everything the renderer owns hangs off the device - the swap chain, the
+// render passes and pipelines, the samplers, every uploaded texture - so all of
+// it goes and is rebuilt. The texture cache cannot be salvaged: those images
+// lived in memory that is gone. Textures upload again on demand as they are
+// drawn, and PrecacheOnFlip asks the engine to do that in one go rather than a
+// stutter at a time.
+bool UVulkanRenderDevice::RecoverFromDeviceLoss()
+{
+	if (DeviceLostCount >= MaxDeviceLostRecoveries)
+	{
+		debugf(TEXT("Vulkan device lost %d times; not trying to rebuild it again"), DeviceLostCount);
+		return false;
+	}
 
-	unguard;
+	DeviceLostCount++;
+	debugf(TEXT("Vulkan device lost - rebuilding it (attempt %d of %d)"), DeviceLostCount, MaxDeviceLostRecoveries);
+
+	try
+	{
+		ReleaseDeviceResources();
+		Device.reset();
+
+		if (!CreateVulkanDevice())
+			return false;
+
+		CreateDeviceResources();
+
+		// Anything remembered about the old device is meaningless now: the
+		// bound pipeline, the scene buffer size that decides whether they get
+		// rebuilt, and whether this frame is inside a render pass.
+		Batch.Pipeline = nullptr;
+		LastRenderScale = -1.0f;
+		UsingSRGBTextures = SRGBTextures;
+		IsLocked = false;
+
+		if (UsePrecache && !GIsEditor)
+			PrecacheOnFlip = 1;
+
+		DeviceLost = false;
+		debugf(TEXT("Vulkan device rebuilt"));
+		return true;
+	}
+	catch (const std::exception& e)
+	{
+		debugf(TEXT("Could not rebuild the Vulkan device: %s"), appFromAnsi(e.what()));
+		return false;
+	}
 }
 
 void UVulkanRenderDevice::SubmitAndWait(bool present, int presentWidth, int presentHeight, bool presentFullscreen)
@@ -727,7 +802,60 @@ void UVulkanRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane Sc
 	pushconstants.srgbLight = SRGBTextures ? 1 : 0;
 	ForceHitIndex = -1;
 
-	try
+	// A device lost part way through the previous frame is rebuilt here rather
+	// than where it was noticed: this is a frame boundary, with nothing half
+	// recorded and no render pass open.
+	bool started = false;
+	std::string failure;
+	for (int attempt = 0; attempt < 2 && !started; attempt++)
+	{
+		try
+		{
+			if (DeviceLost && !RecoverFromDeviceLoss())
+			{
+				failure = "the device was lost and could not be rebuilt";
+				break;
+			}
+
+			BeginFrame(ScreenClear);
+			started = true;
+		}
+		catch (const VulkanDeviceLostError& e)
+		{
+			// Losing it here rather than mid frame is the easy case: nothing
+			// has been drawn yet, so one more pass round rebuilds and retries.
+			debugf(TEXT("Vulkan device lost while starting a frame: %s"), appFromAnsi(e.what()));
+			DeviceLost = true;
+			failure = e.what();
+		}
+		catch (const std::exception& e)
+		{
+			failure = e.what();
+			break;
+		}
+	}
+
+	if (!started)
+	{
+		// Say what happened before going. The engine's own failure path takes
+		// the tail of the log with it, which is why this used to leave nothing
+		// behind explaining itself.
+		static std::basic_string<TCHAR> err;
+		err = appFromAnsi(failure.c_str());
+		debugf(TEXT("Vulkan renderer could not begin a frame: %s"), err.c_str());
+
+#ifdef WIN32
+		// To do: can we report this back to unreal in a better way?
+		MessageBoxA(0, failure.c_str(), "Vulkan Error", MB_OK);
+#endif
+		exit(0);
+	}
+
+	unguard;
+}
+
+void UVulkanRenderDevice::BeginFrame(FPlane ScreenClear)
+{
 	{
 		// Say so when the setting is not what is being used. Clamping silently is
 		// worse than it sounds: asking for a scale beyond the limit renders
@@ -751,6 +879,13 @@ void UVulkanRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane Sc
 			try
 			{
 				Textures->Scene.reset(new SceneTextures(this, sceneWidth, sceneHeight, GetSettingsMultisample()));
+			}
+			catch (const VulkanDeviceLostError&)
+			{
+				// Not a scale this device cannot afford - a device that is
+				// gone. Falling back here would blame the setting and quietly
+				// reset it; let it reach the recovery path instead.
+				throw;
 			}
 			catch (const std::exception& e)
 			{
@@ -809,16 +944,6 @@ void UVulkanRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane Sc
 
 		IsLocked = true;
 	}
-	catch (const std::exception& e)
-	{
-#ifdef WIN32
-		// To do: can we report this back to unreal in a better way?
-		MessageBoxA(0, e.what(), "Vulkan Error", MB_OK);
-#endif
-		exit(0);
-	}
-
-	unguard;
 }
 
 void UVulkanRenderDevice::FlushDrawBatchAndWait()
@@ -909,6 +1034,13 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 		if (Blit)
 			LimitFrameRate();
 
+		// Fake a lost device on demand. It raises the same exception from the
+		// same place a real one does, so the teardown and rebuild below are the
+		// real thing - but the device underneath is still healthy, so this does
+		// not test how a driver behaves once it has actually lost one.
+		if (VkTestDeviceLoss > 0 && Blit && --VkTestDeviceLoss == 0)
+			throw VulkanDeviceLostError("simulated device loss (VkTestDeviceLoss)");
+
 
 		Batch.Pipeline = nullptr;
 
@@ -973,6 +1105,16 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 		HitSize = nullptr;
 
 		IsLocked = false;
+	}
+	catch (const VulkanDeviceLostError& e)
+	{
+		// The frame is lost, but the session need not be: the next Lock finds
+		// the flag and rebuilds the device at the frame boundary. Deliberately
+		// not an engine error - that would end the game over something the
+		// game did not do.
+		IsLocked = false;
+		DeviceLost = true;
+		debugf(TEXT("Vulkan device lost while finishing a frame: %s"), appFromAnsi(e.what()));
 	}
 	catch (std::exception& e)
 	{

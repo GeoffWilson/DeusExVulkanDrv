@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include <set>
 
@@ -98,8 +99,21 @@ std::string VkResultToString(VkResult result);
 void VulkanPrintLog(const char* typestr, const std::string& msg);
 void VulkanError(const char* text);
 
+// Device loss is the one failure worth telling apart from the rest. It is not
+// the caller doing anything wrong - a driver timeout, a GPU reset, an eviction
+// that could not be satisfied - and unlike every other error here it is
+// recoverable, by throwing the device away and building another one. Deriving
+// from runtime_error keeps every existing catch(std::exception) working.
+class VulkanDeviceLostError : public std::runtime_error
+{
+public:
+	explicit VulkanDeviceLostError(const std::string& text) : std::runtime_error(text) { }
+};
+
 inline void CheckVulkanError(VkResult result, const char* text)
 {
 	if (result >= VK_SUCCESS) return;
+	if (result == VK_ERROR_DEVICE_LOST)
+		throw VulkanDeviceLostError(text + std::string(": ") + VkResultToString(result));
 	VulkanError((text + std::string(": ") + VkResultToString(result)).c_str());
 }

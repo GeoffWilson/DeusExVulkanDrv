@@ -103,6 +103,7 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - VkDebug enables the vulkan debug layer and will make the render device output extra information into the UnrealTournament.log file. 'VkMemStats' can also be typed into the console.
 - VkExclusiveFullscreen enables vulkan's exclusive full screen feature. It is off by default as some users have reported problems with it.
 - VkDeviceIndex selects which vulkan device in the system the render device should use. Type 'GetVkDevices' in the system console to get the list of available devices.
+- VkTestDeviceLoss fakes a lost device after this many presented frames, once, and then sets itself back to zero. It exists to exercise the recovery path deliberately rather than discovering it during a real fault. It raises the same error from the same place a real loss does, so the teardown and rebuild are genuine - but the device underneath is still healthy, so it says nothing about how a driver behaves once it has actually lost one. Zero, the default, disables it.
 - RenderScale renders the scene at a multiple of the viewport size and scales the result back down when presenting it, which is supersampling: at 2.0 the game draws four samples for every pixel you see. It anti-aliases everything, including the alpha tested edges and the shimmer of high frequency textures at a distance, where multisampling only reaches geometry edges. The cost is quadratic - 2.0 is four times the pixels, and combining it with MSAA multiplies again - and the HUD and text are drawn into the same buffer, so they are softened along with the rest. Accepted values run from 0.25 to 4.0, and anything outside that is clamped with a note in the log - as is a scale the device cannot allocate, which falls back to 1.0 rather than failing to start. Four is not a hardware limit but the point where the buffers stop earning their size: at a 1440p viewport with multisampling that is already some three gigabytes of render targets, and going further mostly buys frame rate loss and memory pressure. Values below 1.0 render below the viewport size instead, trading sharpness for speed.
 - MaxAnisotropy sets the anisotropic filtering level, clamped to whatever the device supports. Anything at or below 1.0 turns it off. Higher values sharpen textures viewed at a glancing angle, which on these maps is most of the floors and walls.
 - SRGBTextures samples textures as sRGB so the shading runs on linear light, encoding the result back for display at the end. The brightness is unchanged by design: this engine's lighting is a multiplication, and a multiplication gives the same answer in either space, so everything that has to cross over - the light arriving as vertex colours, the fog, the doubling that compensates for half brightness light maps, the detail texture modulation - does, and the result lands where it started. What does change is everything that interpolates or blends rather than multiplies: texture filtering, mip transitions and translucent surfaces resolve in linear light, which reads as smoother gradients and cleaner glow around bright things. Against that, high contrast masked art picks up a visible fringe - the mouse cursor is the clearest example - because a hard white on black edge now filters to a lighter intermediate. Subtle either way, and a matter of taste, which is why it is off by default.
@@ -267,6 +268,33 @@ plane, and - in D3D12Drv - the same unfollowed cursor clip.
   than it did before. It can be changed live from the console with
   `set VulkanDrv.VulkanRenderDevice HdrScale 255`.
 
+- **Surviving a lost device.** `VK_ERROR_DEVICE_LOST` used to take the process
+  with it, and hard enough that the log lost its tail, so there was not even a
+  line saying what happened. It arrives from a driver timeout, a GPU reset, or
+  memory pressure severe enough that an eviction cannot be satisfied - none of
+  which are the game doing anything wrong, and all of which a user will read as
+  the game crashing. It now raises a distinct error type rather than a generic
+  one, which is what makes it possible to treat differently from an actual bug.
+  Lost mid frame it costs that frame and sets a flag; the rebuild happens at the
+  start of the next one, where nothing is half recorded and no render pass is
+  open. Everything hanging off the device goes and is built again, while the
+  instance and the surface - which a device loss does not invalidate - are kept,
+  so the rebuild never has to go back to the window. The texture cache cannot be
+  salvaged, since those images lived in memory that is gone, so `PrecacheOnFlip`
+  asks the engine to fill it again in one go rather than a stutter at a time.
+  Three attempts, then it stops: a device that keeps dying is not coming back,
+  and retrying forever would trade a crash for a hang.
+
+  Two things found while writing it that were worth more than the feature. The
+  results of `vkWaitForFences` were being discarded, so a lost device would have
+  hung on a fence that was never going to be signalled, with nothing in the log
+  - a freeze rather than a crash, and far harder to diagnose. And the scene
+  buffer allocation has a fallback that catches any exception and drops
+  `RenderScale` to 1.0, on the reasoning that a scale the device cannot afford
+  should not cost the session; device loss during that allocation would have
+  been blamed on the setting, silently reset it, and never reached the recovery
+  path at all.
+
 ### Recommended settings for Deus Ex
 
 	RenderScale=2.000000
@@ -298,17 +326,12 @@ different project, not a feature port. Performance work is equally moot: the
 game is bound by its own engine long before the GPU, which is why it will run
 at several hundred frames per second uncapped.
 
-That leaves one idea not taken up yet:
-
-1. **Recovering from a lost device.** `VK_ERROR_DEVICE_LOST` currently takes the
-   process with it - hard enough that the log loses its tail, so there is not
-   even a line saying what happened. It arrives from a driver timeout, a GPU
-   reset, or memory pressure severe enough that an eviction cannot be satisfied,
-   none of which are the game doing anything wrong. Recovering means tearing the
-   device down and rebuilding everything hanging off it - swap chain, render
-   passes, pipelines, samplers, the whole texture cache - and the engine has to
-   be told to precache its textures again afterwards. Worth doing properly or
-   not at all; at the very least it should say what happened before it goes.
+Everything that was on this list has since been done. The one piece of it that
+remains unproven rather than unwritten is device loss against a real fault: the
+recovery path has been exercised deliberately, with `VkTestDeviceLoss`, but
+never by a driver that had actually lost the device. If it ever does happen to
+you, the log will say so in as many words, which is the part that used to be
+missing.
 
 
 Not recommended: the OpenXR VR support in D3D11Drv is not a feature that ports
