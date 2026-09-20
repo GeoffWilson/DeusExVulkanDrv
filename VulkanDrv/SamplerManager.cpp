@@ -31,7 +31,14 @@ void SamplerManager::CreateSceneSamplers()
 	for (int i = 0; i < 4; i++)
 	{
 		SamplerBuilder builder;
-		builder.Anisotropy(8.0f);
+
+		// Clamped to what the device offers: asking for more than
+		// maxSamplerAnisotropy is invalid, and anything at or below one means
+		// the user has asked for it off.
+		float anisotropy = Min(renderer->MaxAnisotropy, renderer->Device->PhysicalDevice.Properties.Properties.limits.maxSamplerAnisotropy);
+		if (anisotropy > 1.0f)
+			builder.Anisotropy(anisotropy);
+
 		builder.MipLodBias(renderer->LODBias);
 
 		if (i & 1)
@@ -62,4 +69,5 @@ void SamplerManager::CreateSceneSamplers()
 	}
 
 	LODBias = renderer->LODBias;
+	MaxAnisotropy = renderer->MaxAnisotropy;
 }

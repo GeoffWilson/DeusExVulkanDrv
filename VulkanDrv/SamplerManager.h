@@ -15,6 +15,7 @@ public:
 	std::unique_ptr<VulkanSampler> PPLinearClamp;
 
 	FLOAT LODBias = 0.0f;
+	FLOAT MaxAnisotropy = 0.0f;
 
 private:
 	UVulkanRenderDevice* renderer = nullptr;

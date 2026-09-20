@@ -121,6 +121,7 @@ public:
 	BYTE LightMode;
 	BITFIELD GammaCorrectScreenshots;
 
+	FLOAT MaxAnisotropy;
 	FLOAT RenderScale;
 	INT FPSLimit;
 

@@ -42,6 +42,7 @@ All the render devices supports the following renderdev specific settings in eac
 VulkanDrv specific settings:
 
 	RenderScale=1.000000
+	MaxAnisotropy=8.000000
 	FPSLimit=0
 	VkDebug=False
 	VkDeviceIndex=0
@@ -102,6 +103,7 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - VkExclusiveFullscreen enables vulkan's exclusive full screen feature. It is off by default as some users have reported problems with it.
 - VkDeviceIndex selects which vulkan device in the system the render device should use. Type 'GetVkDevices' in the system console to get the list of available devices.
 - RenderScale renders the scene at a multiple of the viewport size and scales the result back down when presenting it, which is supersampling: at 2.0 the game draws four samples for every pixel you see. It anti-aliases everything, including the alpha tested edges and the shimmer of high frequency textures at a distance, where multisampling only reaches geometry edges. The cost is quadratic - 2.0 is four times the pixels, and combining it with MSAA multiplies again - and the HUD and text are drawn into the same buffer, so they are softened along with the rest. Values below 1.0 render below the viewport size instead, trading sharpness for speed. A scale the device cannot allocate falls back to 1.0 rather than failing to start.
+- MaxAnisotropy sets the anisotropic filtering level, clamped to whatever the device supports. Anything at or below 1.0 turns it off. Higher values sharpen textures viewed at a glancing angle, which on these maps is most of the floors and walls.
 - FPSLimit caps how many frames per second are presented, or zero to leave the frame rate alone. The engine only enforces a tick rate for network play, so an old game on a modern GPU can run at a frame rate its own timing was never written for - Deus Ex cuts conversation audio short well before a 240Hz display's refresh rate, and 120 or 60 is a reasonable cap there.
 
 ## Description of D3D12Drv specific settings
@@ -216,6 +218,26 @@ plane, and - in D3D12Drv - the same unfollowed cursor clip.
   wrong place. Screenshots come out right for free, since `ReadPixels` already
   blits rather than copies.
 
+### Recommended settings for Deus Ex
+
+	RenderScale=2.000000
+	AntialiasMode=Off
+	FPSLimit=120
+	MaxAnisotropy=16.000000
+
+`FPSLimit` is not optional in practice: uncapped, the engine cuts conversation
+audio short and its cinematic cameras drift.
+
+`RenderScale` earns its cost here in a way multisampling does not. Deus Ex is
+full of alpha tested surfaces - fences, grates, foliage, railings - which
+`AntialiasMode` cannot touch on its own, and of high frequency textures that
+shimmer at a distance, which it cannot touch at all. Supersampling handles both,
+and the game is bound by its own engine long before the GPU, so the time is
+there to spend. Raise the scale until the cost shows rather than turning on MSAA
+as well; the two are worth roughly the same and supersampling is the better buy
+in this game. The HUD and text share the scene buffer and are softened slightly
+along with everything else, which is the one thing to judge for yourself.
+
 ### Possible future work
 
 Ideas weighed against what the 1112 engine can actually supply. Worth noting
@@ -227,16 +249,9 @@ different project, not a feature port. Performance work is equally moot: the
 game is bound by its own engine long before the GPU, which is why it will run
 at several hundred frames per second uncapped.
 
-That leaves the quality features that need no data the engine does not already
-provide:
+That leaves one idea not taken up yet:
 
-1. **Configurable anisotropy.** `MaxAnisotropy` is hardcoded at 8 in all three
-   render devices here. Exposing it, clamped to the device's
-   `maxSamplerAnisotropy`, is a few lines.
-2. **Frame pacing through `VK_KHR_present_wait`.** `FPSLimit` currently sleeps
-   and then spins. Presenting with `present_id` and waiting on it paces frames
-   against the presentation engine itself, for less jitter and less burnt CPU.
-3. **sRGB textures and linear lighting**, as XOpenGL's `UsesRGBTextures` does.
+1. **sRGB textures and linear lighting**, as XOpenGL's `UsesRGBTextures` does.
    This changes how the game looks rather than sharpening it, so it belongs
    behind a setting that defaults to off.
 

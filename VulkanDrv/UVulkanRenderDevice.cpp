@@ -118,6 +118,7 @@ void UVulkanRenderDevice::StaticConstructor()
 
 	GammaCorrectScreenshots = 1;
 
+	MaxAnisotropy = 8.0f;
 	RenderScale = 1.0f;
 	FPSLimit = 0;
 
@@ -166,6 +167,7 @@ void UVulkanRenderDevice::StaticConstructor()
 	new(LightModes->Names)FName(TEXT("BrighterActors"));
 	new(GetClass(), TEXT("LightMode"), RF_Public) UByteProperty(CPP_PROPERTY(LightMode), TEXT("Display"), CPF_Config, LightModes);
 
+	new(GetClass(), TEXT("MaxAnisotropy"), RF_Public) UFloatProperty(CPP_PROPERTY(MaxAnisotropy), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("RenderScale"), RF_Public) UFloatProperty(CPP_PROPERTY(RenderScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDeviceIndex"), RF_Public) UIntProperty(CPP_PROPERTY(VkDeviceIndex), TEXT("Display"), CPF_Config);
@@ -248,6 +250,12 @@ UBOOL UVulkanRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT N
 
 		deviceBuilder.RequireExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
 		deviceBuilder.RequireExtension(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
+
+		// Lets FPSLimit pace against when a frame actually reached the screen
+		// rather than when we finished submitting it. Optional: not every driver
+		// has it, and Wine did not when this was written.
+		deviceBuilder.OptionalExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		deviceBuilder.OptionalExtension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
 		deviceBuilder.SelectDevice(VkDeviceIndex);
 
 		Device = deviceBuilder.Create(instance);
@@ -882,7 +890,7 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 
 		Batch.Pipeline = nullptr;
 
-		if (Samplers->LODBias != LODBias)
+		if (Samplers->LODBias != LODBias || Samplers->MaxAnisotropy != MaxAnisotropy)
 		{
 			DescriptorSets->ClearCache();
 			Textures->ClearAllBindlessIndexes();
@@ -1723,6 +1731,14 @@ void UVulkanRenderDevice::LimitFrameRate()
 	using namespace std::chrono;
 
 	auto interval = duration_cast<steady_clock::duration>(duration<double>(1.0 / (double)FPSLimit));
+
+	// Wait for the frame just submitted to reach the screen, so the pacing is
+	// anchored to that rather than to the moment we finished handing it over -
+	// the queue depth between those two drifts, and the drift is what a sleep
+	// based limiter turns into uneven frame times. The timeout is a second: if
+	// presentation is that far gone, pacing is not the problem.
+	Commands->WaitForLastPresent(seconds(1));
+
 	auto now = steady_clock::now();
 
 	// Pace off when the last frame was due rather than when it finished, so a
