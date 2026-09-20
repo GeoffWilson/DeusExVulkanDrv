@@ -129,6 +129,7 @@ public:
 	BYTE LightMode;
 	BITFIELD GammaCorrectScreenshots;
 
+	BITFIELD SRGBTextures;
 	FLOAT MaxAnisotropy;
 	FLOAT RenderScale;
 	INT FPSLimit;
@@ -219,6 +220,7 @@ private:
 
 	bool IsLocked = false;
 	FLOAT LastRenderScale = -1.0f;
+	BITFIELD UsingSRGBTextures = 0;
 	std::chrono::steady_clock::time_point NextFrameTime;
 
 	void SetPipeline(PipelineState* pipeline);

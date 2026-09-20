@@ -43,12 +43,13 @@ ShaderManager::ShaderManager(UVulkanRenderDevice* renderer) : renderer(renderer)
 	static const char* transferFunctions[2] = { nullptr, "HDR_MODE" };
 	static const char* gammaModes[2] = { "GAMMA_MODE_D3D9", "GAMMA_MODE_XOPENGL" };
 	static const char* colorModes[4] = { nullptr, "COLOR_CORRECT_MODE0", "COLOR_CORRECT_MODE1", "COLOR_CORRECT_MODE2" };
-	for (int i = 0; i < 16; i++)
+	for (int i = 0; i < 32; i++)
 	{
 		std::string defines;
 		if (transferFunctions[i & 1]) defines += std::string("#define ") + transferFunctions[i & 1] + "\r\n";
 		if (gammaModes[(i >> 1) & 1]) defines += std::string("#define ") + gammaModes[(i >> 1) & 1] + "\r\n";
 		if (colorModes[(i >> 2) & 3]) defines += std::string("#define ") + colorModes[(i >> 2) & 3] + "\r\n";
+		if ((i >> 4) & 1) defines += "#define SRGB_SCENE\r\n";
 
 		Postprocess.FragmentPresentShader[i] = ShaderBuilder()
 			.Type(ShaderType::Fragment)

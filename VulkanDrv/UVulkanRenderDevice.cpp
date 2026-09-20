@@ -118,6 +118,7 @@ void UVulkanRenderDevice::StaticConstructor()
 
 	GammaCorrectScreenshots = 1;
 
+	SRGBTextures = 0;
 	MaxAnisotropy = 8.0f;
 	RenderScale = 1.0f;
 	FPSLimit = 0;
@@ -167,6 +168,7 @@ void UVulkanRenderDevice::StaticConstructor()
 	new(LightModes->Names)FName(TEXT("BrighterActors"));
 	new(GetClass(), TEXT("LightMode"), RF_Public) UByteProperty(CPP_PROPERTY(LightMode), TEXT("Display"), CPF_Config, LightModes);
 
+	new(GetClass(), TEXT("SRGBTextures"), RF_Public) UBoolProperty(CPP_PROPERTY(SRGBTextures), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("MaxAnisotropy"), RF_Public) UFloatProperty(CPP_PROPERTY(MaxAnisotropy), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("RenderScale"), RF_Public) UFloatProperty(CPP_PROPERTY(RenderScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
@@ -722,6 +724,7 @@ void UVulkanRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane Sc
 	FlashFog = InFlashFog;
 
 	pushconstants.hitIndex = 0;
+	pushconstants.srgbLight = SRGBTextures ? 1 : 0;
 	ForceHitIndex = -1;
 
 	try
@@ -909,6 +912,16 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 
 		Batch.Pipeline = nullptr;
 
+		if (UsingSRGBTextures != SRGBTextures)
+		{
+			// Whether a texture is sRGB is fixed when its image is created, so
+			// every cached texture has to go and be uploaded again in the other
+			// format.
+			UsingSRGBTextures = SRGBTextures;
+			ClearTextureCache();
+			Textures->ClearAllBindlessIndexes();
+		}
+
 		if (Samplers->LODBias != LODBias || Samplers->MaxAnisotropy != MaxAnisotropy)
 		{
 			DescriptorSets->ClearCache();
@@ -1017,7 +1030,7 @@ void UVulkanRenderDevice::DrawBatch(VulkanCommandBuffer* cmdbuffer)
 		auto layout = RenderPasses->Scene.BindlessPipelineLayout.get();
 		cmdbuffer->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, Batch.Pipeline->Pipeline.get());
 		cmdbuffer->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, DescriptorSets->GetBindlessSet());
-		cmdbuffer->pushConstants(layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ScenePushConstants), &pushconstants);
+		cmdbuffer->pushConstants(layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &pushconstants);
 		cmdbuffer->drawIndexed(icount, 1, Batch.SceneIndexStart, 0, 0);
 		Batch.SceneIndexStart = SceneIndexPos;
 		Stats.DrawCalls++;
@@ -1831,6 +1844,7 @@ void UVulkanRenderDevice::ReadPixels(FColor* Pixels)
 		if (ActiveHdr) presentShader |= 1;
 		if (GammaMode == 1) presentShader |= 2;
 		if (pushconstants.Brightness != 0.0f || pushconstants.Contrast != 1.0f || pushconstants.Saturation != 1.0f) presentShader |= (Clamp(GrayFormula, 0, 2) + 1) << 2;
+		if (SRGBTextures) presentShader |= 16;
 
 		VkViewport viewport = {};
 		viewport.width = Textures->Scene->Width;
@@ -2447,6 +2461,7 @@ void UVulkanRenderDevice::DrawPresentTexture(int width, int height)
 	if (ActiveHdr) presentShader |= 1;
 	if (GammaMode == 1) presentShader |= 2;
 	if (pushconstants.Brightness != 0.0f || pushconstants.Contrast != 1.0f || pushconstants.Saturation != 1.0f) presentShader |= (Clamp(GrayFormula, 0, 2) + 1) << 2;
+	if (SRGBTextures) presentShader |= 16;
 
 	float scale = std::min(width / (float)Viewport->SizeX, height / (float)Viewport->SizeY);
 	int letterboxWidth = (int)std::round(Viewport->SizeX * scale);

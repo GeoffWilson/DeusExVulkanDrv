@@ -21,7 +21,7 @@ void RenderPassManager::CreateSceneBindlessPipelineLayout()
 {
 	Scene.BindlessPipelineLayout = PipelineLayoutBuilder()
 		.AddSetLayout(renderer->DescriptorSets->GetTextureBindlessLayout())
-		.AddPushConstantRange(VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ScenePushConstants))
+		.AddPushConstantRange(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants))
 		.DebugName("SceneBindlessPipelineLayout")
 		.Create(renderer->Device.get());
 }
@@ -344,7 +344,7 @@ void RenderPassManager::CreatePresentRenderPass()
 
 void RenderPassManager::CreatePresentPipeline()
 {
-	for (int i = 0; i < 16; i++)
+	for (int i = 0; i < 32; i++)
 	{
 		Present.Pipeline[i] = GraphicsPipelineBuilder()
 			.AddVertexShader(renderer->Shaders->Postprocess.VertexShader.get())
@@ -360,7 +360,7 @@ void RenderPassManager::CreatePresentPipeline()
 
 void RenderPassManager::CreateScreenshotPipeline()
 {
-	for (int i = 0; i < 16; i++)
+	for (int i = 0; i < 32; i++)
 	{
 		Present.ScreenshotPipeline[i] = GraphicsPipelineBuilder()
 			.AddVertexShader(renderer->Shaders->Postprocess.VertexShader.get())

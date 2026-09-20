@@ -21,7 +21,8 @@ struct ScenePushConstants
 	mat4 objectToProjection;
 	vec4 nearClip;
 	uint32_t hitIndex;
-	uint32_t padding1, padding2, padding3;
+	uint32_t srgbLight;	// non-zero when the light values arriving as vertex colours still need linearising
+	uint32_t padding2, padding3;
 };
 
 struct PresentPushConstants
@@ -55,7 +56,7 @@ public:
 	struct
 	{
 		std::unique_ptr<VulkanShader> VertexShader;
-		std::unique_ptr<VulkanShader> FragmentPresentShader[16];
+		std::unique_ptr<VulkanShader> FragmentPresentShader[32];
 	} Postprocess;
 
 	struct

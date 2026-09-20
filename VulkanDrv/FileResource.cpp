@@ -14,7 +14,8 @@ std::string FileResource::readAllText(const std::string& filename)
 				mat4 objectToProjection;
 				vec4 nearClip;
 				uint uHitIndex;
-				uint padding1, padding2, padding3;
+				uint uSrgbLight;
+				uint padding2, padding3;
 			};
 
 			layout(location = 0) in uint aFlags;
@@ -53,6 +54,15 @@ std::string FileResource::readAllText(const std::string& filename)
 	else if (filename == "shaders/Scene.frag")
 	{
 		return R"(
+			layout(push_constant) uniform ScenePushConstants
+			{
+				mat4 objectToProjection;
+				vec4 nearClip;
+				uint uHitIndex;
+				uint uSrgbLight;
+				uint padding2, padding3;
+			};
+
 			layout(binding = 0) uniform sampler2D textures[];
 
 			layout(location = 0) flat in uint flags;
@@ -74,6 +84,25 @@ std::string FileResource::readAllText(const std::string& filename)
 				return vec4(clamp((c.rgb - cutoff) / (1.0 - cutoff), 0.0, 1.0), c.a);
 			}
 
+			// With sRGB textures the sampler hands back linear light, but the light
+			// values that arrive as vertex colours - lighting, fog, tile colours -
+			// are still in display space. Multiplying the two mixes spaces and the
+			// result is neither; bring them across as well.
+			vec3 toSceneSpace(vec3 c)
+			{
+				return uSrgbLight != 0 ? pow(max(c, 0.0), vec3(2.2)) : c;
+			}
+
+			// The engine's brightness multipliers - the doubling that compensates
+			// for half brightness light maps, and the actor boost - are figures
+			// for display space. Applied to linear values and encoded back, a
+			// doubling arrives as 2^(1/2.2), which is 1.37: everything lit comes
+			// out a third too dark. Take them across the same way.
+			float toSceneSpace(float scale)
+			{
+				return uSrgbLight != 0 ? pow(scale, 2.2) : scale;
+			}
+
 			vec4 textureTex(vec2 uv) { return texture(textures[nonuniformEXT(textureBinds.x)], uv); }
 			vec4 textureMacro(vec2 uv) { return texture(textures[nonuniformEXT(textureBinds.y)], uv); }
 			vec4 textureDetail(vec2 uv) { return texture(textures[nonuniformEXT(textureBinds.z)], uv); }
@@ -81,10 +110,10 @@ std::string FileResource::readAllText(const std::string& filename)
 
 			void main()
 			{
-				float actorXBlending = (flags & 32) != 0 ? 1.5 : 1.0;
-				float oneXBlending = (flags & 64) != 0 ? 1.0 : 2.0;
+				float actorXBlending = toSceneSpace((flags & 32) != 0 ? 1.5 : 1.0);
+				float oneXBlending = toSceneSpace((flags & 64) != 0 ? 1.0 : 2.0);
 
-				outColor = darkClamp(textureTex(texCoord)) * color;
+				outColor = darkClamp(textureTex(texCoord)) * vec4(toSceneSpace(color.rgb), color.a);
 				outColor.rgb *= actorXBlending;
 
 				if ((flags & 2) != 0) // Macro texture
@@ -102,6 +131,7 @@ std::string FileResource::readAllText(const std::string& filename)
 					float fadedistance = 380.0f;
 					float a = clamp(2.0f - (1.0f / gl_FragCoord.w) / fadedistance, 0.0f, 1.0f);
 					vec4 detailColor = (textureDetail(texCoord4) - 0.5) * 0.8 + 1.0;
+					detailColor.rgb = uSrgbLight != 0 ? pow(max(detailColor.rgb, 0.0), vec3(2.2)) : detailColor.rgb;
 					outColor.rgb = mix(outColor.rgb, outColor.rgb * detailColor.rgb, a);
 				}
 				else if ((flags & 8) != 0) // Fog map
@@ -111,7 +141,7 @@ std::string FileResource::readAllText(const std::string& filename)
 				}
 				else if ((flags & 16) != 0) // Fog color
 				{
-					vec4 fogcolor = vec4(texCoord2, texCoord3);
+					vec4 fogcolor = vec4(toSceneSpace(vec3(texCoord2, texCoord3.x)), texCoord3.y);
 					outColor.rgb = fogcolor.rgb + outColor.rgb * (1.0 - fogcolor.a);
 				}
 
@@ -267,9 +297,28 @@ std::string FileResource::readAllText(const std::string& filename)
 			vec3 colorCorrect(vec3 c) { return c; }
 			#endif
 
+			#if defined(SRGB_SCENE)
+
+			// With sRGB textures the hardware hands the shaders linear values, so
+			// the scene buffer holds light rather than display colours and has to
+			// be encoded before anything looks at it. Deliberately the plain 2.2
+			// power curve and not the piecewise sRGB one: the latter needs the
+			// value clamped to a display range, and overbright pixels above one
+			// are what the HDR and bloom paths are looking for.
+			vec3 encodeDisplay(vec3 c)
+			{
+				return pow(max(c, 0.0), vec3(1.0 / 2.2));
+			}
+
+			#endif
+
 			void main()
 			{
-				vec3 color = gammaCorrect(colorCorrect(texture(texSampler, texCoord).rgb));
+				vec3 sceneColor = texture(texSampler, texCoord).rgb;
+			#if defined(SRGB_SCENE)
+				sceneColor = encodeDisplay(sceneColor);
+			#endif
+				vec3 color = gammaCorrect(colorCorrect(sceneColor));
 			#if defined(HDR_MODE)
 				outColor = vec4(linearHdr(color), 1.0f);
 			#else

@@ -22,6 +22,28 @@ bool UploadManager::SupportsTextureFormat(ETextureFormat Format) const
 	return TextureUploader::GetUploader(Format);
 }
 
+// The sRGB counterpart of a texture format, where there is one. Formats without
+// one - the 16 bit packed and floating point kinds - are left alone, so they
+// stay linear and look brighter than the rest once this is on.
+static VkFormat ToSRGBFormat(VkFormat format)
+{
+	switch (format)
+	{
+	case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+	case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+	case VK_FORMAT_R8G8B8_UNORM: return VK_FORMAT_R8G8B8_SRGB;
+	case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return VK_FORMAT_BC1_RGB_SRGB_BLOCK;
+	case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+	case VK_FORMAT_BC2_UNORM_BLOCK: return VK_FORMAT_BC2_SRGB_BLOCK;
+	case VK_FORMAT_BC3_UNORM_BLOCK: return VK_FORMAT_BC3_SRGB_BLOCK;
+	case VK_FORMAT_BC7_UNORM_BLOCK: return VK_FORMAT_BC7_SRGB_BLOCK;
+	case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
+	case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK;
+	case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;
+	default: return format;
+	}
+}
+
 void UploadManager::UploadTexture(CachedTexture* tex, const FTextureInfo& Info, bool masked)
 {
 	int width = Info.USize;
@@ -41,6 +63,8 @@ void UploadManager::UploadTexture(CachedTexture* tex, const FTextureInfo& Info, 
 	}
 
 	VkFormat format = uploader ? uploader->GetVkFormat() : VK_FORMAT_R8G8B8A8_UNORM;
+	if (renderer->SRGBTextures)
+		format = ToSRGBFormat(format);
 
 	if (!tex->image)
 	{

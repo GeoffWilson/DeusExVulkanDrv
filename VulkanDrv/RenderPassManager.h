@@ -44,8 +44,8 @@ public:
 	{
 		std::unique_ptr<VulkanPipelineLayout> PipelineLayout;
 		std::unique_ptr<VulkanRenderPass> RenderPass;
-		std::unique_ptr<VulkanPipeline> Pipeline[16];
-		std::unique_ptr<VulkanPipeline> ScreenshotPipeline[16];
+		std::unique_ptr<VulkanPipeline> Pipeline[32];
+		std::unique_ptr<VulkanPipeline> ScreenshotPipeline[32];
 	} Present;
 
 	struct

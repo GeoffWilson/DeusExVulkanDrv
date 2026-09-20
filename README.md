@@ -43,6 +43,7 @@ VulkanDrv specific settings:
 
 	RenderScale=1.000000
 	MaxAnisotropy=8.000000
+	SRGBTextures=False
 	FPSLimit=0
 	VkDebug=False
 	VkDeviceIndex=0
@@ -84,7 +85,7 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - GammaMode:
   - D3D9: Use the gamma calculations from the other Direct3D render devices
   - XOpenGL: Use the gamma calculations from the XOpenGL render device
-- Hdr: Overbright pixels will use the high dynamic range of the monitor. Note: this will only work if HDR is enabled in the Windows display settings and if you have a HDR capable monitor
+- Hdr: Overbright pixels will use the high dynamic range of the monitor. Note: this will only work if HDR is enabled in the Windows display settings and if you have a HDR capable monitor. Windows only in practice: the swap chain is asked for scRGB (`VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`), which Wayland compositors do not offer - they expose HDR10 PQ instead - so the setting quietly stays SDR there. Supporting it would mean a second present path with ST.2084 encoding, Rec.2020 primaries and a luminance target, not just another surface format
 - AntialiasMode:
   - Off: No anti alias applied
   - MSAA_2x: 2x multisampling
@@ -104,6 +105,7 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - VkDeviceIndex selects which vulkan device in the system the render device should use. Type 'GetVkDevices' in the system console to get the list of available devices.
 - RenderScale renders the scene at a multiple of the viewport size and scales the result back down when presenting it, which is supersampling: at 2.0 the game draws four samples for every pixel you see. It anti-aliases everything, including the alpha tested edges and the shimmer of high frequency textures at a distance, where multisampling only reaches geometry edges. The cost is quadratic - 2.0 is four times the pixels, and combining it with MSAA multiplies again - and the HUD and text are drawn into the same buffer, so they are softened along with the rest. Accepted values run from 0.25 to 4.0, and anything outside that is clamped with a note in the log - as is a scale the device cannot allocate, which falls back to 1.0 rather than failing to start. Four is not a hardware limit but the point where the buffers stop earning their size: at a 1440p viewport with multisampling that is already some three gigabytes of render targets, and going further mostly buys frame rate loss and memory pressure. Values below 1.0 render below the viewport size instead, trading sharpness for speed.
 - MaxAnisotropy sets the anisotropic filtering level, clamped to whatever the device supports. Anything at or below 1.0 turns it off. Higher values sharpen textures viewed at a glancing angle, which on these maps is most of the floors and walls.
+- SRGBTextures samples textures as sRGB so the shading runs on linear light, encoding the result back for display at the end. The brightness is unchanged by design: this engine's lighting is a multiplication, and a multiplication gives the same answer in either space, so everything that has to cross over - the light arriving as vertex colours, the fog, the doubling that compensates for half brightness light maps, the detail texture modulation - does, and the result lands where it started. What does change is everything that interpolates or blends rather than multiplies: texture filtering, mip transitions and translucent surfaces resolve in linear light, which reads as smoother gradients and cleaner glow around bright things. Against that, high contrast masked art picks up a visible fringe - the mouse cursor is the clearest example - because a hard white on black edge now filters to a lighter intermediate. Subtle either way, and a matter of taste, which is why it is off by default.
 - FPSLimit caps how many frames per second are presented, or zero to leave the frame rate alone. The engine only enforces a tick rate for network play, so an old game on a modern GPU can run at a frame rate its own timing was never written for - Deus Ex cuts conversation audio short well before a 240Hz display's refresh rate, and 120 or 60 is a reasonable cap there. Where the device supports VK_KHR_present_wait, the limiter paces against when a frame actually reached the screen instead of when it was handed over, which keeps frame times even.
 
 ## Description of D3D12Drv specific settings
@@ -238,6 +240,14 @@ as well; the two are worth roughly the same and supersampling is the better buy
 in this game. The HUD and text share the scene buffer and are softened slightly
 along with everything else, which is the one thing to judge for yourself.
 
+- **sRGB textures.** `SRGBTextures` samples textures as sRGB so the shading runs
+  on linear light, and the present pass encodes the result back for display. The
+  catch is that every value the engine hands over is a display space figure -
+  the vertex lighting, the fog, the light map doubling, the detail modulation -
+  and each has to be converted or the picture is wrong in a way that looks like
+  a lighting bug. Off by default; it is a matter of taste rather than an
+  improvement.
+
 ### Possible future work
 
 Ideas weighed against what the 1112 engine can actually supply. Worth noting
@@ -251,7 +261,15 @@ at several hundred frames per second uncapped.
 
 That leaves two ideas not taken up yet:
 
-1. **Recovering from a lost device.** `VK_ERROR_DEVICE_LOST` currently takes the
+1. **An HDR10 path.** `Hdr` only ever asks for scRGB, which is what Windows and
+   its drivers offer. Wayland compositors expose `VK_COLOR_SPACE_HDR10_ST2084_EXT`
+   instead, so the setting cannot engage there at all. Supporting it means
+   encoding with ST.2084 rather than a power curve, converting to Rec.2020
+   primaries, and deciding what luminance the game's nominal white maps to.
+   Worth weighing against what it buys in this game: Deus Ex's overbright range
+   is narrow, so the gain is brighter coronas and muzzle flashes rather than a
+   transformed image.
+2. **Recovering from a lost device.** `VK_ERROR_DEVICE_LOST` currently takes the
    process with it - hard enough that the log loses its tail, so there is not
    even a line saying what happened. It arrives from a driver timeout, a GPU
    reset, or memory pressure severe enough that an eviction cannot be satisfied,
@@ -260,9 +278,7 @@ That leaves two ideas not taken up yet:
    passes, pipelines, samplers, the whole texture cache - and the engine has to
    be told to precache its textures again afterwards. Worth doing properly or
    not at all; at the very least it should say what happened before it goes.
-2. **sRGB textures and linear lighting**, as XOpenGL's `UsesRGBTextures` does.
-   This changes how the game looks rather than sharpening it, so it belongs
-   behind a setting that defaults to off.
+
 
 Not recommended: the OpenXR VR support in D3D11Drv is not a feature that ports
 across. It is bound up with UT's weapon and HUD handling, and Deus Ex's HUD and
