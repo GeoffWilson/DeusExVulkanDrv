@@ -1,0 +1,117 @@
+# Building VulkanDrv for Deus Ex from Linux
+
+The Visual Studio solution stays the canonical build. This CMake project builds
+the same `DeusExRelease` configuration with clang-cl, so the Deus Ex port can be
+compiled and iterated on without Windows.
+
+## One-time setup
+
+The MSVC CRT and the Windows SDK are downloaded from Microsoft with
+[`xwin`](https://github.com/Jake-Shadle/xwin):
+
+```sh
+cargo install xwin --locked
+xwin --accept-license --arch x86 --cache-dir ../.xwin-cache splat --output ../.xwin
+```
+
+`../.xwin` (next to the repository) is where the toolchain file looks by
+default; pass `-DXWIN_DIR=/some/path` to override. Also needed: `clang-cl`,
+`lld-link`, `llvm-lib`, `llvm-rc`, `cmake`, `ninja` and `python3`.
+
+## Building
+
+```sh
+cmake -S . -B build-deusex -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/xwin-clang-cl-x86.cmake \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build build-deusex -j8
+```
+
+The result is `build-deusex/VulkanDrv.dll`, a 32 bit DLL linked against the
+Deus Ex 1112f import libraries in `Thirdparty/DeusEx`.
+
+## Installing
+
+```sh
+cmake/deploy-deusex.sh /path/to/DeusEx/System
+```
+
+That copies `VulkanDrv.dll` and `VulkanDrv.int` into the game's System folder
+and sets `GameRenderDevice=VulkanDrv.VulkanRenderDevice` in `DeusEx.ini`,
+keeping the previous ini as `DeusEx.ini.prevulkan`.
+
+## What the cross build has to work around
+
+Deus Ex's SDK predates the compilers by two decades, so a few things differ from
+an MSVC build. Each is handled in the build or in a commented source change:
+
+- **Struct packing.** The engine DLLs use 4 byte packing (`/Zp4` in the VS
+  project), but Windows and Vulkan structures need their natural alignment - the
+  Vulkan ABI on 32 bit would otherwise break on every 64 bit field. MSVC gets
+  this from `#pragma pack(push, 8)` around those includes, which clang-cl will
+  not honour above a command line `/Zp`. `Precomp.h` therefore states the
+  engine's packing explicitly and the cross build passes no `/Zp` at all.
+- **Inline assembly.** `appRound`, `appFloor`, `appCycles`, `appSeconds`,
+  `appMemcpy`, `appMemzero` and `appDebugBreak` exist only as MASM blocks in
+  `UnVcWin32.h` and are not exported from Core.dll. The build sets `ASM=0` and
+  `VulkanDrv/UE1AsmShims.h` supplies portable equivalents.
+- **Header case.** The SDK headers include each other with Windows' casing
+  rules (`Core.h` asks for `UnCid.h`, the file is `UnCId.h`). `case-compat.py`
+  generates a directory of symlinks for the alternate spellings.
+- **`TCHAR` is `unsigned short`.** Core.dll exports the UNICODE flavour of the
+  engine API, so the build defines `UNICODE`/`_UNICODE` and compiles with
+  `/Zc:wchar_t-`, matching `CharacterSet=Unicode` in the VS project.
+- **The engine's allocator.** `UnFile.h` replaces global `operator new` and
+  `operator delete` with the engine's `GMalloc`. C++14 sized deallocation then
+  calls `operator delete(void*, size_t)`, which the SDK does *not* replace, so
+  memory from the engine's allocator reaches the CRT's `free()` - it took about
+  820 frames for a `std::vector` reallocation to trip over it. The other SDKs
+  bundled here let a package opt out with `UTGLR_NO_APP_MALLOC`, which
+  `Precomp.h` already defines; the Deus Ex copy had no such guard, so one was
+  added. This is not specific to the cross build: an MSVC build needs it too.
+- **dllimport propagation.** clang extends the `dllimport` on `FString` to the
+  members of its `TArray<TCHAR>` base, which Core.dll never exported;
+  `UnTemplate.h` instantiates that specialization first so they are emitted
+  locally. The same effect made `UObject::operator delete`'s `guard()` ask for a
+  `__FUNC_NAME__` import whose scope number only VC6 produces, so that one
+  `guard()` is gone.
+
+The last three bullets touch `Thirdparty/DeusEx`; those edits are `__clang__`
+guarded or inert, so the MSVC build sees the same code it did before.
+
+## Deus Ex specifics worth knowing
+
+Things found while bringing the port up that are the game's behaviour rather
+than the render device's, so nobody has to rediscover them:
+
+- **Frame rate.** The engine only enforces a tick rate for network play, so
+  Deus Ex free-runs at whatever the GPU manages. Above a few hundred frames per
+  second it truncates conversation audio and the intro's camera interpolation
+  drifts, which makes cinematics look mis-framed. The driver's `FPSLimit`
+  setting caps presentation; 120 or 60 is a reasonable value.
+- **Field of view.** UE1 treats `FovAngle` as the *horizontal* field of view, so
+  a wider display crops the top and bottom rather than showing more at the
+  sides. A render device cannot widen this on its own - the engine culls and
+  clips against its own frustum, so a wider frustum in the device just yields
+  empty wedges at the edges. Raise the game's FOV instead (`DesiredFOV` and
+  `DefaultFOV` in User.ini). To keep the 4:3 vertical view from the default 75
+  degrees: about 91 at 16:9, about 108 at 21:9.
+- **Cinematic letterbox and subtitles.** `CinematicWindow.SetRootViewport()` in
+  DeusEx.u letterboxes cinematics to exactly 16:9 and draws the subtitles in the
+  band below. On a 16:9 screen that band is zero high, and on anything wider the
+  game takes its own "screen size is strange" branch and drops the letterbox, so
+  cinematic subtitles disappear. Only cinematics are affected; ordinary dialogue
+  sizes itself as a fraction of the height and is aspect independent. Playing at
+  4:3 is the only way to get them without patching the game's script. The
+  driver's resolution list offers 4:3 and 16:9 modes at the monitor's full
+  height for exactly this, letterboxed by the present pass.
+- **Switching between fullscreen and windowed.** The engine destroys and
+  recreates the whole render device for every mode change - each toggle shows an
+  `EndFullscreen`/`AttemptFullscreen` pair and a fresh Vulkan device in the log -
+  and the device also asks the engine for a DirectDraw backed fullscreen mode.
+  On Proton the first toggle after startup can leave the desktop unpainted or
+  the window unmapped even though the driver reports no error at all; toggling
+  once more settles it and it then works indefinitely. `UseDirectDraw=False` in
+  DeusEx.ini removes the mode switch, which a Vulkan device has no use for.
+  Doing fullscreen purely as a borderless window would remove it entirely, at
+  the cost of the engine no longer knowing it is fullscreen.
