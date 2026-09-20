@@ -277,6 +277,7 @@
     <ClInclude Include="UploadManager.h" />
     <ClInclude Include="UTF16.h" />
     <ClInclude Include="UD3D11RenderDevice.h" />
+    <ClInclude Include="VRBackend.h" />
     <ClInclude Include="vec.h" />
   </ItemGroup>
   <ItemGroup>
@@ -285,6 +286,7 @@
     <ClCompile Include="FileResource.cpp" />
     <ClCompile Include="halffloat.cpp" />
     <ClCompile Include="mat.cpp" />
+    <ClCompile Include="OpenXRBackendStub.cpp" />
     <ClCompile Include="Precomp.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='DeusExDebug|Win32'">Create</PrecompiledHeader>

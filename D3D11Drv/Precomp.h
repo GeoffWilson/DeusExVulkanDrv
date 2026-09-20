@@ -20,6 +20,7 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <map>
 #include <unordered_map>
