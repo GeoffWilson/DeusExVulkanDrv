@@ -28,6 +28,8 @@
 #include <zvulkan/vulkanbuilders.h>
 #include <zvulkan/vulkancompatibledevice.h>
 #include <mutex>
+#include <chrono>
+#include <thread>
 #include <vector>
 #include <algorithm>
 #include <memory>
@@ -43,6 +45,15 @@
 
 #endif
 
+// The engine DLLs are built with 4 byte struct packing, so its headers must be
+// parsed that way for FTextureInfo, FSceneNode and friends to match. The MSVC
+// project gets this from /Zp4 on the command line; state it here as well so
+// compilers that treat /Zp as a hard cap (clang-cl) still agree with the engine,
+// and so the Windows and Vulkan headers above keep their natural alignment.
+#pragma pack(push, 4)
+
+#include "UE1AsmShims.h"
+
 #include "Engine.h"
 #include "UnRender.h"
 
@@ -53,6 +64,8 @@
 #if defined(OLDUNREAL469SDK)
 #include "Render.h"
 #endif
+
+#pragma pack(pop)
 
 constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 // The frame index belongs to a device, not to the process: it picks which of
