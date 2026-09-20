@@ -105,13 +105,20 @@ than the render device's, so nobody has to rediscover them:
   4:3 is the only way to get them without patching the game's script. The
   driver's resolution list offers 4:3 and 16:9 modes at the monitor's full
   height for exactly this, letterboxed by the present pass.
-- **Switching between fullscreen and windowed.** The engine destroys and
-  recreates the whole render device for every mode change - each toggle shows an
-  `EndFullscreen`/`AttemptFullscreen` pair and a fresh Vulkan device in the log -
-  and the device also asks the engine for a DirectDraw backed fullscreen mode.
-  On Proton the first toggle after startup can leave the desktop unpainted or
-  the window unmapped even though the driver reports no error at all; toggling
-  once more settles it and it then works indefinitely. `UseDirectDraw=False` in
-  DeusEx.ini removes the mode switch, which a Vulkan device has no use for.
-  Doing fullscreen purely as a borderless window would remove it entirely, at
-  the cost of the engine no longer knowing it is fullscreen.
+- **Switching between fullscreen and windowed under Proton.** The engine
+  destroys and recreates the whole render device for every mode change - each
+  toggle shows an `EndFullscreen`/`AttemptFullscreen` pair and a fresh Vulkan
+  device in the log - and the device also asks the engine for a DirectDraw
+  backed fullscreen mode. Under Proton the first toggle after startup can leave
+  the desktop unpainted or the window unmapped, although the driver reports no
+  error at all; toggling once more settles it and it then works indefinitely.
+  The same build on native Windows switches cleanly every time, so this is the
+  wine/compositor/driver handoff rather than the render device.
+  `UseDirectDraw=False` in DeusEx.ini removes the mode switch, which a Vulkan
+  device has no use for, should it help.
+- **Test on Windows, not only on Proton.** Wine enforces the cursor clip
+  loosely, which hid a fault that made the game unplayable on Windows: the
+  engine's pointer clip was left describing the window as it stood before this
+  device restyled it, and the engine read the clamped recentre back as a
+  constant pull on the X axis every frame. Anything touching window or input
+  handling wants checking on Windows before it is believed.
