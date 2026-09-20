@@ -118,6 +118,7 @@ void UVulkanRenderDevice::StaticConstructor()
 
 	GammaCorrectScreenshots = 1;
 
+	RenderScale = 1.0f;
 	FPSLimit = 0;
 
 	VkDeviceIndex = 0;
@@ -165,6 +166,7 @@ void UVulkanRenderDevice::StaticConstructor()
 	new(LightModes->Names)FName(TEXT("BrighterActors"));
 	new(GetClass(), TEXT("LightMode"), RF_Public) UByteProperty(CPP_PROPERTY(LightMode), TEXT("Display"), CPF_Config, LightModes);
 
+	new(GetClass(), TEXT("RenderScale"), RF_Public) UFloatProperty(CPP_PROPERTY(RenderScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDeviceIndex"), RF_Public) UIntProperty(CPP_PROPERTY(VkDeviceIndex), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDebug"), RF_Public) UBoolProperty(CPP_PROPERTY(VkDebug), TEXT("Display"), CPF_Config);
@@ -717,11 +719,28 @@ void UVulkanRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane Sc
 	try
 	{
 		// If frame textures no longer match the window or user settings, recreate them along with the swap chain
-		if (!Textures->Scene || Textures->Scene->Width != Viewport->SizeX || Textures->Scene->Height != Viewport->SizeY ||Textures->Scene->Multisample != GetSettingsMultisample())
+		int sceneWidth, sceneHeight;
+		GetSceneSize(sceneWidth, sceneHeight);
+		if (!Textures->Scene || Textures->Scene->Width != sceneWidth || Textures->Scene->Height != sceneHeight ||Textures->Scene->Multisample != GetSettingsMultisample())
 		{
 			Framebuffers->DestroySceneFramebuffer();
 			Textures->Scene.reset();
-			Textures->Scene.reset(new SceneTextures(this, Viewport->SizeX, Viewport->SizeY, GetSettingsMultisample()));
+			try
+			{
+				Textures->Scene.reset(new SceneTextures(this, sceneWidth, sceneHeight, GetSettingsMultisample()));
+			}
+			catch (const std::exception& e)
+			{
+				// A scale the device cannot find memory for should cost the
+				// setting, not the session - especially as recovering otherwise
+				// means editing the ini to launch at all.
+				if (sceneWidth == Viewport->SizeX && sceneHeight == Viewport->SizeY)
+					throw;
+
+				debugf(TEXT("Could not create %dx%d scene buffers (%s); falling back to the viewport size"), sceneWidth, sceneHeight, appFromAnsi(e.what()));
+				RenderScale = 1.0f;
+				Textures->Scene.reset(new SceneTextures(this, Viewport->SizeX, Viewport->SizeY, GetSettingsMultisample()));
+			}
 			RenderPasses->CreateRenderPass();
 			RenderPasses->CreatePipelines();
 			Framebuffers->CreateSceneFramebuffer();
@@ -873,8 +892,10 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 		if (HitData)
 		{
 			// Look for the last hit
-			int width = Viewport->HitXL;
-			int height = Viewport->HitYL;
+			// Matches the scaled region copied out in BlitSceneToPostprocess.
+			const float hitScale = GetSceneScale();
+			int width = Max((int)std::round(Viewport->HitXL * hitScale), 1);
+			int height = Max((int)std::round(Viewport->HitYL * hitScale), 1);
 			int hit = 0;
 			const int32_t* data = (const int32_t*)Textures->Scene->StagingHitBuffer->Map(0, width * height * sizeof(int32_t));
 			if (data)
@@ -1673,6 +1694,24 @@ void UVulkanRenderDevice::PopHit(INT Count, UBOOL bForce)
 	unguard;
 }
 
+void UVulkanRenderDevice::GetSceneSize(int& width, int& height) const
+{
+	float scale = Clamp(RenderScale, 0.25f, 4.0f);
+	int maxSize = (int)Device->PhysicalDevice.Properties.Properties.limits.maxImageDimension2D;
+
+	width = Clamp((int)std::round(Viewport->SizeX * scale), 1, maxSize);
+	height = Clamp((int)std::round(Viewport->SizeY * scale), 1, maxSize);
+}
+
+float UVulkanRenderDevice::GetSceneScale() const
+{
+	// Taken from the buffers we actually got rather than from the setting, so
+	// rounding and any clamping above are already accounted for.
+	if (!Textures->Scene || Viewport->SizeX <= 0)
+		return 1.0f;
+	return Textures->Scene->Width / (float)Viewport->SizeX;
+}
+
 void UVulkanRenderDevice::LimitFrameRate()
 {
 	if (FPSLimit <= 0)
@@ -1937,11 +1976,16 @@ void UVulkanRenderDevice::SetSceneNode(FSceneNode* Frame)
 	RFX2 = 2.0f * RProjZ / Frame->FX;
 	RFY2 = 2.0f * RProjZ * Aspect / Frame->FY;
 
+	// The engine works in viewport pixels throughout - including the vertices
+	// the 2D drawing calls build from RFX2/RFY2 - so only the rectangle we hand
+	// Vulkan follows the scene buffers up to their scaled size.
+	const float sceneScale = GetSceneScale();
+
 	viewportdesc = {};
-	viewportdesc.x = Frame->XB;
-	viewportdesc.y = Frame->YB;
-	viewportdesc.width = Frame->X;
-	viewportdesc.height = Frame->Y;
+	viewportdesc.x = Frame->XB * sceneScale;
+	viewportdesc.y = Frame->YB * sceneScale;
+	viewportdesc.width = Frame->X * sceneScale;
+	viewportdesc.height = Frame->Y * sceneScale;
 	viewportdesc.minDepth = 0.1f;
 	viewportdesc.maxDepth = 1.0f;
 	commands->setViewport(0, 1, &viewportdesc);
@@ -2094,8 +2138,17 @@ void UVulkanRenderDevice::BlitSceneToPostprocess()
 		VkBufferImageCopy copy = {};
 		copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		copy.imageSubresource.layerCount = 1;
-		copy.imageOffset = { (int32_t)Viewport->HitX, (int32_t)Viewport->HitY, (int32_t)0 };
-		copy.imageExtent = { (uint32_t)Viewport->HitXL, (uint32_t)Viewport->HitYL, (uint32_t)1 };
+		// The hit buffer is a scene buffer, so the engine's hit rectangle has to
+		// be scaled to match - and kept at least a pixel, since the engine asks
+		// for rectangles a fraction of a pixel wide when the scale is below one.
+		const float hitScale = GetSceneScale();
+		const int hitX = (int)(Viewport->HitX * hitScale);
+		const int hitY = (int)(Viewport->HitY * hitScale);
+		const int hitW = Max((int)std::round(Viewport->HitXL * hitScale), 1);
+		const int hitH = Max((int)std::round(Viewport->HitYL * hitScale), 1);
+
+		copy.imageOffset = { (int32_t)hitX, (int32_t)hitY, (int32_t)0 };
+		copy.imageExtent = { (uint32_t)hitW, (uint32_t)hitH, (uint32_t)1 };
 		cmdbuffer->copyImageToBuffer(buffers->PPHitBuffer->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffers->StagingHitBuffer->buffer, 1, &copy);
 
 		PipelineBarrier()

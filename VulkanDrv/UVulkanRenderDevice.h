@@ -59,6 +59,13 @@ public:
 
 	void SetHitLocation();
 
+	// Size of the offscreen scene buffers: the viewport scaled by RenderScale,
+	// clamped to something the device will allocate. Everything the engine hands
+	// us stays in viewport pixels; only the Vulkan viewport, the hit buffer
+	// region and the present blit know about the scaled size.
+	void GetSceneSize(int& width, int& height) const;
+	float GetSceneScale() const;
+
 	// Paces presentation to FPSLimit frames per second. The UE1 engine only
 	// enforces a tick rate for network play, and Deus Ex misbehaves when left to
 	// run at several hundred frames a second - conversation audio gets cut off.
@@ -114,6 +121,7 @@ public:
 	BYTE LightMode;
 	BITFIELD GammaCorrectScreenshots;
 
+	FLOAT RenderScale;
 	INT FPSLimit;
 
 	INT VkDeviceIndex;

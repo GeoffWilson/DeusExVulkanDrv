@@ -41,6 +41,7 @@ All the render devices supports the following renderdev specific settings in eac
 
 VulkanDrv specific settings:
 
+	RenderScale=1.000000
 	FPSLimit=0
 	VkDebug=False
 	VkDeviceIndex=0
@@ -100,6 +101,7 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - VkDebug enables the vulkan debug layer and will make the render device output extra information into the UnrealTournament.log file. 'VkMemStats' can also be typed into the console.
 - VkExclusiveFullscreen enables vulkan's exclusive full screen feature. It is off by default as some users have reported problems with it.
 - VkDeviceIndex selects which vulkan device in the system the render device should use. Type 'GetVkDevices' in the system console to get the list of available devices.
+- RenderScale renders the scene at a multiple of the viewport size and scales the result back down when presenting it, which is supersampling: at 2.0 the game draws four samples for every pixel you see. It anti-aliases everything, including the alpha tested edges and the shimmer of high frequency textures at a distance, where multisampling only reaches geometry edges. The cost is quadratic - 2.0 is four times the pixels, and combining it with MSAA multiplies again - and the HUD and text are drawn into the same buffer, so they are softened along with the rest. Values below 1.0 render below the viewport size instead, trading sharpness for speed. A scale the device cannot allocate falls back to 1.0 rather than failing to start.
 - FPSLimit caps how many frames per second are presented, or zero to leave the frame rate alone. The engine only enforces a tick rate for network play, so an old game on a modern GPU can run at a frame rate its own timing was never written for - Deus Ex cuts conversation audio short well before a 240Hz display's refresh rate, and 120 or 60 is a reasonable cap there.
 
 ## Description of D3D12Drv specific settings
@@ -203,4 +205,42 @@ plane, and - in D3D12Drv - the same unfollowed cursor clip.
   alpha rescaled to cross the threshold over about a pixel so the edge is
   anti-aliased rather than smeared by mip filtering. It costs nothing when
   multisampling is off, and is left off where blending is in play.
+
+- **Supersampling.** `RenderScale` draws the scene into buffers a multiple of
+  the viewport size and scales the result down when presenting, which
+  anti-aliases everything rather than only the geometry edges multisampling
+  reaches - including the texture shimmer a 2000 game shows plenty of. The
+  engine keeps working in viewport pixels throughout; only the Vulkan viewport
+  rectangle, the hit test region and the present blit know about the scaled
+  size, and the hit rectangle has to scale with it or clicking lands in the
+  wrong place. Screenshots come out right for free, since `ReadPixels` already
+  blits rather than copies.
+
+### Possible future work
+
+Ideas weighed against what the 1112 engine can actually supply. Worth noting
+first what cannot be done at all: XOpenGL's `BumpMaps` and `ParallaxVersion`
+need a bump texture per surface that only the 469 engine hands to a render
+device. Deus Ex's `FTextureInfo` has no such field, so there is nothing to
+render from short of an external texture pack keyed on texture name - a
+different project, not a feature port. Performance work is equally moot: the
+game is bound by its own engine long before the GPU, which is why it will run
+at several hundred frames per second uncapped.
+
+That leaves the quality features that need no data the engine does not already
+provide:
+
+1. **Configurable anisotropy.** `MaxAnisotropy` is hardcoded at 8 in all three
+   render devices here. Exposing it, clamped to the device's
+   `maxSamplerAnisotropy`, is a few lines.
+2. **Frame pacing through `VK_KHR_present_wait`.** `FPSLimit` currently sleeps
+   and then spins. Presenting with `present_id` and waiting on it paces frames
+   against the presentation engine itself, for less jitter and less burnt CPU.
+3. **sRGB textures and linear lighting**, as XOpenGL's `UsesRGBTextures` does.
+   This changes how the game looks rather than sharpening it, so it belongs
+   behind a setting that defaults to off.
+
+Not recommended: the OpenXR VR support in D3D11Drv is not a feature that ports
+across. It is bound up with UT's weapon and HUD handling, and Deus Ex's HUD and
+conversation system would need rethinking around it.
 
