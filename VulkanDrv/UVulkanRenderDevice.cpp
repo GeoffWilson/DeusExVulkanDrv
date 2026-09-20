@@ -1842,7 +1842,17 @@ void UVulkanRenderDevice::SetSceneNode(FSceneNode* Frame)
 	commands->setViewport(0, 1, &viewportdesc);
 
 	pushconstants.objectToProjection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+
+#if defined(OLDUNREAL469SDK)
 	pushconstants.nearClip = vec4(Frame->NearClip.X, Frame->NearClip.Y, Frame->NearClip.Z, -Frame->NearClip.W);
+#else
+	// The older engines clip polygons themselves before handing them over, and
+	// their FSceneNode::NearClip is a screen space plane - dotting it with a
+	// world space position clips whatever happens to fall on its negative side.
+	// It is zero in ordinary frames, so only the scene nodes that do set it, the
+	// cinematic cameras, lost geometry. Leave the plane switched off instead.
+	pushconstants.nearClip = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
 
 	unguardSlow;
 }
