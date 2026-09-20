@@ -850,7 +850,8 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 	}
 	catch (std::exception& e)
 	{
-		static std::wstring err;
+		// TCHAR is wchar_t in the 469 SDK but char in the Deus Ex one.
+		static std::basic_string<TCHAR> err;
 		err = appFromAnsi(e.what());
 		appUnwindf(TEXT("%s"), err.c_str());
 	}
