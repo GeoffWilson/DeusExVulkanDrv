@@ -116,7 +116,18 @@ std::string FileResource::readAllText(const std::string& filename)
 				}
 
 				#if defined(ALPHATEST)
-				if (outColor.a < 0.5) discard;
+					#if defined(ALPHATOCOVERAGE)
+						// The hardware turns this alpha into a coverage mask, so
+						// rescale it to cross the 0.5 threshold over about one
+						// pixel. Left as the texture gives it, the cutout fades
+						// across however wide the mip filtering smeared the
+						// edge, which reads as a blurred fringe rather than an
+						// anti aliased one.
+						outColor.a = clamp((outColor.a - 0.5) / max(fwidth(outColor.a), 0.0001) + 0.5, 0.0, 1.0);
+						if (outColor.a <= 0.0) discard;
+					#else
+						if (outColor.a < 0.5) discard;
+					#endif
 				#endif
 
 				outColor = clamp(outColor, 0.0, 1.0);

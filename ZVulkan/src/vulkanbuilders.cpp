@@ -957,6 +957,12 @@ GraphicsPipelineBuilder& GraphicsPipelineBuilder::RasterizationSamples(VkSampleC
 	return *this;
 }
 
+GraphicsPipelineBuilder& GraphicsPipelineBuilder::AlphaToCoverage(bool value)
+{
+	multisampling.alphaToCoverageEnable = value ? VK_TRUE : VK_FALSE;
+	return *this;
+}
+
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::Cache(VulkanPipelineCache* cache)
 {
 	this->cache = cache;

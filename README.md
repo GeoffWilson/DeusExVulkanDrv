@@ -192,3 +192,15 @@ Six fixes, each commented where it lives:
 The last four are engine-agnostic bugs in code shared with D3D11Drv and
 D3D12Drv, which carry the same `FovAngle` line, the same unconditional clip
 plane, and - in D3D12Drv - the same unfollowed cursor clip.
+
+### What else was added
+
+- **Alpha to coverage on masked geometry.** Masked surfaces are a hard alpha
+  test, which multisampling cannot anti-alias: with `AntialiasMode` set, world
+  edges come out smooth while every chain link fence, grate, railing and leaf
+  keeps its jagged cutout - and Deus Ex leans on masked textures heavily. The
+  masked opaque pipelines now let the alpha drive the coverage mask, with the
+  alpha rescaled to cross the threshold over about a pixel so the edge is
+  anti-aliased rather than smeared by mip filtering. It costs nothing when
+  multisampling is off, and is left off where blending is in play.
+

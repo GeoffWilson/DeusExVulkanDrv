@@ -49,6 +49,7 @@ public:
 		std::unique_ptr<VulkanShader> VertexShader;
 		std::unique_ptr<VulkanShader> FragmentShader;
 		std::unique_ptr<VulkanShader> FragmentShaderAlphaTest;
+		std::unique_ptr<VulkanShader> FragmentShaderAlphaToCoverage;
 	} Scene;
 
 	struct

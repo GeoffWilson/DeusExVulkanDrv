@@ -383,6 +383,7 @@ public:
 	GraphicsPipelineBuilder& Viewport(float x, float y, float width, float height, float minDepth = 0.0f, float maxDepth = 1.0f);
 	GraphicsPipelineBuilder& Scissor(int x, int y, int width, int height);
 	GraphicsPipelineBuilder& RasterizationSamples(VkSampleCountFlagBits samples);
+	GraphicsPipelineBuilder& AlphaToCoverage(bool value);
 
 	GraphicsPipelineBuilder& Cull(VkCullModeFlags cullMode, VkFrontFace frontFace);
 	GraphicsPipelineBuilder& DepthStencilEnable(bool test, bool write, bool stencil);

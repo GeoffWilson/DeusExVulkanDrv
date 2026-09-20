@@ -26,6 +26,14 @@ ShaderManager::ShaderManager(UVulkanRenderDevice* renderer) : renderer(renderer)
 		.DebugName("fragmentShader")
 		.Create("fragmentShader", renderer->Device.get());
 
+	// Used for masked geometry when multisampling is on, where the alpha becomes
+	// a coverage mask instead of a straight pass or fail.
+	Scene.FragmentShaderAlphaToCoverage = ShaderBuilder()
+		.Type(ShaderType::Fragment)
+		.AddSource("shaders/Scene.frag", LoadShaderCode("shaders/Scene.frag", "#extension GL_EXT_nonuniform_qualifier : enable\r\n#define ALPHATEST\r\n#define ALPHATOCOVERAGE"))
+		.DebugName("fragmentShader")
+		.Create("fragmentShader", renderer->Device.get());
+
 	Postprocess.VertexShader = ShaderBuilder()
 		.Type(ShaderType::Vertex)
 		.AddSource("shaders/PPStep.vert", LoadShaderCode("shaders/PPStep.vert"))

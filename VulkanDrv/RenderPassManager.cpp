@@ -90,6 +90,8 @@ void RenderPassManager::CreatePipelines()
 	VulkanShader* vertShader = renderer->Shaders->Scene.VertexShader.get();
 	VulkanShader* fragShader = renderer->Shaders->Scene.FragmentShader.get();
 	VulkanShader* fragShaderAlphaTest = renderer->Shaders->Scene.FragmentShaderAlphaTest.get();
+	VulkanShader* fragShaderAlphaToCoverage = renderer->Shaders->Scene.FragmentShaderAlphaToCoverage.get();
+	const bool multisampled = renderer->Textures->Scene->SceneSamples != VK_SAMPLE_COUNT_1_BIT;
 	VulkanPipelineLayout* layout = Scene.BindlessPipelineLayout.get();
 	static const char* debugName = "ScenePipeline";
 
@@ -153,9 +155,22 @@ void RenderPassManager::CreatePipelines()
 		}
 
 		if (i & 16) // PF_Masked
-			builder.AddFragmentShader(fragShaderAlphaTest);
+		{
+			// Masked geometry is a hard alpha test, which multisampling cannot
+			// anti alias - every fence, grate and railing keeps its jagged
+			// cutout however high the sample count. Letting the alpha drive the
+			// coverage mask instead hands those edges to the same samples that
+			// smooth everything else. Only for the plain opaque pass: with
+			// blending enabled, partial coverage and a blend equation fight over
+			// the same pixel.
+			const bool alphaToCoverage = multisampled && (i & 3) == 3;
+			builder.AddFragmentShader(alphaToCoverage ? fragShaderAlphaToCoverage : fragShaderAlphaTest);
+			builder.AlphaToCoverage(alphaToCoverage);
+		}
 		else
+		{
 			builder.AddFragmentShader(fragShader);
+		}
 
 		builder.AddColorBlendAttachment(colorblend.Create());
 		builder.AddColorBlendAttachment(ColorBlendAttachmentBuilder().Create());
