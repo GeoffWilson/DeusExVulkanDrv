@@ -438,6 +438,12 @@ CORE_API void appMemzero( void* Dest, INT Count );
 //
 // C++ style memory allocation.
 //
+// Replacing global new/delete routes every allocation in a render device (the
+// STL's included) through the engine's allocator, while the compiler still
+// pairs them with the CRT's sized operator delete - which frees engine memory
+// with free(). Packages that want to keep the CRT's allocator define
+// UTGLR_NO_APP_MALLOC, as the other SDKs here already allow.
+#ifndef UTGLR_NO_APP_MALLOC
 inline   void* operator new( unsigned int Size, const TCHAR* Tag )
 {
 	guardSlow(new);
@@ -475,6 +481,19 @@ inline void operator delete[]( void* Ptr )
 	guardSlow(delete);
 	appFree( Ptr );
 	unguardSlow;
+}
+#endif
+#else
+// The engine's tagged new is used by inline code in these headers, so it still
+// has to exist - on the CRT's allocator, so that the delete the same inline
+// code pairs with it frees the allocation from the heap it came from.
+inline void* operator new( unsigned int Size, const TCHAR* Tag )
+{
+	return ::operator new( (size_t)Size );
+}
+inline void* operator new[]( unsigned int Size, const TCHAR* Tag )
+{
+	return ::operator new[]( (size_t)Size );
 }
 #endif
 
