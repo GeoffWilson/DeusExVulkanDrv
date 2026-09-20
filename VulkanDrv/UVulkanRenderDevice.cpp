@@ -338,6 +338,46 @@ public:
 	bool& value;
 };
 
+#ifdef WIN32
+
+// Keep the engine's cursor clip on the window we actually have.
+//
+// The engine clips the pointer to the window as it stands when ResizeViewport
+// captures the mouse, but both branches below restyle and move that window
+// afterwards, so the clip is left describing the rectangle the window used to
+// occupy - typically the small windowed frame. The engine goes on recentring the
+// pointer in the middle of the window it now has, and that recentre is clamped
+// to the stale rectangle's edge, so every frame the engine reads the difference
+// back as mouse movement: a constant pull towards that edge, which is a hard
+// spin in game and a cursor pinned against one side in the menus.
+//
+// Wine enforces the clip loosely, which is why this only bites on Windows.
+static void ReclipCursorToWindow(HWND hWnd)
+{
+	RECT clip = {};
+	if (!GetClipCursor(&clip))
+		return;
+
+	// Only follow a clip that is actually confining the pointer; if the engine
+	// has left the cursor free to roam the desktop, leave it that way.
+	RECT desktop =
+	{
+		GetSystemMetrics(SM_XVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN),
+		GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)
+	};
+	if (EqualRect(&clip, &desktop))
+		return;
+
+	RECT client = {};
+	GetClientRect(hWnd, &client);
+	MapWindowPoints(hWnd, nullptr, (POINT*)&client, 2);
+	ClipCursor(&client);
+}
+
+#endif
+
 UBOOL UVulkanRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fullscreen)
 {
 	guard(UVulkanRenderDevice::SetRes);
@@ -399,6 +439,10 @@ UBOOL UVulkanRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL F
 
 		FullscreenState.Enabled = true;
 	}
+
+	// Either branch above may have moved the window out from under the engine,
+	// so bring the cursor clip along with it.
+	ReclipCursorToWindow((HWND)Viewport->GetWindow());
 
 #else
 

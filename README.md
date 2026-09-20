@@ -158,7 +158,7 @@ renderer.
 
 ### What had to change
 
-Five fixes, each commented where it lives:
+Six fixes, each commented where it lives:
 
 - **The package's allocations.** The SDK replaces global `new`/`delete` with the
   engine's allocator, but C++14 sized deallocation bypasses the replacement, so
@@ -178,7 +178,17 @@ Five fixes, each commented where it lives:
 - **Fullscreen state** is captured before `ResizeViewport` rather than after, so
   leaving fullscreen no longer restores the fullscreen geometry as the window to
   come back to.
+- **The cursor clip** now follows the window. `SetRes` restyles and resizes the
+  window after `ResizeViewport`, by which point the engine has already clipped
+  the pointer to the window as it was - the small windowed frame. The engine goes
+  on recentring the pointer in the middle of the window it now has, so that
+  recentre is clamped to the stale rectangle's edge and the engine reads the
+  difference back as mouse movement every frame. At 3440x1440 that is a constant
+  -726 pixels of X per frame: the cursor sits pinned against one side of the
+  menus and the player spins hard left in game, while Y, whose centre still falls
+  inside the stale rectangle, behaves perfectly. Only Windows is affected, as
+  Wine enforces the clip loosely.
 
-The last three are engine-agnostic bugs in code shared with D3D11Drv and
-D3D12Drv, which carry the same `FovAngle` line and the same unconditional clip
-plane.
+The last four are engine-agnostic bugs in code shared with D3D11Drv and
+D3D12Drv, which carry the same `FovAngle` line, the same unconditional clip
+plane, and - in D3D12Drv - the same unfollowed cursor clip.
