@@ -118,6 +118,8 @@ void UVulkanRenderDevice::StaticConstructor()
 
 	GammaCorrectScreenshots = 1;
 
+	FPSLimit = 0;
+
 	VkDeviceIndex = 0;
 	VkDebug = 0;
 	VkExclusiveFullscreen = 0;
@@ -163,6 +165,7 @@ void UVulkanRenderDevice::StaticConstructor()
 	new(LightModes->Names)FName(TEXT("BrighterActors"));
 	new(GetClass(), TEXT("LightMode"), RF_Public) UByteProperty(CPP_PROPERTY(LightMode), TEXT("Display"), CPF_Config, LightModes);
 
+	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDeviceIndex"), RF_Public) UIntProperty(CPP_PROPERTY(VkDeviceIndex), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDebug"), RF_Public) UBoolProperty(CPP_PROPERTY(VkDebug), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkExclusiveFullscreen"), RF_Public) UBoolProperty(CPP_PROPERTY(VkExclusiveFullscreen), TEXT("Display"), CPF_Config);
@@ -809,6 +812,10 @@ void UVulkanRenderDevice::Unlock(UBOOL Blit)
 		bool canPresent = Blit && windowWidth > 0 && windowHeight > 0 && Viewport->SizeX > 0 && Viewport->SizeY > 0;
 
 		SubmitAndWait(canPresent, windowWidth, windowHeight, Viewport->IsFullscreen());
+
+		if (Blit)
+			LimitFrameRate();
+
 
 		Batch.Pipeline = nullptr;
 
@@ -1620,6 +1627,41 @@ void UVulkanRenderDevice::PopHit(INT Count, UBOOL bForce)
 	SetHitLocation();
 
 	unguard;
+}
+
+void UVulkanRenderDevice::LimitFrameRate()
+{
+	if (FPSLimit <= 0)
+	{
+		NextFrameTime = {};
+		return;
+	}
+
+	using namespace std::chrono;
+
+	auto interval = duration_cast<steady_clock::duration>(duration<double>(1.0 / (double)FPSLimit));
+	auto now = steady_clock::now();
+
+	// Pace off when the last frame was due rather than when it finished, so a
+	// frame that runs long is not paid for twice. Restart the pacing if we have
+	// fallen more than one frame behind.
+	if (NextFrameTime == steady_clock::time_point() || now > NextFrameTime + interval)
+		NextFrameTime = now;
+
+	NextFrameTime += interval;
+
+	// Sleeping is only accurate to a millisecond or so, so hand the last of the
+	// wait to a spin.
+	while (true)
+	{
+		auto remaining = NextFrameTime - steady_clock::now();
+		if (remaining <= steady_clock::duration::zero())
+			break;
+		if (remaining > milliseconds(2))
+			std::this_thread::sleep_for(remaining - milliseconds(1));
+		else
+			std::this_thread::yield();
+	}
 }
 
 void UVulkanRenderDevice::SetHitLocation()

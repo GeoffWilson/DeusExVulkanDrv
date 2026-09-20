@@ -59,6 +59,11 @@ public:
 
 	void SetHitLocation();
 
+	// Paces presentation to FPSLimit frames per second. The UE1 engine only
+	// enforces a tick rate for network play, and Deus Ex misbehaves when left to
+	// run at several hundred frames a second - conversation audio gets cut off.
+	void LimitFrameRate();
+
 #if defined(OLDUNREAL469SDK)
 	// URenderDeviceOldUnreal469 extensions
 	void DrawGouraudTriangles(const FSceneNode* Frame, const FTextureInfo& Info, FTransTexture* const Pts, INT NumPts, DWORD PolyFlags, DWORD DataFlags, FSpanBuffer* Span) override;
@@ -108,6 +113,8 @@ public:
 	BYTE GammaMode;
 	BYTE LightMode;
 	BITFIELD GammaCorrectScreenshots;
+
+	INT FPSLimit;
 
 	INT VkDeviceIndex;
 	BITFIELD VkDebug;
@@ -194,6 +201,7 @@ private:
 	float RFY2;
 
 	bool IsLocked = false;
+	std::chrono::steady_clock::time_point NextFrameTime;
 
 	void SetPipeline(PipelineState* pipeline);
 	ivec4 GetTextureIndexes(DWORD PolyFlags, CachedTexture* tex, bool clamp = false);

@@ -32,6 +32,7 @@ All the render devices supports the following renderdev specific settings in eac
 
 VulkanDrv specific settings:
 
+	FPSLimit=0
 	VkDebug=False
 	VkDeviceIndex=0
 	VkExclusiveFullscreen=False
@@ -90,6 +91,7 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - VkDebug enables the vulkan debug layer and will make the render device output extra information into the UnrealTournament.log file. 'VkMemStats' can also be typed into the console.
 - VkExclusiveFullscreen enables vulkan's exclusive full screen feature. It is off by default as some users have reported problems with it.
 - VkDeviceIndex selects which vulkan device in the system the render device should use. Type 'GetVkDevices' in the system console to get the list of available devices.
+- FPSLimit caps how many frames per second are presented, or zero to leave the frame rate alone. The engine only enforces a tick rate for network play, so an old game on a modern GPU can run at a frame rate its own timing was never written for - Deus Ex cuts conversation audio short well before a 240Hz display's refresh rate, and 120 or 60 is a reasonable cap there.
 
 ## Description of D3D12Drv specific settings
 
