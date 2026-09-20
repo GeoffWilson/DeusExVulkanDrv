@@ -59,11 +59,13 @@ public:
 
 	void SetHitLocation();
 
-	// What RenderScale is allowed to ask for. The upper end is a sanity bound
-	// only - the device's own maximum image size and the fallback when an
-	// allocation fails are what actually keep it safe.
+	// What RenderScale is allowed to ask for. Four is not a hardware limit - it
+	// is where the scene buffers stop being worth their size. At eight, a 1440p
+	// viewport with multisampling wants some twelve gigabytes of render targets,
+	// which survives until something else on the desktop wants memory too, and
+	// a device lost from that is not a failure this driver can recover from.
 	static constexpr float MinRenderScale = 0.25f;
-	static constexpr float MaxRenderScale = 8.0f;
+	static constexpr float MaxRenderScale = 4.0f;
 
 	// Size of the offscreen scene buffers: the viewport scaled by RenderScale,
 	// clamped to something the device will allocate. Everything the engine hands
