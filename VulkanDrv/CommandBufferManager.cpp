@@ -158,7 +158,8 @@ void CommandBufferManager::SubmitCommands(bool present, int presentWidth, int pr
 
 	if (present && PresentImageIndex != -1)
 	{
-		SwapChain->QueuePresent(PresentImageIndex, RenderFinishedSemaphore.get());
+		// Ids start at one: zero means "no id" to the swap chain.
+		SwapChain->QueuePresent(PresentImageIndex, RenderFinishedSemaphore.get(), ++PresentId);
 	}
 
 	// Advance frame index. NO vkWaitForFences here!
@@ -213,4 +214,13 @@ void CommandBufferManager::DeleteFrameObjects()
 {
 	for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		FrameDeleteLists[i] = std::make_unique<DeleteList>();
+}
+
+bool CommandBufferManager::WaitForLastPresent(std::chrono::steady_clock::duration timeout)
+{
+	if (!SwapChain || PresentId == 0)
+		return false;
+
+	auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
+	return SwapChain->WaitForPresent(PresentId, (uint64_t)std::max<int64_t>(nanoseconds, 0));
 }

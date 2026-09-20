@@ -37,7 +37,13 @@ public:
 	VulkanImageView* GetImageView(int index) { return views[index].get(); }
 
 	int AcquireImage(VulkanSemaphore* semaphore = nullptr, VulkanFence* fence = nullptr);
-	void QueuePresent(int imageIndex, VulkanSemaphore* semaphore = nullptr);
+	void QueuePresent(int imageIndex, VulkanSemaphore* semaphore = nullptr, uint64_t presentId = 0);
+
+	// Blocks until the present carrying this id has actually reached the screen.
+	// Returns false if the device cannot tell us - no VK_KHR_present_wait, or
+	// the wait timed out - so a caller can fall back to its own timing.
+	bool WaitForPresent(uint64_t presentId, uint64_t timeoutNanoseconds);
+	bool SupportsPresentWait() const;
 
 private:
 	void SelectFormat(const VulkanSurfaceCapabilities& caps, bool hdr);

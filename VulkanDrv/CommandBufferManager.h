@@ -18,6 +18,10 @@ public:
 	VulkanCommandBuffer* GetDrawCommands();
 	void DeleteFrameObjects();
 
+	// Waits for the most recent present to reach the screen. Does nothing, and
+	// says so, where the device has no VK_KHR_present_wait.
+	bool WaitForLastPresent(std::chrono::steady_clock::duration timeout);
+
 	struct DeleteList
 	{
 		std::vector<std::unique_ptr<VulkanImage>> images;
@@ -40,6 +44,7 @@ public:
 
 	std::shared_ptr<VulkanSwapChain> SwapChain;
 	int PresentImageIndex = -1;
+	uint64_t PresentId = 0;
 	BITFIELD UsingVsync = 0;
 	BITFIELD UsingHdr = 0;
 

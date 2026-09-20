@@ -298,12 +298,25 @@ std::vector<VulkanPhysicalDevice> VulkanInstance::GetPhysicalDevices(VkInstance 
 				next = &dev.Features.DescriptorIndexing.pNext;
 			}
 
+			if (checkForExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME))
+			{
+				*next = &dev.Features.PresentId;
+				next = &dev.Features.PresentId.pNext;
+			}
+			if (checkForExtension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME))
+			{
+				*next = &dev.Features.PresentWait;
+				next = &dev.Features.PresentWait.pNext;
+			}
+
 			vkGetPhysicalDeviceFeatures2(dev.Device, &deviceFeatures2);
 			dev.Features.Features = deviceFeatures2.features;
 			dev.Features.BufferDeviceAddress.pNext = nullptr;
 			dev.Features.AccelerationStructure.pNext = nullptr;
 			dev.Features.RayQuery.pNext = nullptr;
 			dev.Features.DescriptorIndexing.pNext = nullptr;
+			dev.Features.PresentId.pNext = nullptr;
+			dev.Features.PresentWait.pNext = nullptr;
 		}
 		else
 		{

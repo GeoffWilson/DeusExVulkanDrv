@@ -248,11 +248,35 @@ int VulkanSwapChain::AcquireImage(VulkanSemaphore* semaphore, VulkanFence* fence
 	}
 }
 
-void VulkanSwapChain::QueuePresent(int imageIndex, VulkanSemaphore* semaphore)
+bool VulkanSwapChain::SupportsPresentWait() const
+{
+	return device->SupportsExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+		device->SupportsExtension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) &&
+		device->EnabledFeatures.PresentId.presentId &&
+		device->EnabledFeatures.PresentWait.presentWait;
+}
+
+bool VulkanSwapChain::WaitForPresent(uint64_t presentId, uint64_t timeoutNanoseconds)
+{
+	if (!SupportsPresentWait() || presentId == 0 || !swapchain)
+		return false;
+
+	VkResult result = vkWaitForPresentKHR(device->device, swapchain, presentId, timeoutNanoseconds);
+	return result == VK_SUCCESS;
+}
+
+void VulkanSwapChain::QueuePresent(int imageIndex, VulkanSemaphore* semaphore, uint64_t presentId)
 {
 	uint32_t index = imageIndex;
+
+	VkPresentIdKHR presentIdInfo = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+	presentIdInfo.swapchainCount = 1;
+	presentIdInfo.pPresentIds = &presentId;
+
 	VkPresentInfoKHR presentInfo = {};
 	presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+	if (presentId != 0 && SupportsPresentWait())
+		presentInfo.pNext = &presentIdInfo;
 	presentInfo.waitSemaphoreCount = semaphore ? 1 : 0;
 	presentInfo.pWaitSemaphores = semaphore ? &semaphore->semaphore : VK_NULL_HANDLE;
 	presentInfo.swapchainCount = 1;
