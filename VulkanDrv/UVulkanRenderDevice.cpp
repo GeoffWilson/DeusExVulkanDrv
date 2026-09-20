@@ -753,6 +753,13 @@ void UVulkanRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane Sc
 			RenderPasses->CreatePipelines();
 			Framebuffers->CreateSceneFramebuffer();
 			DescriptorSets->UpdateFrameDescriptors();
+
+			// Only on a resolution, scale or sample count change, so this says
+			// what is actually being rendered without filling the log.
+			debugf(TEXT("Scene buffers: %dx%d for a %dx%d viewport (RenderScale %.2f), %d samples per pixel"),
+				Textures->Scene->Width, Textures->Scene->Height,
+				(int)Viewport->SizeX, (int)Viewport->SizeY,
+				GetSceneScale(), GetSettingsMultisample() ? GetSettingsMultisample() : 1);
 		}
 
 		auto cmdbuffer = Commands->GetDrawCommands();
