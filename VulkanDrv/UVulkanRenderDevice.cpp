@@ -726,6 +726,18 @@ void UVulkanRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane Sc
 
 	try
 	{
+		// Say so when the setting is not what is being used. Clamping silently is
+		// worse than it sounds: asking for a scale beyond the limit renders
+		// exactly as the limit did, so nothing changes and nothing is logged,
+		// and the setting looks like it did nothing at all - which is true.
+		if (RenderScale != LastRenderScale)
+		{
+			LastRenderScale = RenderScale;
+			float clamped = Clamp(RenderScale, MinRenderScale, MaxRenderScale);
+			if (clamped != RenderScale)
+				debugf(TEXT("RenderScale %.2f is outside the supported range of %.2f to %.2f; rendering at %.2f"), RenderScale, MinRenderScale, MaxRenderScale, clamped);
+		}
+
 		// If frame textures no longer match the window or user settings, recreate them along with the swap chain
 		int sceneWidth, sceneHeight;
 		GetSceneSize(sceneWidth, sceneHeight);
@@ -1711,7 +1723,7 @@ void UVulkanRenderDevice::PopHit(INT Count, UBOOL bForce)
 
 void UVulkanRenderDevice::GetSceneSize(int& width, int& height) const
 {
-	float scale = Clamp(RenderScale, 0.25f, 4.0f);
+	float scale = Clamp(RenderScale, MinRenderScale, MaxRenderScale);
 	int maxSize = (int)Device->PhysicalDevice.Properties.Properties.limits.maxImageDimension2D;
 
 	width = Clamp((int)std::round(Viewport->SizeX * scale), 1, maxSize);

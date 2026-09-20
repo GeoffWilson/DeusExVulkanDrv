@@ -59,6 +59,12 @@ public:
 
 	void SetHitLocation();
 
+	// What RenderScale is allowed to ask for. The upper end is a sanity bound
+	// only - the device's own maximum image size and the fallback when an
+	// allocation fails are what actually keep it safe.
+	static constexpr float MinRenderScale = 0.25f;
+	static constexpr float MaxRenderScale = 8.0f;
+
 	// Size of the offscreen scene buffers: the viewport scaled by RenderScale,
 	// clamped to something the device will allocate. Everything the engine hands
 	// us stays in viewport pixels; only the Vulkan viewport, the hit buffer
@@ -210,6 +216,7 @@ private:
 	float RFY2;
 
 	bool IsLocked = false;
+	FLOAT LastRenderScale = -1.0f;
 	std::chrono::steady_clock::time_point NextFrameTime;
 
 	void SetPipeline(PipelineState* pipeline);
