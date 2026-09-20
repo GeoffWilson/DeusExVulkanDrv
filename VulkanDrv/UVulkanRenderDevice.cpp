@@ -2454,7 +2454,12 @@ void UVulkanRenderDevice::DrawPresentTexture(int width, int height)
 {
 	PresentPushConstants pushconstants = GetPresentPushConstants();
 
-	bool ActiveHdr = (Commands->SwapChain->Format().colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) ? 1 : 0;
+	// Which of the two HDR colour spaces the swapchain settled on decides how
+	// much of the display encode the shader has to do. Both are HDR as far as
+	// the rest of the device is concerned.
+	VkColorSpaceKHR colorSpace = Commands->SwapChain->Format().colorSpace;
+	bool ActiveHdr = colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT || colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+	bool ActiveHdr10 = colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
 
 	// Select present shader based on what the user is actually using
 	int presentShader = 0;
@@ -2462,6 +2467,7 @@ void UVulkanRenderDevice::DrawPresentTexture(int width, int height)
 	if (GammaMode == 1) presentShader |= 2;
 	if (pushconstants.Brightness != 0.0f || pushconstants.Contrast != 1.0f || pushconstants.Saturation != 1.0f) presentShader |= (Clamp(GrayFormula, 0, 2) + 1) << 2;
 	if (SRGBTextures) presentShader |= 16;
+	if (ActiveHdr10) presentShader |= 32;
 
 	float scale = std::min(width / (float)Viewport->SizeX, height / (float)Viewport->SizeY);
 	int letterboxWidth = (int)std::round(Viewport->SizeX * scale);

@@ -58,6 +58,8 @@ void VulkanSwapChain::Create(int width, int height, int imageCount, bool vsync, 
 
 void VulkanSwapChain::SelectFormat(const VulkanSurfaceCapabilities& caps, bool hdr)
 {
+	availableFormats = caps.Formats;
+
 	if (caps.Formats.size() == 1 && caps.Formats.front().format == VK_FORMAT_UNDEFINED)
 	{
 		format.format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -67,9 +69,29 @@ void VulkanSwapChain::SelectFormat(const VulkanSurfaceCapabilities& caps, bool h
 
 	if (hdr)
 	{
+		// scRGB first. It is the easiest of the two to hand values to: the
+		// compositor takes linear light with 1.0 meaning 80 nits and does the
+		// display encode itself, so the present shader only has to undo the
+		// gamma it just applied. Windows offers this; Wayland does not.
 		for (const auto& f : caps.Formats)
 		{
 			if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT && f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
+			{
+				format = f;
+				return;
+			}
+		}
+
+		// HDR10, which is what a Wayland compositor actually offers. Here the
+		// encode is ours to do - Rec.2020 primaries and the ST.2084 curve, in
+		// the present shader. Ten bits per channel is not a preference: PQ
+		// spends its code values across 0..10000 nits, so at eight bits the
+		// banding lands in the dark end of the picture, which in Deus Ex is
+		// most of the picture.
+		for (const auto& f : caps.Formats)
+		{
+			if (f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+				(f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32))
 			{
 				format = f;
 				return;

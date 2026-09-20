@@ -32,6 +32,11 @@ public:
 	int Height() const { return actualExtent.height; }
 	VkSurfaceFormatKHR Format() const { return format; }
 
+	// Every format/colour space pair the surface offered at the last Create.
+	// Kept so a caller can say what it had to choose between, which is the only
+	// way to tell "the compositor does not offer HDR" from "we asked wrongly".
+	const std::vector<VkSurfaceFormatKHR>& AvailableFormats() const { return availableFormats; }
+
 	int ImageCount() const { return (int)images.size(); }
 	VulkanImage* GetImage(int index) { return images[index].get(); }
 	VulkanImageView* GetImageView(int index) { return views[index].get(); }
@@ -58,6 +63,7 @@ private:
 	VkExtent2D actualExtent = {};
 	VkSwapchainKHR swapchain = VK_NULL_HANDLE;
 	VkSurfaceFormatKHR format = {};
+	std::vector<VkSurfaceFormatKHR> availableFormats;
 	VkPresentModeKHR presentMode;
 	std::vector<std::unique_ptr<VulkanImage>> images;
 	std::vector<std::unique_ptr<VulkanImageView>> views;

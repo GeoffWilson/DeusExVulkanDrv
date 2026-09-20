@@ -85,7 +85,7 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - GammaMode:
   - D3D9: Use the gamma calculations from the other Direct3D render devices
   - XOpenGL: Use the gamma calculations from the XOpenGL render device
-- Hdr: Overbright pixels will use the high dynamic range of the monitor. Note: this will only work if HDR is enabled in the Windows display settings and if you have a HDR capable monitor. Windows only in practice: the swap chain is asked for scRGB (`VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`), which Wayland compositors do not offer - they expose HDR10 PQ instead - so the setting quietly stays SDR there. Supporting it would mean a second present path with ST.2084 encoding, Rec.2020 primaries and a luminance target, not just another surface format
+- Hdr: Overbright pixels will use the high dynamic range of the monitor. Needs HDR enabled in the desktop's display settings and a display that can do it. Two surface types are accepted, in order of preference: scRGB (`VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`), which Windows offers and where the compositor does the display encode, and HDR10 (`VK_COLOR_SPACE_HDR10_ST2084_EXT`) at ten bits per channel, which is what Wayland compositors offer and where the present shader does the Rec.2020 and ST.2084 encode itself. If neither is offered the setting stays SDR; the log says which of the three happened. `HdrScale` sets what the game's white is worth in both paths, so the picture does not change brightness when the same machine moves between them
 - AntialiasMode:
   - Off: No anti alias applied
   - MSAA_2x: 2x multisampling
@@ -220,6 +220,53 @@ plane, and - in D3D12Drv - the same unfollowed cursor clip.
   wrong place. Screenshots come out right for free, since `ReadPixels` already
   blits rather than copies.
 
+- **sRGB textures.** `SRGBTextures` samples textures as sRGB so the shading runs
+  on linear light, and the present pass encodes the result back for display. The
+  catch is that every value the engine hands over is a display space figure -
+  the vertex lighting, the fog, the light map doubling, the detail modulation -
+  and each has to be converted or the picture is wrong in a way that looks like
+  a lighting bug. Off by default; it is a matter of taste rather than an
+  improvement.
+
+- **HDR on Wayland.** `Hdr` asked only for scRGB, which is what Windows offers
+  and what lets a render device hand over linear light and leave the display
+  encode to the compositor. Wayland offers HDR10 instead, so the setting could
+  not engage at all on Linux - and silently, since falling back to an SDR
+  surface is not an error. The swap chain now takes either, preferring scRGB
+  where both exist, and a second present variant does the work HDR10 does not
+  do for you: Rec.2020 primaries, the ST.2084 curve, and a real luminance for
+  white rather than "1.0". `HdrScale` keeps its meaning across both, because
+  scRGB defines 1.0 as 80 nits and the HDR10 path multiplies by exactly that
+  before encoding. Ten bits per channel is required rather than preferred - PQ
+  spends its code values over 0 to 10000 nits, so at eight bits the banding
+  lands in the dark end of the picture, which in this game is most of the
+  picture. Changing the setting changes the swap chain format, which the present
+  render pass declares, so that pass and its pipelines are now rebuilt when the
+  format moves.
+
+  Under Proton this needs `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` in the
+  game's launch options. Without the first of those the game runs on XWayland,
+  which has no colour management to pass through, and the surface offers two
+  8 bit sRGB formats and nothing else however the desktop is configured - so
+  the setting cannot engage and, since falling back to SDR is not an error,
+  says nothing about why. That is what the log lines are for: on a fallback the
+  driver prints whether `VK_EXT_swapchain_colorspace` went in and every
+  format/colour space pair the surface offered, which separates "the compositor
+  has no HDR to give" from "the driver asked for a pairing it was never going
+  to get".
+
+  Worth knowing what it buys before spending an evening on it. Deus Ex has no
+  HDR content: the scene buffer holds ordinary display referred values that
+  rarely exceed white. What changes is that the values which do - coronas, a
+  flashlight on a near wall, muzzle flashes - stop being clipped flat, and the
+  dark end gets ten bits instead of eight. Measured against SDR on a 3440x1440
+  HDR display, the difference is real but small. `HdrScale` is worth setting
+  deliberately rather than left alone, because PQ is absolute: it is what
+  declares the game's white in nits (128 is 184 nits, 255 is 304), and if the
+  desktop maps SDR content brighter than that the game will simply look dimmer
+  than it did before. It can be changed live from the console with
+  `set VulkanDrv.VulkanRenderDevice HdrScale 255`.
+
 ### Recommended settings for Deus Ex
 
 	RenderScale=2.000000
@@ -240,14 +287,6 @@ as well; the two are worth roughly the same and supersampling is the better buy
 in this game. The HUD and text share the scene buffer and are softened slightly
 along with everything else, which is the one thing to judge for yourself.
 
-- **sRGB textures.** `SRGBTextures` samples textures as sRGB so the shading runs
-  on linear light, and the present pass encodes the result back for display. The
-  catch is that every value the engine hands over is a display space figure -
-  the vertex lighting, the fog, the light map doubling, the detail modulation -
-  and each has to be converted or the picture is wrong in a way that looks like
-  a lighting bug. Off by default; it is a matter of taste rather than an
-  improvement.
-
 ### Possible future work
 
 Ideas weighed against what the 1112 engine can actually supply. Worth noting
@@ -259,17 +298,9 @@ different project, not a feature port. Performance work is equally moot: the
 game is bound by its own engine long before the GPU, which is why it will run
 at several hundred frames per second uncapped.
 
-That leaves two ideas not taken up yet:
+That leaves one idea not taken up yet:
 
-1. **An HDR10 path.** `Hdr` only ever asks for scRGB, which is what Windows and
-   its drivers offer. Wayland compositors expose `VK_COLOR_SPACE_HDR10_ST2084_EXT`
-   instead, so the setting cannot engage there at all. Supporting it means
-   encoding with ST.2084 rather than a power curve, converting to Rec.2020
-   primaries, and deciding what luminance the game's nominal white maps to.
-   Worth weighing against what it buys in this game: Deus Ex's overbright range
-   is narrow, so the gain is brighter coronas and muzzle flashes rather than a
-   transformed image.
-2. **Recovering from a lost device.** `VK_ERROR_DEVICE_LOST` currently takes the
+1. **Recovering from a lost device.** `VK_ERROR_DEVICE_LOST` currently takes the
    process with it - hard enough that the log loses its tail, so there is not
    even a line saying what happened. It arrives from a driver timeout, a GPU
    reset, or memory pressure severe enough that an eviction cannot be satisfied,

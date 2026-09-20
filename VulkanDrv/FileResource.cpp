@@ -312,6 +312,55 @@ std::string FileResource::readAllText(const std::string& filename)
 
 			#endif
 
+			#if defined(HDR10_MODE)
+
+			// HDR10: Rec.2020 primaries and the ST.2084 (PQ) transfer curve.
+			//
+			// The scRGB path above hands the compositor linear light and lets it
+			// do the display encode. HDR10 has no such arrangement - a code value
+			// means a specific luminance, full stop - so both halves of the encode
+			// are ours to do here. This is the path Wayland takes, since it offers
+			// HDR10 and not scRGB.
+
+			// Rec.709 -> Rec.2020. Both are D65, so this is a pure gamut rotation
+			// with no white point adaptation. Skipping it does not fail loudly: the
+			// display simply reads our narrow gamut numbers as wide gamut ones and
+			// every colour comes back oversaturated.
+			vec3 rec709ToRec2020(vec3 c)
+			{
+				const mat3 M = mat3(
+					0.6274040, 0.0690970, 0.0163916,   // column major
+					0.3292820, 0.9195400, 0.0880132,
+					0.0433136, 0.0113612, 0.8955950);
+				return M * c;
+			}
+
+			// ST.2084 inverse EOTF. Input is luminance with 1.0 meaning PQ's
+			// ceiling of 10000 nits; output is the code value the display decodes.
+			vec3 pqEncode(vec3 L)
+			{
+				const float m1 = 0.1593017578125;   // 2610/16384
+				const float m2 = 78.84375;          // 2523/4096 * 128
+				const float c1 = 0.8359375;         // 3424/4096
+				const float c2 = 18.8515625;        // 2413/4096 * 32
+				const float c3 = 18.6875;           // 2392/4096 * 32
+
+				vec3 y = pow(clamp(L, 0.0, 1.0), vec3(m1));
+				return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
+			}
+
+			vec3 encodeHdr10(vec3 c)
+			{
+				// linearHdr() produces scRGB units, in which 1.0 is 80 nits by
+				// definition. Multiplying by that turns them into real luminance,
+				// which is what PQ wants and the reason HdrScale means the same
+				// brightness in both HDR paths rather than two different ones.
+				vec3 nits = linearHdr(max(c, vec3(0.0))) * 80.0;
+				return pqEncode(max(rec709ToRec2020(nits), vec3(0.0)) / 10000.0);
+			}
+
+			#endif
+
 			void main()
 			{
 				vec3 sceneColor = texture(texSampler, texCoord).rgb;
@@ -319,7 +368,9 @@ std::string FileResource::readAllText(const std::string& filename)
 				sceneColor = encodeDisplay(sceneColor);
 			#endif
 				vec3 color = gammaCorrect(colorCorrect(sceneColor));
-			#if defined(HDR_MODE)
+			#if defined(HDR10_MODE)
+				outColor = vec4(encodeHdr10(color), 1.0f);
+			#elif defined(HDR_MODE)
 				outColor = vec4(linearHdr(color), 1.0f);
 			#else
 				outColor = vec4(dither(color), 1.0f);

@@ -56,7 +56,7 @@ public:
 	struct
 	{
 		std::unique_ptr<VulkanShader> VertexShader;
-		std::unique_ptr<VulkanShader> FragmentPresentShader[32];
+		std::unique_ptr<VulkanShader> FragmentPresentShader[64];
 	} Postprocess;
 
 	struct

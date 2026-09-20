@@ -101,6 +101,54 @@ void CommandBufferManager::SubmitCommands(bool present, int presentWidth, int pr
 			UsingHdr = renderer->Hdr;
 			renderer->Framebuffers->DestroySwapChainFramebuffers();
 			SwapChain->Create(presentWidth, presentHeight, renderer->UseVSync ? 2 : 3, renderer->UseVSync, renderer->Hdr, renderer->VkExclusiveFullscreen && presentFullscreen);
+
+			// Turning HDR on or off changes the swapchain's pixel format, and a
+			// render pass states the format of its attachment - so the present
+			// pass and the pipelines built against it no longer match what they
+			// would be rendering into. Rebuild them when, and only when, the
+			// format actually moved. Other frames may still hold the old ones,
+			// hence the idle: this happens on a settings change, not per frame.
+			if (renderer->Hdr)
+			{
+				switch (SwapChain->Format().colorSpace)
+				{
+				case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+					debugf(TEXT("HDR output: scRGB, the compositor does the display encode"));
+					break;
+				case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+					debugf(TEXT("HDR output: HDR10, Rec.2020 primaries and the PQ curve encoded by the present shader"));
+					break;
+				default:
+					// Say what was on offer instead. Without it there is no way
+					// to tell a compositor that does not do HDR from a surface
+					// that does but in a pairing this code did not look for.
+					debugf(TEXT("HDR was requested but the surface offers neither scRGB nor HDR10 - staying SDR"));
+
+					// A surface can only ever report an HDR colour space if this
+					// instance extension went in. It is optional, so if the
+					// loader did not have it we asked a question that could only
+					// have one answer, and that is not the compositor's doing.
+					{
+						const std::set<std::string>& enabled = renderer->Device->Instance->EnabledExtensions;
+						bool colorSpaceExt = enabled.find(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) != enabled.end();
+						debugf(TEXT("  %s is %s"), appFromAnsi(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), colorSpaceExt ? TEXT("enabled") : TEXT("NOT enabled - no HDR colour space can be reported without it"));
+					}
+
+					for (const VkSurfaceFormatKHR& f : SwapChain->AvailableFormats())
+						debugf(TEXT("  surface offers format %d, color space %d"), (int)f.format, (int)f.colorSpace);
+					break;
+				}
+			}
+
+			VkFormat swapChainFormat = SwapChain->Format().format;
+			if (swapChainFormat != UsingSwapChainFormat)
+			{
+				vkDeviceWaitIdle(renderer->Device->device);
+				UsingSwapChainFormat = swapChainFormat;
+				renderer->RenderPasses->CreatePresentRenderPass();
+				renderer->RenderPasses->CreatePresentPipeline();
+			}
+
 			renderer->Framebuffers->CreateSwapChainFramebuffers();
 		}
 

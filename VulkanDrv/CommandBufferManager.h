@@ -47,6 +47,7 @@ public:
 	uint64_t PresentId = 0;
 	BITFIELD UsingVsync = 0;
 	BITFIELD UsingHdr = 0;
+	VkFormat UsingSwapChainFormat = VK_FORMAT_UNDEFINED;
 
 private:
 	UVulkanRenderDevice* renderer = nullptr;

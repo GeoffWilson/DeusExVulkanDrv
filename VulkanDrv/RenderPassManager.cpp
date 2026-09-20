@@ -344,8 +344,13 @@ void RenderPassManager::CreatePresentRenderPass()
 
 void RenderPassManager::CreatePresentPipeline()
 {
-	for (int i = 0; i < 32; i++)
+	for (int i = 0; i < 64; i++)
 	{
+		// Combinations the shader manager does not build (HDR10 without HDR)
+		// have no fragment shader to give the pipeline.
+		if (!renderer->Shaders->Postprocess.FragmentPresentShader[i])
+			continue;
+
 		Present.Pipeline[i] = GraphicsPipelineBuilder()
 			.AddVertexShader(renderer->Shaders->Postprocess.VertexShader.get())
 			.AddFragmentShader(renderer->Shaders->Postprocess.FragmentPresentShader[i].get())
@@ -360,8 +365,11 @@ void RenderPassManager::CreatePresentPipeline()
 
 void RenderPassManager::CreateScreenshotPipeline()
 {
-	for (int i = 0; i < 32; i++)
+	for (int i = 0; i < 64; i++)
 	{
+		if (!renderer->Shaders->Postprocess.FragmentPresentShader[i])
+			continue;
+
 		Present.ScreenshotPipeline[i] = GraphicsPipelineBuilder()
 			.AddVertexShader(renderer->Shaders->Postprocess.VertexShader.get())
 			.AddFragmentShader(renderer->Shaders->Postprocess.FragmentPresentShader[i].get())
