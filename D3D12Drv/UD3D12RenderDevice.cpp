@@ -330,6 +330,43 @@ public:
 	bool& value;
 };
 
+// Keep the engine's cursor clip on the window we actually have.
+//
+// The engine clips the pointer to the window as it stands when ResizeViewport
+// captures the mouse, but the fullscreen branches below restyle and move that
+// window afterwards, so the clip is left describing the rectangle the window
+// used to occupy - typically the small windowed frame. The engine goes on
+// recentring the pointer in the middle of the window it now has, and that
+// recentre is clamped to the stale rectangle's edge, so every frame the engine
+// reads the difference back as mouse movement: a constant pull towards that
+// edge, which is a hard spin in game and a cursor pinned against one side in
+// the menus.
+//
+// Wine enforces the clip loosely, which is why this only bites on Windows.
+static void ReclipCursorToWindow(HWND hWnd)
+{
+	RECT clip = {};
+	if (!GetClipCursor(&clip))
+		return;
+
+	// Only follow a clip that is actually confining the pointer; if the engine
+	// has left the cursor free to roam the desktop, leave it that way.
+	RECT desktop =
+	{
+		GetSystemMetrics(SM_XVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN),
+		GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)
+	};
+	if (EqualRect(&clip, &desktop))
+		return;
+
+	RECT client = {};
+	GetClientRect(hWnd, &client);
+	MapWindowPoints(hWnd, nullptr, (POINT*)&client, 2);
+	ClipCursor(&client);
+}
+
 UBOOL UD3D12RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fullscreen)
 {
 	guard(UD3D12RenderDevice::SetRes);
@@ -366,6 +403,19 @@ UBOOL UD3D12RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fu
 		FullscreenState.Enabled = false;
 	}
 
+	// Save the windowed state before resizing the viewport, not after: the
+	// engine's own fullscreen handling moves and restyles the window as part of
+	// the resize, so reading it afterwards saves the fullscreen geometry as the
+	// one to go back to - and the window then never comes back down, leaving the
+	// game rendering a small viewport into a still fullscreen sized window.
+	const bool enteringFullscreen = Fullscreen && !FullscreenState.Enabled;
+	if (enteringFullscreen)
+	{
+		GetWindowRect((HWND)Viewport->GetWindow(), &FullscreenState.WindowPos);
+		FullscreenState.Style = GetWindowLong((HWND)Viewport->GetWindow(), GWL_STYLE);
+		FullscreenState.ExStyle = GetWindowLong((HWND)Viewport->GetWindow(), GWL_EXSTYLE);
+	}
+
 	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), NewX, NewY, NewColorBytes))
 	{
 		debugf(TEXT("Viewport.ResizeViewport failed (%d, %d, %d, %d)"), NewX, NewY, NewColorBytes, (INT)Fullscreen);
@@ -375,13 +425,8 @@ UBOOL UD3D12RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fu
 	CurrentSizeX = NewX;
 	CurrentSizeY = NewY;
 
-	if (Fullscreen && !FullscreenState.Enabled) // Entering fullscreen
+	if (enteringFullscreen)
 	{
-		// Save old state
-		GetWindowRect((HWND)Viewport->GetWindow(), &FullscreenState.WindowPos);
-		FullscreenState.Style = GetWindowLong((HWND)Viewport->GetWindow(), GWL_STYLE);
-		FullscreenState.ExStyle = GetWindowLong((HWND)Viewport->GetWindow(), GWL_EXSTYLE);
-
 		// Find primary monitor resolution
 		HDC screenDC = GetDC(0);
 		int screenWidth = GetDeviceCaps(screenDC, HORZRES);
@@ -418,6 +463,10 @@ UBOOL UD3D12RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fu
 			debugf(TEXT("SwapChain.ResizeTarget failed (%d, %d, %d, %d)"), NewX, NewY, NewColorBytes, (INT)Fullscreen);
 		}
 	}
+
+	// Either fullscreen branch above may have moved the window out from under
+	// the engine, so bring the cursor clip along with it.
+	ReclipCursorToWindow((HWND)Viewport->GetWindow());
 
 	if (!UpdateSwapChain())
 		return FALSE;
@@ -1947,6 +1996,15 @@ UBOOL UD3D12RenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			output->Release();
 		}
 
+		// The engine treats FovAngle as the horizontal field of view, so a wider
+		// display crops the top and bottom rather than showing more at the sides,
+		// and Deus Ex's cinematic subtitles are only drawn at 16:9 or narrower.
+		// Offering these at the monitor's full height gives a way out of both:
+		// the present pass centres them with bars instead of stretching. Same
+		// list VulkanDrv offers.
+		resolutions.insert({ (DesktopResolution.Height * 4 + 2) / 3, DesktopResolution.Height });
+		resolutions.insert({ (DesktopResolution.Height * 16 + 8) / 9, DesktopResolution.Height });
+
 		FString Str;
 		for (const Resolution& resolution : resolutions)
 		{
@@ -3289,7 +3347,19 @@ void UD3D12RenderDevice::SetSceneNode(FSceneNode* Frame)
 
 	CurrentFrame = Frame;
 	Aspect = Frame->FY / Frame->FX;
-	RProjZ = (float)appTan(radians(Viewport->Actor->FovAngle) * 0.5);
+	// The engine projects a point as Point.X * Frame->Proj.Z / Point.Z + FX15
+	// (see FVertex::Project), so Frame->Proj.Z carries the field of view this
+	// scene node is actually being rendered with. Taking it from the player
+	// instead only agrees while the player is the camera: Deus Ex shoots its
+	// cinematics through a camera with its own FOV, and the mismatch scales the
+	// whole scene, pushing the actors out of frame. Fall back to the player's
+	// FOV where the engine gives no usable projection, such as an ortho
+	// viewport in the editor.
+	APlayerPawn* ViewActor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
+	if (Frame->Proj.Z > 0.0f)
+		RProjZ = Frame->FX / (2.0f * Frame->Proj.Z);
+	else
+		RProjZ = (float)appTan(radians(ViewActor ? ViewActor->FovAngle : 90.0f) * 0.5);
 	RFX2 = 2.0f * RProjZ / Frame->FX;
 	RFY2 = 2.0f * RProjZ * Aspect / Frame->FY;
 
@@ -3303,7 +3373,16 @@ void UD3D12RenderDevice::SetSceneNode(FSceneNode* Frame)
 	Commands.Current->Draw->RSSetViewports(1, &SceneViewport);
 
 	SceneConstants.ObjectToProjection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+#if defined(OLDUNREAL469SDK)
 	SceneConstants.NearClip = vec4(Frame->NearClip.X, Frame->NearClip.Y, Frame->NearClip.Z, -Frame->NearClip.W);
+#else
+	// The older engines clip polygons themselves before handing them over, and
+	// their FSceneNode::NearClip is a screen space plane - dotting it with a
+	// world space position clips whatever happens to fall on its negative side.
+	// It is zero in ordinary frames, so only the scene nodes that do set it, the
+	// cinematic cameras, lost geometry. Leave the plane switched off instead.
+	SceneConstants.NearClip = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
 
 	unguardSlow;
 }

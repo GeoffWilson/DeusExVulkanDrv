@@ -73,6 +73,7 @@ void UD3D11RenderDevice::StaticConstructor()
 	LODBias = 0.0f;
 	LightMode = 0;
 	RefreshRate = 0;
+	UseExclusiveFullscreen = 0;
 
 	GammaCorrectScreenshots = 1;
 	UseDebugLayer = 0;
@@ -141,6 +142,7 @@ void UD3D11RenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("BloomAmount"), RF_Public) UByteProperty(CPP_PROPERTY(BloomAmount), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LODBias"), RF_Public) UFloatProperty(CPP_PROPERTY(LODBias), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("RefreshRate"), RF_Public) UIntProperty(CPP_PROPERTY(RefreshRate), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("UseExclusiveFullscreen"), RF_Public) UBoolProperty(CPP_PROPERTY(UseExclusiveFullscreen), TEXT("Display"), CPF_Config);
 
 	UEnum* AntialiasModes = new(GetClass(), TEXT("AntialiasModes"))UEnum(nullptr);
 	new(AntialiasModes->Names)FName(TEXT("Off"));
@@ -552,6 +554,44 @@ public:
 	bool& value;
 };
 
+// Keep the engine's cursor clip on the window we actually have.
+//
+// The engine clips the pointer to the window as it stands when ResizeViewport
+// captures the mouse. This device does not restyle that window itself, but
+// SetFullscreenState and ResizeTarget below hand it to DXGI, which resizes it -
+// so the clip is left describing the rectangle the window used to occupy. The
+// engine goes on recentring the pointer in the middle of the window it now has,
+// and that recentre is clamped to the stale rectangle's edge, so every frame the
+// engine reads the difference back as mouse movement: a constant pull towards
+// that edge, which is a hard spin in game and a cursor pinned against one side
+// in the menus.
+//
+// Wine enforces the clip loosely, so this is mild there and bites hardest on
+// Windows - the same fault, and the same fix, as in VulkanDrv and D3D12Drv.
+static void ReclipCursorToWindow(HWND hWnd)
+{
+	RECT clip = {};
+	if (!GetClipCursor(&clip))
+		return;
+
+	// Only follow a clip that is actually confining the pointer; if the engine
+	// has left the cursor free to roam the desktop, leave it that way.
+	RECT desktop =
+	{
+		GetSystemMetrics(SM_XVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN),
+		GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)
+	};
+	if (EqualRect(&clip, &desktop))
+		return;
+
+	RECT client = {};
+	GetClientRect(hWnd, &client);
+	MapWindowPoints(hWnd, nullptr, (POINT*)&client, 2);
+	ClipCursor(&client);
+}
+
 UBOOL UD3D11RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fullscreen)
 {
 	guard(UD3D11RenderDevice::SetRes);
@@ -633,6 +673,18 @@ UBOOL UD3D11RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fu
 
 		debugf(TEXT("D3D11Drv: Calling Viewport->ResizeViewport(BLIT_Fullscreen | BLIT_Direct3D, %d, %d, %d)"), NewX, NewY, NewColorBytes);
 
+		// Save the windowed state before resizing the viewport, not after: the
+		// engine's fullscreen handling moves and restyles the window as part of
+		// the resize, so reading it afterwards saves the fullscreen geometry as
+		// the one to go back to, and the window never comes back down.
+		const bool enteringFullscreen = !FullscreenState.Enabled;
+		if (enteringFullscreen && !UseExclusiveFullscreen)
+		{
+			GetWindowRect((HWND)Viewport->GetWindow(), &FullscreenState.WindowPos);
+			FullscreenState.Style = GetWindowLong((HWND)Viewport->GetWindow(), GWL_STYLE);
+			FullscreenState.ExStyle = GetWindowLong((HWND)Viewport->GetWindow(), GWL_EXSTYLE);
+		}
+
 		// If we are going fullscreen we want to resize the window *prior* to entering fullscreen.
 		if (!Viewport->ResizeViewport(BLIT_Fullscreen | BLIT_Direct3D, NewX, NewY, NewColorBytes))
 		{
@@ -640,22 +692,53 @@ UBOOL UD3D11RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fu
 			return FALSE;
 		}
 
-		result = SwapChain->SetFullscreenState(TRUE, nullptr);
-		if (FAILED(result))
+		if (UseExclusiveFullscreen)
 		{
-			debugf(TEXT("SwapChain.SetFullscreenState failed (%d, %d, %d, %d)"), NewX, NewY, NewColorBytes, (INT)Fullscreen);
-			// Don't fail this as it can happen if the application isn't the foreground process
-		}
+			result = SwapChain->SetFullscreenState(TRUE, nullptr);
+			if (FAILED(result))
+			{
+				debugf(TEXT("SwapChain.SetFullscreenState failed (%d, %d, %d, %d)"), NewX, NewY, NewColorBytes, (INT)Fullscreen);
+				// Don't fail this as it can happen if the application isn't the foreground process
+			}
 
-		result = SwapChain->ResizeTarget(&modeDesc);
-		if (FAILED(result))
+			result = SwapChain->ResizeTarget(&modeDesc);
+			if (FAILED(result))
+			{
+				debugf(TEXT("SwapChain.ResizeTarget failed (%d, %d, %d, %d)"), NewX, NewY, NewColorBytes, (INT)Fullscreen);
+			}
+		}
+		else
 		{
-			debugf(TEXT("SwapChain.ResizeTarget failed (%d, %d, %d, %d)"), NewX, NewY, NewColorBytes, (INT)Fullscreen);
+			// Borderless instead, the way D3D12Drv has always done it: a window
+			// the size of the desktop with no frame, and no display mode change
+			// at all. The present pass letterboxes whatever resolution the game
+			// asked for into it, so this costs nothing but the mode switch - and
+			// the mode switch is the part wine handles worst.
+			SetWindowLong((HWND)Viewport->GetWindow(), GWL_STYLE, WS_OVERLAPPED | WS_VISIBLE);
+			SetWindowLong((HWND)Viewport->GetWindow(), GWL_EXSTYLE, WS_EX_APPWINDOW);
+			SetWindowPos((HWND)Viewport->GetWindow(), HWND_TOP, 0, 0, DesktopResolution.Width, DesktopResolution.Height, SWP_FRAMECHANGED | SWP_NOSENDCHANGING | SWP_NOACTIVATE | SWP_NOZORDER);
+			FullscreenState.Enabled = true;
 		}
 	}
 	else
 	{
-		if (CurrentFullscreen)
+		if (FullscreenState.Enabled)
+		{
+			// Put the frame and the old rectangle back.
+			SetWindowLong((HWND)Viewport->GetWindow(), GWL_STYLE, FullscreenState.Style);
+			SetWindowLong((HWND)Viewport->GetWindow(), GWL_EXSTYLE, FullscreenState.ExStyle);
+			SetWindowPos(
+				(HWND)Viewport->GetWindow(),
+				HWND_TOP,
+				FullscreenState.WindowPos.left,
+				FullscreenState.WindowPos.top,
+				FullscreenState.WindowPos.right - FullscreenState.WindowPos.left,
+				FullscreenState.WindowPos.bottom - FullscreenState.WindowPos.top,
+				SWP_FRAMECHANGED | SWP_NOSENDCHANGING | SWP_NOACTIVATE | SWP_NOZORDER);
+
+			FullscreenState.Enabled = false;
+		}
+		else if (CurrentFullscreen)
 		{
 			result = SwapChain->SetFullscreenState(FALSE, nullptr);
 			if (FAILED(result))
@@ -684,6 +767,10 @@ UBOOL UD3D11RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fu
 	CurrentSizeX = NewX;
 	CurrentSizeY = NewY;
 	CurrentFullscreen = Fullscreen;
+
+	// DXGI has just moved the window out from under the engine, so bring the
+	// cursor clip along with it.
+	ReclipCursorToWindow((HWND)Viewport->GetWindow());
 
 	BufferCount = UseVSync ? 2 : 3;
 	if (!UpdateSwapChain())
@@ -723,6 +810,17 @@ bool UD3D11RenderDevice::UpdateSwapChain(bool resizeSceneBuffers)
 	// always-on mirror).
 	BackBufferSizeX = CurrentSizeX;
 	BackBufferSizeY = CurrentSizeY;
+
+	// Borderless fullscreen puts a desktop sized window on screen, so the back
+	// buffer has to be that size too. Leaving it at the game's resolution makes
+	// DXGI stretch it to the window, which pulls a 4:3 or 16:9 mode out to the
+	// full width of an ultrawide instead of centring it. D3D12Drv does the same.
+	if (FullscreenState.Enabled)
+	{
+		BackBufferSizeX = DesktopResolution.Width;
+		BackBufferSizeY = DesktopResolution.Height;
+	}
+
 	if (VR && VRMirrorMode == 4 && !ActiveHdr && VRSBSSizeX > 0 && VRSBSSizeY > 0)
 	{
 		BackBufferSizeX = VRSBSSizeX;
@@ -1820,6 +1918,15 @@ UBOOL UD3D11RenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			output->Release();
 		}
 
+		// The engine treats FovAngle as the horizontal field of view, so a wider
+		// display crops the top and bottom rather than showing more at the sides,
+		// and Deus Ex's cinematic subtitles are only drawn at 16:9 or narrower.
+		// Offering these at the monitor's full height gives a way out of both:
+		// the present pass centres them with bars instead of stretching. Same
+		// list VulkanDrv offers.
+		resolutions.insert({ (DesktopResolution.Height * 4 + 2) / 3, DesktopResolution.Height });
+		resolutions.insert({ (DesktopResolution.Height * 16 + 8) / 9, DesktopResolution.Height });
+
 		FString Str;
 		for (const Resolution& resolution : resolutions)
 		{
@@ -2124,8 +2231,6 @@ void UD3D11RenderDevice::Unlock(UBOOL Blit)
 		Context->OMSetRenderTargets(1, rtvs, nullptr);
 
 		D3D11_VIEWPORT viewport = {};
-		viewport.Width = CurrentSizeX;
-		viewport.Height = CurrentSizeY;
 		viewport.MaxDepth = 1.0f;
 		// VR SBS-record mode leaves the backbuffer larger than the window (see UpdateSwapChain);
 		// when this fallback present runs (VR session not rendering), it must fill the whole
@@ -2134,6 +2239,30 @@ void UD3D11RenderDevice::Unlock(UBOOL Blit)
 		{
 			viewport.Width = (FLOAT)BackBufferSizeX;
 			viewport.Height = (FLOAT)BackBufferSizeY;
+		}
+		else if (CurrentSizeX > 0 && CurrentSizeY > 0)
+		{
+			// Centre the scene in the back buffer and keep its aspect, rather
+			// than stretching it to the edges: in borderless fullscreen the back
+			// buffer is the desktop, so a 4:3 mode on an ultrawide belongs in the
+			// middle with bars either side. Matches D3D12Drv and VulkanDrv.
+			int targetWidth = BackBufferSizeX > 0 ? BackBufferSizeX : (int)CurrentSizeX;
+			int targetHeight = BackBufferSizeY > 0 ? BackBufferSizeY : (int)CurrentSizeY;
+			float scale = std::min(targetWidth / (float)CurrentSizeX, targetHeight / (float)CurrentSizeY);
+			int letterboxWidth = (int)std::round(CurrentSizeX * scale);
+			int letterboxHeight = (int)std::round(CurrentSizeY * scale);
+			viewport.TopLeftX = (FLOAT)((targetWidth - letterboxWidth) / 2);
+			viewport.TopLeftY = (FLOAT)((targetHeight - letterboxHeight) / 2);
+			viewport.Width = (FLOAT)letterboxWidth;
+			viewport.Height = (FLOAT)letterboxHeight;
+
+			// The bars are whatever the recycled buffer last held unless they
+			// are cleared; the present pass only draws inside the viewport.
+			if (viewport.Width != targetWidth || viewport.Height != targetHeight)
+			{
+				FLOAT black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+				Context->ClearRenderTargetView(BackBufferView, black);
+			}
 		}
 		Context->RSSetViewports(1, &viewport);
 
@@ -3815,7 +3944,19 @@ void UD3D11RenderDevice::SetSceneNode(FSceneNode* Frame)
 
 	CurrentFrame = Frame;
 	Aspect = Frame->FY / Frame->FX;
-	RProjZ = (float)appTan(radians(Viewport->Actor->FovAngle) * 0.5);
+	// The engine projects a point as Point.X * Frame->Proj.Z / Point.Z + FX15
+	// (see FVertex::Project), so Frame->Proj.Z carries the field of view this
+	// scene node is actually being rendered with. Taking it from the player
+	// instead only agrees while the player is the camera: Deus Ex shoots its
+	// cinematics through a camera with its own FOV, and the mismatch scales the
+	// whole scene, pushing the actors out of frame. Fall back to the player's
+	// FOV where the engine gives no usable projection, such as an ortho
+	// viewport in the editor.
+	APlayerPawn* ViewActor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
+	if (Frame->Proj.Z > 0.0f)
+		RProjZ = Frame->FX / (2.0f * Frame->Proj.Z);
+	else
+		RProjZ = (float)appTan(radians(ViewActor ? ViewActor->FovAngle : 90.0f) * 0.5);
 
 	// The menu player-mesh preview (UMenuPlayerMeshClient::DrawClippedActor) mutates THIS frame's
 	// rect + FovAngle in place and never restores the FOV, poisoning every scene node afterwards
@@ -3855,7 +3996,16 @@ void UD3D11RenderDevice::SetSceneNode(FSceneNode* Frame)
 	Context->RSSetViewports(1, &SceneViewport);
 
 	SceneConstants.ObjectToProjection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+#if defined(OLDUNREAL469SDK)
 	SceneConstants.NearClip = vec4(Frame->NearClip.X, Frame->NearClip.Y, Frame->NearClip.Z, -Frame->NearClip.W);
+#else
+	// The older engines clip polygons themselves before handing them over, and
+	// their FSceneNode::NearClip is a screen space plane - dotting it with a
+	// world space position clips whatever happens to fall on its negative side.
+	// It is zero in ordinary frames, so only the scene nodes that do set it, the
+	// cinematic cameras, lost geometry. Leave the plane switched off instead.
+	SceneConstants.NearClip = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
 
 	Context->UpdateSubresource(ScenePass.ConstantBuffer, 0, nullptr, &SceneConstants, 0, 0);
 

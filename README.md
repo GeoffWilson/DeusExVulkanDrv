@@ -109,6 +109,10 @@ D3D11Drv specific settings (OpenXR virtual reality):
 - SRGBTextures samples textures as sRGB so the shading runs on linear light, encoding the result back for display at the end. The brightness is unchanged by design: this engine's lighting is a multiplication, and a multiplication gives the same answer in either space, so everything that has to cross over - the light arriving as vertex colours, the fog, the doubling that compensates for half brightness light maps, the detail texture modulation - does, and the result lands where it started. What does change is everything that interpolates or blends rather than multiplies: texture filtering, mip transitions and translucent surfaces resolve in linear light, which reads as smoother gradients and cleaner glow around bright things. Against that, high contrast masked art picks up a visible fringe - the mouse cursor is the clearest example - because a hard white on black edge now filters to a lighter intermediate. Subtle either way, and a matter of taste, which is why it is off by default.
 - FPSLimit caps how many frames per second are presented, or zero to leave the frame rate alone. The engine only enforces a tick rate for network play, so an old game on a modern GPU can run at a frame rate its own timing was never written for - Deus Ex cuts conversation audio short well before a 240Hz display's refresh rate, and 120 or 60 is a reasonable cap there. Where the device supports VK_KHR_present_wait, the limiter paces against when a frame actually reached the screen instead of when it was handed over, which keeps frame times even.
 
+## Description of D3D11Drv specific settings
+
+- UseExclusiveFullscreen hands fullscreen to DXGI with a real display mode change, instead of making a borderless window the size of the desktop and letterboxing into it. Off by default: the mode switch is the part wine handles worst, and D3D12Drv has always taken the borderless route, which is why it behaved where this did not.
+
 ## Description of D3D12Drv specific settings
 
 - UseDebugLayer enables the D3D12 debug layer and will make the render device output extra information into the UnrealTournament.log file for any errors or warnings.
@@ -153,11 +157,15 @@ Please see LICENSE.md for the details.
 
 ## Deus Ex
 
-VulkanDrv runs Deus Ex 1112fm. Copy `VulkanDrv.dll` and `VulkanDrv.int` into the
-game's `System` folder and set `GameRenderDevice=VulkanDrv.VulkanRenderDevice` in
-the `[Engine.Engine]` section of `DeusEx.ini`.
+All three render devices run Deus Ex 1112fm. Copy the `.dll` and `.int` of the
+one you want into the game's `System` folder and set `GameRenderDevice` in the
+`[Engine.Engine]` section of `DeusEx.ini` to `VulkanDrv.VulkanRenderDevice`,
+`D3D11Drv.D3D11RenderDevice` or `D3D12Drv.D3D12RenderDevice`.
 
-Build it either from the `DeusExRelease` configuration of the Visual Studio
+VulkanDrv is the one that has been played through; the two Direct3D devices have
+had the same fixes applied and been confirmed to run, no more than that.
+
+Build them either from the `DeusExRelease` configurations of the Visual Studio
 solution, or - on Linux - with the CMake cross build described in
 [cmake/README-crossbuild.md](cmake/README-crossbuild.md), which also documents
 the Deus Ex specific behaviour worth knowing before filing a bug against the
@@ -197,8 +205,46 @@ Six fixes, each commented where it lives:
   Wine enforces the clip loosely.
 
 The last four are engine-agnostic bugs in code shared with D3D11Drv and
-D3D12Drv, which carry the same `FovAngle` line, the same unconditional clip
-plane, and - in D3D12Drv - the same unfollowed cursor clip.
+D3D12Drv, and both now carry the fixes; see below.
+
+### The Direct3D devices
+
+D3D11Drv and D3D12Drv have `DeusExRelease` configurations and the `DEUSEX`
+guards to go with them, but nothing had ever been built from them: the non-469
+branch of `D3D11Drv/TextureManager.cpp` opened with an `else` that had no `if`,
+left over from where the function was split out of `GetTexture`, and
+`D3D12Drv/UD3D12RenderDevice.h` put static data members in an anonymous struct,
+which is an MSVC extension. Neither compiles. Both are fixed.
+
+The two engine fixes above - the field of view from the scene node, and the near
+clip plane - apply to both and are now in both. The window handling needed more:
+
+- **D3D12Drv** read its saved windowed geometry after `ResizeViewport` and left
+  the cursor clip behind, exactly as VulkanDrv did.
+- **D3D11Drv** hands fullscreen to DXGI rather than restyling the window itself,
+  so it looked exempt from both. It is not: `SetFullscreenState` and
+  `ResizeTarget` resize the window just the same, and the engine's cursor clip is
+  stale afterwards in the same way.
+
+D3D11Drv also gained the two things D3D12Drv already had and it did not. Its
+back buffer stayed at the game's resolution and DXGI stretched it to the window,
+so a 4:3 mode came out pulled across the full width of an ultrawide; it now sizes
+the back buffer to the desktop and centres the scene with bars, clearing them
+first. And `UseExclusiveFullscreen`, off by default, makes it borderless the way
+D3D12Drv has always been - a desktop sized frameless window and no display mode
+change. Exclusive fullscreen is the fragile path under wine, and it is why
+D3D12Drv behaved where D3D11Drv did not; `VkExclusiveFullscreen` defaults off for
+the same reason.
+
+Both now offer the letterboxed 4:3 and 16:9 modes at the monitor's full height
+that VulkanDrv does, which is the practical answer to the horizontal field of
+view on a wide display.
+
+The OpenXR VR backend in D3D11Drv is not part of this. Its headers are not in
+this repository and the vcxproj does not build it either, so the cross build
+substitutes a stub whose `nullptr` the caller already treats as "no headset,
+run mono" - and the VR paths that remain are given the three things the 469 SDK
+has and Deus Ex's does not, so that they still compile.
 
 ### What else was added
 

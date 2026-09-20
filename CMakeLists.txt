@@ -98,44 +98,121 @@ add_library(VulkanDrv SHARED
 	"${VULKANDRV_DIR}/UVulkanRenderDevice.cpp"
 	"${VULKANDRV_DIR}/VulkanDrv.cpp")
 
-set_target_properties(VulkanDrv PROPERTIES PREFIX "" OUTPUT_NAME "VulkanDrv")
-
-# The SDK headers include each other with Windows' casing rules; see the script.
+# The SDK headers include each other with Windows' casing rules, and the D3D
+# sources ask the Windows SDK for <D3D11.h> and <D3D12.h> when the files are
+# lower case. Both are the same problem; see the script.
 set(CASE_COMPAT_DIR "${CMAKE_CURRENT_BINARY_DIR}/sdk-case-compat")
 execute_process(
 	COMMAND "${CMAKE_COMMAND}" -E env python3
-		"${CMAKE_CURRENT_SOURCE_DIR}/cmake/case-compat.py" "${CASE_COMPAT_DIR}"
-		"${DEUSEX_SDK}/Core/Inc" "${DEUSEX_SDK}/Engine/Inc"
+		"${CMAKE_CURRENT_SOURCE_DIR}/cmake/case-compat.py"
+		--out "${CASE_COMPAT_DIR}"
+		--scan "${DEUSEX_SDK}/Core/Inc" "${DEUSEX_SDK}/Engine/Inc"
 	COMMAND_ERROR_IS_FATAL ANY)
 
-target_include_directories(VulkanDrv PRIVATE
-	"${VULKANDRV_DIR}"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Thirdparty"
-	"${DEUSEX_SDK}/Core/Inc"
-	"${DEUSEX_SDK}/Engine/Inc"
-	"${CASE_COMPAT_DIR}")
+# XWIN_DIR is set by the toolchain file; without it there is no Windows SDK to
+# resolve against and this step is simply skipped.
+if(DEFINED XWIN_DIR)
+	execute_process(
+		COMMAND "${CMAKE_COMMAND}" -E env python3
+			"${CMAKE_CURRENT_SOURCE_DIR}/cmake/case-compat.py"
+			--out "${CASE_COMPAT_DIR}"
+			--scan "${CMAKE_CURRENT_SOURCE_DIR}/D3D11Drv" "${CMAKE_CURRENT_SOURCE_DIR}/D3D12Drv"
+			--search "${XWIN_DIR}/sdk/include/um" "${XWIN_DIR}/sdk/include/shared"
+		COMMAND_ERROR_IS_FATAL ANY)
+endif()
 
-target_compile_definitions(VulkanDrv PRIVATE
-	WIN32 NDEBUG _WINDOWS _USRDLL VULKANDRV_EXPORTS DEUSEX
-	# Deus Ex's Core.dll exports the UNICODE flavour of the engine API (TCHAR is
-	# UNICHAR), which the VS project gets from CharacterSet=Unicode. Together
-	# with /Zc:wchar_t- below this makes TCHAR an unsigned short, the type the
-	# 2000-era import libraries were built against.
-	UNICODE _UNICODE
-	# The SDK's hand written MASM blocks (FVertex::ComputeOutcode and friends)
-	# are inline functions we never call, but clang-cl cannot parse their
-	# struct-offset syntax, so take the C++ fallbacks instead.
-	ASM=0 ASM3DNOW=0 ASMKNI=0)
+# Everything the three render devices share. Their vcxproj DeusExRelease
+# configurations differ only in the exports define and which graphics libraries
+# they link, so the rest is stated once here.
+function(configure_deusex_renderdevice target exports_define)
+	target_include_directories(${target} PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/Thirdparty"
+		"${DEUSEX_SDK}/Core/Inc"
+		"${DEUSEX_SDK}/Engine/Inc"
+		"${CASE_COMPAT_DIR}")
 
-# Matches the DeusExRelease ClCompile settings: static CRT, asynchronous
-# exceptions, 4 byte struct packing (the engine's ABI) and a non-native wchar_t
-# so the VC6-era import libs still link.
-target_compile_options(VulkanDrv PRIVATE /MT /EHa /Zc:wchar_t- /GR /Zi)
-target_link_options(VulkanDrv PRIVATE /DEBUG)
+	target_compile_definitions(${target} PRIVATE
+		WIN32 NDEBUG _WINDOWS _USRDLL ${exports_define} DEUSEX
+		# Deus Ex's Core.dll exports the UNICODE flavour of the engine API (TCHAR
+		# is UNICHAR), which the VS project gets from CharacterSet=Unicode.
+		# Together with /Zc:wchar_t- below this makes TCHAR an unsigned short, the
+		# type the 2000-era import libraries were built against.
+		UNICODE _UNICODE
+		# The SDK's hand written MASM blocks (FVertex::ComputeOutcode and friends)
+		# are inline functions we never call, but clang-cl cannot parse their
+		# struct-offset syntax, so take the C++ fallbacks instead.
+		ASM=0 ASM3DNOW=0 ASMKNI=0)
+
+	# Matches the DeusExRelease ClCompile settings: static CRT, asynchronous
+	# exceptions and a non-native wchar_t so the VC6-era import libs still link.
+	# The engine's 4 byte packing is stated in each Precomp.h rather than with a
+	# global /Zp, which clang-cl treats as a cap a pragma cannot widen past.
+	target_compile_options(${target} PRIVATE /MT /EHa /Zc:wchar_t- /GR /Zi)
+	target_link_options(${target} PRIVATE /DEBUG)
+
+	set_target_properties(${target} PROPERTIES PREFIX "" OUTPUT_NAME "${target}")
+
+	target_link_libraries(${target} PRIVATE
+		"${DEUSEX_SDK}/Core/Lib/Core.lib"
+		"${DEUSEX_SDK}/Engine/Lib/Engine.lib"
+		user32 gdi32 advapi32 ole32 shell32)
+endfunction()
+
+target_include_directories(VulkanDrv PRIVATE "${VULKANDRV_DIR}")
+configure_deusex_renderdevice(VulkanDrv VULKANDRV_EXPORTS)
+target_link_libraries(VulkanDrv PRIVATE zvulkan)
 target_compile_options(zvulkan PRIVATE /MT /EHsc)
 
-target_link_libraries(VulkanDrv PRIVATE
-	zvulkan
-	"${DEUSEX_SDK}/Core/Lib/Core.lib"
-	"${DEUSEX_SDK}/Engine/Lib/Engine.lib"
-	user32 gdi32 advapi32 ole32 shell32)
+# ---------------------------------------------------------------- D3D11Drv ---
+
+set(D3D11DRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/D3D11Drv")
+
+# The OpenXR headers are not bundled with this repository and the vcxproj does
+# not build OpenXRBackend.cpp either, so the default is a stub whose nullptr the
+# caller already treats as "no headset, run mono". Point this at the real file
+# if you have the SDK on the include path.
+option(D3D11DRV_OPENXR "Build the OpenXR VR backend (needs the OpenXR SDK headers)" OFF)
+if(D3D11DRV_OPENXR)
+	set(D3D11DRV_VR_SOURCE "OpenXRBackend.cpp")
+else()
+	set(D3D11DRV_VR_SOURCE "OpenXRBackendStub.cpp")
+endif()
+
+add_library(D3D11Drv SHARED
+	"${D3D11DRV_DIR}/CycleTimer.cpp"
+	"${D3D11DRV_DIR}/D3D11Drv.cpp"
+	"${D3D11DRV_DIR}/FileResource.cpp"
+	"${D3D11DRV_DIR}/halffloat.cpp"
+	"${D3D11DRV_DIR}/mat.cpp"
+	"${D3D11DRV_DIR}/${D3D11DRV_VR_SOURCE}"
+	"${D3D11DRV_DIR}/Precomp.cpp"
+	"${D3D11DRV_DIR}/TextureManager.cpp"
+	"${D3D11DRV_DIR}/TextureUploader.cpp"
+	"${D3D11DRV_DIR}/UD3D11RenderDevice.cpp"
+	"${D3D11DRV_DIR}/UploadManager.cpp"
+	"${D3D11DRV_DIR}/UTF16.cpp")
+
+target_include_directories(D3D11Drv PRIVATE "${D3D11DRV_DIR}")
+configure_deusex_renderdevice(D3D11Drv D3D11DRV_EXPORTS)
+target_link_libraries(D3D11Drv PRIVATE d3d11 dxgi d3dcompiler dxguid)
+
+# ---------------------------------------------------------------- D3D12Drv ---
+
+set(D3D12DRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/D3D12Drv")
+
+add_library(D3D12Drv SHARED
+	"${D3D12DRV_DIR}/D3D12Drv.cpp"
+	"${D3D12DRV_DIR}/D3D12MemAlloc/D3D12MemAlloc.cpp"
+	"${D3D12DRV_DIR}/FileResource.cpp"
+	"${D3D12DRV_DIR}/halffloat.cpp"
+	"${D3D12DRV_DIR}/mat.cpp"
+	"${D3D12DRV_DIR}/Precomp.cpp"
+	"${D3D12DRV_DIR}/TextureManager.cpp"
+	"${D3D12DRV_DIR}/TextureUploader.cpp"
+	"${D3D12DRV_DIR}/UD3D12RenderDevice.cpp"
+	"${D3D12DRV_DIR}/UploadManager.cpp"
+	"${D3D12DRV_DIR}/UTF16.cpp")
+
+target_include_directories(D3D12Drv PRIVATE "${D3D12DRV_DIR}")
+configure_deusex_renderdevice(D3D12Drv D3D12DRV_EXPORTS)
+target_link_libraries(D3D12Drv PRIVATE d3d12 dxgi d3dcompiler dxguid)

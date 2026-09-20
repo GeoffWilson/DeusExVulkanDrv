@@ -226,7 +226,9 @@ public:
 		float MaxDepth = 1.0f;
 	};
 
-	struct
+	// Named rather than anonymous: it has static members, and a static data
+	// member of an unnamed class is an MSVC extension that clang-cl rejects.
+	struct ScenePassData
 	{
 		ComPtr<ID3D12Resource> VertexBuffer;
 		ComPtr<ID3D12Resource> IndexBuffer;

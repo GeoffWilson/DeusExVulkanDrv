@@ -95,7 +95,9 @@ void TextureManager::UploadTexture(FTextureInfo* info, bool masked, CachedTextur
 		renderer->Timers.TextureUpload.Unclock();
 	}
 #else
-	else if (info->bRealtimeChanged)
+	// Was "else if", left over from where this was split out of GetTexture -
+	// there is no preceding if here, so the non-469 branch never compiled.
+	if (info->bRealtimeChanged)
 	{
 		renderer->Timers.TextureUpload.Clock();
 

@@ -27,18 +27,26 @@ cmake -S . -B build-deusex -G Ninja \
 cmake --build build-deusex -j8
 ```
 
-The result is `build-deusex/VulkanDrv.dll`, a 32 bit DLL linked against the
-Deus Ex 1112f import libraries in `Thirdparty/DeusEx`.
+The result is `build-deusex/VulkanDrv.dll`, `D3D11Drv.dll` and `D3D12Drv.dll`,
+32 bit DLLs linked against the Deus Ex 1112f import libraries in
+`Thirdparty/DeusEx`. The Windows SDK that `xwin` fetches carries the Direct3D
+headers and import libraries, so the two Direct3D devices need nothing extra;
+their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 
 ## Installing
 
 ```sh
-cmake/deploy-deusex.sh /path/to/DeusEx/System
+cmake/deploy-deusex.sh /path/to/DeusEx/System [vulkan|d3d11|d3d12|none]
 ```
 
-That copies `VulkanDrv.dll` and `VulkanDrv.int` into the game's System folder
-and sets `GameRenderDevice=VulkanDrv.VulkanRenderDevice` in `DeusEx.ini`,
-keeping the previous ini as `DeusEx.ini.prevulkan`.
+That copies every driver that was built, with its `.int`, into the game's System
+folder and points `GameRenderDevice` at the one named (Vulkan by default),
+keeping the previous ini as `DeusEx.ini.prevulkan`. To switch afterwards without
+redeploying:
+
+```sh
+cmake/select-renderer.sh vulkan|d3d11|d3d12|d3d /path/to/DeusEx/System
+```
 
 ## What the cross build has to work around
 

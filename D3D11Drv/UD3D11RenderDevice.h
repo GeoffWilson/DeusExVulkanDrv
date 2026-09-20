@@ -271,6 +271,11 @@ public:
 	BYTE GammaMode;
 	BYTE LightMode;
 	INT RefreshRate;
+	// Hand fullscreen to DXGI (SetFullscreenState) rather than making a
+	// borderless window ourselves. Off by default: exclusive fullscreen is the
+	// fragile path under wine, and D3D12Drv has always taken the borderless
+	// route, which is why it behaves where this did not.
+	BITFIELD UseExclusiveFullscreen;
 	BITFIELD GammaCorrectScreenshots;
 	BITFIELD UseDebugLayer;
 
@@ -518,6 +523,15 @@ private:
 		int Width = 0;
 		int Height = 0;
 	} DesktopResolution;
+
+	// The windowed style and rectangle to go back to, for the borderless path.
+	struct
+	{
+		RECT WindowPos = {};
+		LONG Style = 0;
+		LONG ExStyle = 0;
+		bool Enabled = false;
+	} FullscreenState;
 
 	bool InSetResCall = false;
 	UBOOL CurrentFullscreen = 0;

@@ -35,6 +35,17 @@
 #pragma warning(disable: 4297) // warning C4297: 'UObject::operator delete': function assumed not to throw an exception but does
 #endif
 
+// The engine's ABI is 4 byte packed (StructMemberAlignment in the vcxproj),
+// while the Windows and D3D headers above need their natural alignment. MSVC
+// gets that from the pragma pack around them plus a global /Zp4; clang-cl will
+// not honour a pragma that widens past a command line /Zp, so the cross build
+// passes no /Zp at all and the engine's packing is stated here instead. Both
+// compilers then see the same layout.
+#pragma pack(push, 4)
+
+// Portable stand-ins for the SDK's MASM blocks. Must precede any SDK header.
+#include "UE1AsmShims.h"
+
 #include "Engine.h"
 #include "UnRender.h"
 
@@ -45,5 +56,7 @@
 #if defined(OLDUNREAL469SDK)
 #include "Render.h"
 #endif
+
+#pragma pack(pop)
 
 #include "ComPtr.h"
