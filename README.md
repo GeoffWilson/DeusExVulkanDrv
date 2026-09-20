@@ -1,4 +1,13 @@
 # Unreal Tournament Render Devices
+
+> **This is a modified version of [OldUnreal/UT99VulkanDrv](https://github.com/OldUnreal/UT99VulkanDrv),
+> which is itself a fork of [dpjudas/UT99VulkanDrv](https://github.com/dpjudas/UT99VulkanDrv)
+> by Magnus Norddahl. It is not the original software and is not supported by
+> its authors.** This branch makes VulkanDrv work in **Deus Ex** (engine 1112fm),
+> a configuration the upstream project has project files for but which had
+> evidently never been built or run. See [Deus Ex](#deus-ex) below for what
+> changed; everything else is upstream's work.
+
 This project implements Vulkan, Direct3D 12, and Direct3D 11 render devices for Unreal Tournament (UT99).
 
 ## Compiling the source
@@ -134,3 +143,42 @@ Console commands available while D3D11Drv is active:
 ## License
 
 Please see LICENSE.md for the details.
+
+## Deus Ex
+
+VulkanDrv runs Deus Ex 1112fm. Copy `VulkanDrv.dll` and `VulkanDrv.int` into the
+game's `System` folder and set `GameRenderDevice=VulkanDrv.VulkanRenderDevice` in
+the `[Engine.Engine]` section of `DeusEx.ini`.
+
+Build it either from the `DeusExRelease` configuration of the Visual Studio
+solution, or - on Linux - with the CMake cross build described in
+[cmake/README-crossbuild.md](cmake/README-crossbuild.md), which also documents
+the Deus Ex specific behaviour worth knowing before filing a bug against the
+renderer.
+
+### What had to change
+
+Five fixes, each commented where it lives:
+
+- **The package's allocations.** The SDK replaces global `new`/`delete` with the
+  engine's allocator, but C++14 sized deallocation bypasses the replacement, so
+  engine memory reached the CRT's `free()`. It crashed after roughly 820 frames.
+  The sibling UT432 SDK in this repository already had the `UTGLR_NO_APP_MALLOC`
+  guard for this; the Deus Ex copy did not. **An MSVC build needs this too.**
+- **`FPSLimit`.** The engine only enforces a tick rate for network play. Left
+  uncapped, Deus Ex cuts conversation audio short and its cinematic camera
+  interpolation drifts.
+- **The field of view** now comes from `FSceneNode::Proj.Z` rather than the
+  player pawn's `FovAngle`, which is only the same thing while the player is the
+  camera. Deus Ex's cinematics have their own cameras, and the mismatch rendered
+  them zoomed with the actors out of frame.
+- **The near clip plane** is no longer applied on pre-469 engines, which clip
+  polygons themselves and whose `NearClip` is a screen space plane. It was
+  slicing characters out of cinematics.
+- **Fullscreen state** is captured before `ResizeViewport` rather than after, so
+  leaving fullscreen no longer restores the fullscreen geometry as the window to
+  come back to.
+
+The last three are engine-agnostic bugs in code shared with D3D11Drv and
+D3D12Drv, which carry the same `FovAngle` line and the same unconditional clip
+plane.
