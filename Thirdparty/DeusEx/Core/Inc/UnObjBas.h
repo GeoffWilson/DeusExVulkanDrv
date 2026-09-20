@@ -454,7 +454,11 @@ public:
 	// Destructors.
 	virtual ~UObject();
 	void operator delete( void* Object, size_t Size )
-		{guard(UObject::operator delete); appFree( Object ); unguard;}
+		// No guard() here: its static __FUNC_NAME__ is a local of an inline
+		// member of a dllimport class, and compilers other than the one that
+		// built Core.dll number that local's scope differently, so the import
+		// it asks Core.lib for does not exist.
+		{ appFree( Object ); }
 
 	// FUnknown interface.
 	virtual DWORD STDCALL QueryInterface( const FGuid& RefIID, void** InterfacePtr );

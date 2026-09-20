@@ -945,6 +945,13 @@ template <class T> void TLazyArray<T>::Unload()
 //
 // A dynamically sizeable string.
 //
+#if defined(__clang__)
+// FString is dllimport and clang extends that to the members of its base class
+// template, which Core.dll never exported. Instantiating TArray<TCHAR> here,
+// before FString is declared, gets those members emitted locally instead.
+template class TArray<TCHAR>;
+#endif
+
 class CORE_API FString : protected TArray<TCHAR>
 {
 public:

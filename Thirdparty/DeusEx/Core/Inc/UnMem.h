@@ -18,6 +18,11 @@ enum EMemOned   {MEM_Oned  =1};
 	FMemStack.
 -----------------------------------------------------------------------------*/
 
+class FMemStack;
+void* operator new( size_t Size, FMemStack& Mem, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
+void* operator new( size_t Size, FMemStack& Mem, EMemZeroed Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
+void* operator new( size_t Size, FMemStack& Mem, EMemOned Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
+
 //
 // Simple linear-allocation memory stack.
 // Items are allocated via PushBytes() or the specialized operator new()s.
@@ -59,9 +64,9 @@ public:
 
 	// Friends.
 	friend class FMemMark;
-	friend void* operator new( size_t Size, FMemStack& Mem, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
-	friend void* operator new( size_t Size, FMemStack& Mem, EMemZeroed Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
-	friend void* operator new( size_t Size, FMemStack& Mem, EMemOned Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
+	friend void* operator new( size_t Size, FMemStack& Mem, INT Count, INT Align );
+	friend void* operator new( size_t Size, FMemStack& Mem, EMemZeroed Tag, INT Count, INT Align );
+	friend void* operator new( size_t Size, FMemStack& Mem, EMemOned Tag, INT Count, INT Align );
 
 	// Types.
 	struct FTaggedMemory
