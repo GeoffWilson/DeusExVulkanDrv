@@ -372,6 +372,19 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 		}
 	}
 
+	// The mesh's own import rotation. Deus Ex's characters are modelled facing a
+	// different axis and carry a yaw here to correct it, which is why every NPC
+	// stood at ninety degrees to where they were looking. Baked into the
+	// geometry rather than into the instance: it is a property of the mesh, and
+	// the geometry is already cached per mesh.
+	//
+	// Same convention as MakeTransform - the axes of UnitCoords / Rotation are
+	// the columns of the object-to-world matrix, so a vertex is the sum of the
+	// axes scaled by its components, not the dot products against them.
+	const bool rotateMesh =
+		mesh->RotOrigin.Pitch != 0 || mesh->RotOrigin.Yaw != 0 || mesh->RotOrigin.Roll != 0;
+	const FCoords meshCoords = GMath.UnitCoords / mesh->RotOrigin;
+
 	geometry.Positions.reserve(triangles.size() * 3);
 	geometry.Attributes.reserve(triangles.size());
 
@@ -394,6 +407,8 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 			// GM_Trench and its relatives carry Origin.Z = 12200 while animals
 			// and props carry zero - which is why the animals looked fine.
 			p[v] = (mesh->Verts(index).Vector() - mesh->Origin) * mesh->Scale;
+			if (rotateMesh)
+				p[v] = meshCoords.XAxis * p[v].X + meshCoords.YAxis * p[v].Y + meshCoords.ZAxis * p[v].Z;
 		}
 		if (!ok)
 			continue;
