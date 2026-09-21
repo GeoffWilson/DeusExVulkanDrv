@@ -173,10 +173,21 @@ std::string Shaders::Trace()
 
 				float t = rayQueryGetIntersectionTEXT(rq, true);
 				int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-				TriangleAttributes attr = tris[primitive];
+
+				// Each instance carries the offset of its geometry's shading
+				// data as its custom index, so one buffer serves every shape.
+				int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+				TriangleAttributes attr = tris[attributeBase + primitive];
 
 				vec3 position = origin + direction * t;
-				vec3 normal = normalize(attr.Normal.xyz);
+
+				// Normals are stored in object space, because the same mesh is
+				// instanced at whatever orientation the actor happens to have.
+				// Rotating by the instance transform is what puts it back in the
+				// world - without it every mover and character would be lit as
+				// though it had never turned.
+				mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+				vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
 
 				// These surfaces are single sided in the engine but solid from
 				// either direction here, so face the normal back at the ray.
@@ -222,6 +233,55 @@ std::string Shaders::Trace()
 			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
 
 			imageStore(outImage, pixel, vec4(mapped, 1.0));
+		}
+	)";
+}
+
+std::string Shaders::TileVertex()
+{
+	return R"(
+		#version 460
+
+		layout(location = 0) in vec2 aPosition;   // already in normalised device coordinates
+		layout(location = 1) in vec2 aTexCoord;
+		layout(location = 2) in vec4 aColor;
+
+		layout(location = 0) out vec2 vTexCoord;
+		layout(location = 1) out vec4 vColor;
+
+		void main()
+		{
+			vTexCoord = aTexCoord;
+			vColor = aColor;
+			gl_Position = vec4(aPosition, 0.0, 1.0);
+		}
+	)";
+}
+
+std::string Shaders::TileFragment()
+{
+	return R"(
+		#version 460
+
+		layout(binding = 0) uniform sampler2D texSampler;
+
+		layout(location = 0) in vec2 vTexCoord;
+		layout(location = 1) in vec4 vColor;
+		layout(location = 0) out vec4 outColor;
+
+		void main()
+		{
+			vec4 texel = texture(texSampler, vTexCoord);
+
+			// The traced image is tonemapped and gamma encoded by the time the
+			// tiles land on it, so this pass works in display space too and the
+			// engine's colours can be used as they are given.
+			outColor = texel * vColor;
+
+			// Masked art arrives with a zero alpha hole; anything that survives
+			// a blend at all should not be written where the hole is.
+			if (outColor.a < 0.01)
+				discard;
 		}
 	)";
 }

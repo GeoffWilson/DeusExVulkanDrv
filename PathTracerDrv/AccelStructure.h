@@ -2,49 +2,71 @@
 
 #include "LevelScene.h"
 #include <memory>
+#include <vector>
 
 class UPathTracerRenderDevice;
 
-// The scene as the ray tracing hardware wants it: a bottom level structure over
-// the triangles, a top level structure holding one instance of it, and the
-// shading data the trace shader reads by primitive index.
+// The scene as the ray tracing hardware wants it.
 //
-// Everything here is static for the lifetime of a level. Deus Ex's movers would
-// need their own instances and a per frame top level rebuild; that is not done
-// yet, so doors and lifts are traced where they stood when the level loaded.
+// One bottom level structure per distinct shape - the static world, each mover's
+// brush, each mesh pose - and a top level structure rebuilt every frame from the
+// placements. Bottom level structures are built once and kept: that is the whole
+// point of instancing, and it is why a door costs a transform per frame rather
+// than a rebuild.
 class AccelStructure
 {
 public:
 	AccelStructure(UPathTracerRenderDevice* renderer);
 	~AccelStructure();
 
-	// Throws on failure, like the rest of the Vulkan code here.
-	void Build(const LevelScene& scene);
+	// Builds bottom level structures for any geometry that does not have one
+	// yet, and re-uploads the shading attributes if that added some.
+	void SyncGeometry(const LevelScene& scene);
 
-	bool IsBuilt() const { return TopLevel != nullptr; }
+	// Rebuilt every frame, inside the frame's own command buffer.
+	void BuildTopLevel(const LevelScene& scene, VulkanCommandBuffer* commands);
+
+	void Reset();
+
+	bool IsReady() const { return TopLevel != nullptr && !Bottom.empty(); }
+	bool AttributesChanged() const { return attributesChanged; }
+	void ClearAttributesChanged() { attributesChanged = false; }
 
 	VulkanAccelerationStructure* GetTopLevel() const { return TopLevel.get(); }
 	VulkanBuffer* GetAttributeBuffer() const { return AttributeBuffer.get(); }
 	VulkanBuffer* GetLightBuffer() const { return LightBuffer.get(); }
 	int LightCount() const { return Lights; }
 
-private:
-	void Reset();
+	// Where each geometry's attributes begin, which is what an instance carries
+	// as its custom index.
+	uint32_t AttributeBase(int geometryIndex) const { return Bottom[geometryIndex].AttributeBase; }
 
-	// Uploads through a staging buffer and returns the device local result.
+private:
+	struct BottomLevel
+	{
+		std::unique_ptr<VulkanBuffer> Vertices;
+		std::unique_ptr<VulkanBuffer> Buffer;
+		std::unique_ptr<VulkanAccelerationStructure> Structure;
+		uint32_t AttributeBase = 0;
+	};
+
 	std::unique_ptr<VulkanBuffer> UploadBuffer(const void* data, size_t size, VkBufferUsageFlags usage, const char* debugName);
+	void BuildBottomLevel(const SceneGeometry& geometry, BottomLevel& out);
+	void EnsureTopLevelCapacity(size_t instanceCount);
 
 	UPathTracerRenderDevice* renderer = nullptr;
 
-	std::unique_ptr<VulkanBuffer> VertexBuffer;
+	std::vector<BottomLevel> Bottom;
+	std::vector<TriangleAttributes> AllAttributes;
+
 	std::unique_ptr<VulkanBuffer> AttributeBuffer;
 	std::unique_ptr<VulkanBuffer> LightBuffer;
 	std::unique_ptr<VulkanBuffer> InstanceBuffer;
-
-	std::unique_ptr<VulkanBuffer> BottomBuffer;
 	std::unique_ptr<VulkanBuffer> TopBuffer;
-	std::unique_ptr<VulkanAccelerationStructure> BottomLevel;
+	std::unique_ptr<VulkanBuffer> TopScratch;
 	std::unique_ptr<VulkanAccelerationStructure> TopLevel;
 
+	size_t TopCapacity = 0;
 	int Lights = 0;
+	bool attributesChanged = false;
 };

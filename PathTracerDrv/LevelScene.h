@@ -2,58 +2,92 @@
 
 #include "vec.h"
 #include <vector>
+#include <unordered_map>
 
 class UPathTracerRenderDevice;
 
-// One triangle's worth of shading data, indexed by gl_PrimitiveID in the trace
-// shader. Kept separate from the position buffer the acceleration structure is
-// built over, which must be tightly packed vec3s and nothing else.
+// One triangle's worth of shading data, indexed in the trace shader by the
+// instance's custom index plus the primitive index. Normals are in object space
+// and rotated into world space by the shader using the instance transform, so
+// the same geometry can be instanced at any orientation.
 struct TriangleAttributes
 {
-	vec4 Normal;      // xyz world normal, w unused
-	vec4 Albedo;      // rgb reflectance 0..1, a unused
-	vec4 Emission;    // rgb emitted radiance, a unused
+	vec4 Normal;
+	vec4 Albedo;
+	vec4 Emission;
 };
 
 // A light as the engine describes it, converted to something physical.
 struct SceneLight
 {
-	vec4 PositionRadius;   // xyz world position, w radius in world units
-	vec4 ColorBrightness;  // rgb linear colour, a scalar brightness
+	vec4 PositionRadius;
+	vec4 ColorBrightness;
 };
 
-// The static level, converted once per level into what a ray tracer needs.
+// Triangles that share a bottom level acceleration structure.
+struct SceneGeometry
+{
+	std::vector<vec3> Positions;
+	std::vector<TriangleAttributes> Attributes;
+};
+
+// One placement of a geometry in the world, rebuilt every frame for anything
+// that moves.
+struct SceneInstance
+{
+	int GeometryIndex = 0;
+	uint32_t AttributeBase = 0;
+	float Transform[12] = {};   // 3x4, row major, as Vulkan wants it
+};
+
+// Turns the engine's level into geometry, lights and placements.
 //
-// This is deliberately not built from what the engine pushes at a render
-// device. DrawComplexSurface only ever arrives for surfaces that survived
-// frustum and BSP culling, and a path tracer needs the geometry behind the
-// camera as much as the geometry in front of it - that is where the bounce
-// light comes from. So the level is read directly out of UModel instead, which
-// a render device can reach through FSceneNode::Level.
+// Deliberately not built from what the engine pushes at a render device:
+// DrawComplexSurface only describes what survived frustum and BSP culling, and a
+// path tracer needs the geometry behind the camera as much as in front of it.
+// The level is read out of UModel instead, through FSceneNode::Level.
 class LevelScene
 {
 public:
-	// Returns false if there was nothing to build from.
-	bool Build(ULevel* level);
+	// The static world. Returns false if there was nothing to build from.
+	bool BuildStatic(ULevel* level);
+
+	// The things that move: mover brushes and mesh actors. Called every frame.
+	// Geometry is built once per distinct shape and cached; only the placements
+	// change from frame to frame.
+	void CollectDynamic(ULevel* level);
 
 	void Clear();
 
-	bool IsEmpty() const { return Positions.empty(); }
-	int TriangleCount() const { return (int)(Positions.size() / 3); }
+	bool IsEmpty() const { return Geometries.empty(); }
 
-	// Tightly packed triangle soup: three positions per triangle, no indices.
-	// An index buffer would save memory, but the shading attributes are per
-	// triangle rather than per vertex - the engine's surfaces are flat - so
-	// there is nothing to share.
-	std::vector<vec3> Positions;
-	std::vector<TriangleAttributes> Attributes;
+	std::vector<SceneGeometry> Geometries;
 	std::vector<SceneLight> Lights;
 
-	// What this was built from, so the device knows when to rebuild.
+	// Rebuilt each frame. The first entry is always the static world.
+	std::vector<SceneInstance> Instances;
+
+	// Set when CollectDynamic added geometry, so the device knows the bottom
+	// level structures and the attribute buffer need extending.
+	bool GeometryAdded = false;
+
 	ULevel* SourceLevel = nullptr;
 	int SourceNodeCount = 0;
 
 private:
-	void AddSurfaces(UModel* model);
+	void AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals);
 	void AddLights(ULevel* level);
+
+	// Geometry index for a mover's brush, built on first sight.
+	int GeometryForBrush(UModel* brush);
+	// Geometry index for a mesh at a particular animation frame.
+	int GeometryForMesh(UMesh* mesh, int frame);
+
+	std::unordered_map<void*, int> BrushGeometry;
+	std::unordered_map<uint64_t, int> MeshGeometry;
+
+	// A ceiling on how many poses are kept. Each one is a bottom level
+	// structure, and a level with many characters could otherwise build them
+	// without limit.
+	static const int MaxMeshGeometries = 768;
 };

@@ -104,8 +104,10 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 		RenderFinishedSemaphore = SemaphoreBuilder().DebugName("PathTracerRenderFinished").Create(Device.get());
 
 		Accel.reset(new AccelStructure(this));
+		Textures.reset(new TextureCache(this));
 
 		CreateTracePipeline();
+		CreateTilePipeline();
 	}
 	catch (const std::exception& e)
 	{
@@ -170,12 +172,303 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.Create(Device.get());
 }
 
+std::unique_ptr<VulkanDescriptorSet> UPathTracerRenderDevice::AllocateTileDescriptorSet(VulkanImageView* view)
+{
+	auto set = TileDescriptorPool->allocate(TileSetLayout.get());
+	WriteDescriptors()
+		.AddCombinedImageSampler(set.get(), 0, view, TileSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+		.Execute(Device.get());
+	return set;
+}
+
+void UPathTracerRenderDevice::CreateTilePipeline()
+{
+	TileSampler = SamplerBuilder()
+		.MinFilter(VK_FILTER_LINEAR)
+		.MagFilter(VK_FILTER_LINEAR)
+		.AddressMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+		.DebugName("PathTracerTileSampler")
+		.Create(Device.get());
+
+	TileSetLayout = DescriptorSetLayoutBuilder()
+		.AddBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT)
+		.DebugName("PathTracerTileSetLayout")
+		.Create(Device.get());
+
+	// One set per cached texture. A generous ceiling: a Deus Ex menu touches a
+	// few hundred distinct textures at most, and the pool is only reset when the
+	// cache is flushed.
+	TileDescriptorPool = DescriptorPoolBuilder()
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096)
+		.MaxSets(4096)
+		.DebugName("PathTracerTileDescriptorPool")
+		.Create(Device.get());
+
+	TilePipelineLayout = PipelineLayoutBuilder()
+		.AddSetLayout(TileSetLayout.get())
+		.DebugName("PathTracerTilePipelineLayout")
+		.Create(Device.get());
+
+	// The traced image is loaded rather than cleared: the tiles go on top of it.
+	TileRenderPass = RenderPassBuilder()
+		.AddAttachment(
+			VK_FORMAT_R16G16B16A16_SFLOAT,
+			VK_SAMPLE_COUNT_1_BIT,
+			VK_ATTACHMENT_LOAD_OP_LOAD,
+			VK_ATTACHMENT_STORE_OP_STORE,
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+		.AddSubpass()
+		.AddSubpassColorAttachmentRef(0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+		.DebugName("PathTracerTileRenderPass")
+		.Create(Device.get());
+
+	TileVertexShader = ShaderBuilder()
+		.Type(ShaderType::Vertex)
+		.AddSource("shaders/Tile.vert", Shaders::TileVertex())
+		.DebugName("PathTracerTileVertex")
+		.Create("PathTracerTileVertex", Device.get());
+
+	TileFragmentShader = ShaderBuilder()
+		.Type(ShaderType::Fragment)
+		.AddSource("shaders/Tile.frag", Shaders::TileFragment())
+		.DebugName("PathTracerTileFragment")
+		.Create("PathTracerTileFragment", Device.get());
+
+	for (int mode = 0; mode < 3; mode++)
+	{
+		GraphicsPipelineBuilder builder;
+		builder.AddVertexShader(TileVertexShader.get());
+		builder.AddFragmentShader(TileFragmentShader.get());
+		builder.AddVertexBufferBinding(0, sizeof(TileVertex));
+		builder.AddVertexAttribute(0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(TileVertex, Position));
+		builder.AddVertexAttribute(1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(TileVertex, TexCoord));
+		builder.AddVertexAttribute(2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(TileVertex, Color));
+		builder.AddDynamicState(VK_DYNAMIC_STATE_VIEWPORT);
+		builder.AddDynamicState(VK_DYNAMIC_STATE_SCISSOR);
+		builder.Layout(TilePipelineLayout.get());
+		builder.RenderPass(TileRenderPass.get());
+		builder.Topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+		builder.Cull(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+		builder.DepthStencilEnable(false, false, false);
+
+		// The three ways this engine composites 2D art.
+		VkPipelineColorBlendAttachmentState blend = {};
+		blend.blendEnable = VK_TRUE;
+		blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+		blend.colorBlendOp = VK_BLEND_OP_ADD;
+		blend.alphaBlendOp = VK_BLEND_OP_ADD;
+		blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		if (mode == 1)
+		{
+			blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+			blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		}
+		else if (mode == 2)
+		{
+			// Modulate 2x, not a plain multiply: the result is
+			// src*dst + dst*src, so mid grey is the identity and a modulated
+			// texture's neutral areas leave the background alone. A plain
+			// multiply halves it instead, which shows up as a dark rectangle
+			// the size of the tile - the mouse cursor being the obvious one.
+			blend.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
+			blend.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR;
+		}
+		else
+		{
+			blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+			blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		}
+		builder.AddColorBlendAttachment(blend);
+
+		builder.DebugName("PathTracerTilePipeline");
+		TilePipelines[mode] = builder.Create(Device.get());
+	}
+}
+
+// Draw the frame's collected tiles over the traced image.
+void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
+{
+	if (TileVertices.empty() || !TileFramebuffer)
+		return;
+
+	const size_t byteSize = TileVertices.size() * sizeof(TileVertex);
+	if (!TileVertexBuffer || TileVertexCapacity < byteSize)
+	{
+		// Grown rather than sized exactly, so a busy menu does not reallocate
+		// every frame.
+		TileVertexCapacity = byteSize * 2;
+		TileVertexBuffer = BufferBuilder()
+			.Size(TileVertexCapacity)
+			.Usage(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+			.DebugName("PathTracerTileVertices")
+			.Create(Device.get());
+	}
+
+	void* mapped = TileVertexBuffer->Map(0, byteSize);
+	memcpy(mapped, TileVertices.data(), byteSize);
+	TileVertexBuffer->Unmap();
+
+	PipelineBarrier()
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	RenderPassBegin()
+		.RenderPass(TileRenderPass.get())
+		.Framebuffer(TileFramebuffer.get())
+		.RenderArea(0, 0, TraceWidth, TraceHeight)
+		.Execute(commands);
+
+	VkViewport viewport = {};
+	viewport.width = (float)TraceWidth;
+	viewport.height = (float)TraceHeight;
+	viewport.maxDepth = 1.0f;
+	commands->setViewport(0, 1, &viewport);
+
+	VkRect2D scissor = {};
+	scissor.extent.width = TraceWidth;
+	scissor.extent.height = TraceHeight;
+	commands->setScissor(0, 1, &scissor);
+
+	VkBuffer vertexBuffers[] = { TileVertexBuffer->buffer };
+	VkDeviceSize offsets[] = { 0 };
+	commands->bindVertexBuffers(0, 1, vertexBuffers, offsets);
+
+	int boundMode = -1;
+	for (const TileBatch& batch : TileBatches)
+	{
+		if (!batch.Texture || !batch.Texture->Set || batch.VertexCount == 0)
+			continue;
+
+		if (batch.BlendMode != boundMode)
+		{
+			commands->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, TilePipelines[batch.BlendMode].get());
+			boundMode = batch.BlendMode;
+		}
+
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, TilePipelineLayout.get(), 0, batch.Texture->Set.get());
+		commands->draw(batch.VertexCount, 1, batch.FirstVertex, 0);
+	}
+
+	commands->endRenderPass();
+
+	PipelineBarrier()
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+
+// Keep the engine's cursor clip on the window we actually have.
+//
+// The engine clips the pointer to the window as it stands when ResizeViewport
+// captures the mouse, but the fullscreen branch below restyles and moves that
+// window afterwards, leaving the clip describing the rectangle it used to
+// occupy. The engine goes on recentring the pointer in the middle of the window
+// it now has, and that recentre is clamped to the stale rectangle, so the
+// difference comes back as mouse movement every frame.
+static void ReclipCursorToWindow(HWND hWnd)
+{
+	RECT clip = {};
+	if (!GetClipCursor(&clip))
+		return;
+
+	RECT desktop =
+	{
+		GetSystemMetrics(SM_XVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN),
+		GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+		GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)
+	};
+	if (EqualRect(&clip, &desktop))
+		return;
+
+	RECT client = {};
+	GetClientRect(hWnd, &client);
+	MapWindowPoints(hWnd, nullptr, (POINT*)&client, 2);
+	ClipCursor(&client);
+}
+
+class PathTracerSetResLock
+{
+public:
+	PathTracerSetResLock(bool& value) : value(value) { value = true; }
+	~PathTracerSetResLock() { value = false; }
+	bool& value;
+};
+
 UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fullscreen)
 {
 	guard(UPathTracerRenderDevice::SetRes);
 
+	// The engine can re-enter this while the viewport is being resized.
+	if (InSetResCall)
+		return TRUE;
+	PathTracerSetResLock lock(InSetResCall);
+
+	if (NewX == 0 || NewY == 0)
+		return 1;
+
+	HWND window = (HWND)Viewport->GetWindow();
+
+	if (!Fullscreen && FullscreenState.Enabled) // Leaving fullscreen
+	{
+		SetWindowLong(window, GWL_STYLE, FullscreenState.Style);
+		SetWindowLong(window, GWL_EXSTYLE, FullscreenState.ExStyle);
+		SetWindowPos(
+			window,
+			HWND_TOP,
+			FullscreenState.WindowPos.left,
+			FullscreenState.WindowPos.top,
+			FullscreenState.WindowPos.right - FullscreenState.WindowPos.left,
+			FullscreenState.WindowPos.bottom - FullscreenState.WindowPos.top,
+			SWP_FRAMECHANGED | SWP_NOSENDCHANGING | SWP_NOACTIVATE | SWP_NOZORDER);
+
+		FullscreenState.Enabled = false;
+	}
+
+	// Read the windowed state before the resize, not after: the engine's own
+	// fullscreen handling moves and restyles the window as part of it, so
+	// reading afterwards saves the fullscreen geometry as the one to go back to.
+	const bool enteringFullscreen = Fullscreen && !FullscreenState.Enabled;
+	if (enteringFullscreen)
+	{
+		GetWindowRect(window, &FullscreenState.WindowPos);
+		FullscreenState.Style = GetWindowLong(window, GWL_STYLE);
+		FullscreenState.ExStyle = GetWindowLong(window, GWL_EXSTYLE);
+	}
+
+	// BLIT_Fullscreen even though the window below is only borderless. The engine
+	// keys a good deal off believing it is fullscreen - input capture, the
+	// pointer clip, and whether the system cursor is shown - so telling it
+	// otherwise leaves the desktop cursor on screen underneath the one the game
+	// draws itself. The actual display mode change it asks for is undone by the
+	// restyle that follows; UseDirectDraw=False in DeusEx.ini removes it
+	// entirely, which a device presenting through Vulkan has no use for.
 	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), NewX, NewY, NewColorBytes))
 		return 0;
+
+	if (enteringFullscreen)
+	{
+		HDC screenDC = GetDC(0);
+		int screenWidth = GetDeviceCaps(screenDC, HORZRES);
+		int screenHeight = GetDeviceCaps(screenDC, VERTRES);
+		ReleaseDC(0, screenDC);
+
+		SetWindowLong(window, GWL_STYLE, WS_OVERLAPPED | WS_VISIBLE);
+		SetWindowLong(window, GWL_EXSTYLE, WS_EX_APPWINDOW);
+		SetWindowPos(window, HWND_TOP, 0, 0, screenWidth, screenHeight, SWP_FRAMECHANGED | SWP_NOSENDCHANGING | SWP_NOZORDER);
+
+		FullscreenState.Enabled = true;
+	}
+
+	// Restyling a window can leave it behind whatever was in front of it, with
+	// the engine still believing it has focus and swallowing the input that
+	// would bring it back. Ask for the foreground explicitly on either
+	// transition rather than relying on the restyle to carry it.
+	SetForegroundWindow(window);
+	SetFocus(window);
+
+	ReclipCursorToWindow(window);
 
 	SaveConfig();
 	Flush(1);
@@ -196,6 +489,7 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 
 	vkDeviceWaitIdle(Device->device);
 
+	TileFramebuffer.reset();
 	AccumView.reset();
 	AccumImage.reset();
 	OutputView.reset();
@@ -212,10 +506,22 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	OutputImage = ImageBuilder()
 		.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
 		.Size(width, height)
-		.Usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+		.Usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
 		.DebugName("PathTracerOutput")
 		.Create(Device.get());
 	OutputView = ImageViewBuilder().Image(OutputImage.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName("PathTracerOutputView").Create(Device.get());
+
+	// The tile pass draws into the traced image, so its framebuffer follows the
+	// image rather than the window.
+	if (TileRenderPass)
+	{
+		TileFramebuffer = FramebufferBuilder()
+			.RenderPass(TileRenderPass.get())
+			.Size(width, height)
+			.AddAttachment(OutputView.get())
+			.DebugName("PathTracerTileFramebuffer")
+			.Create(Device.get());
+	}
 
 	TraceWidth = width;
 	TraceHeight = height;
@@ -240,7 +546,7 @@ void UPathTracerRenderDevice::ReleaseSwapChainResources()
 
 void UPathTracerRenderDevice::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel || !Accel->IsBuilt() || !AccumView)
+	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView)
 		return;
 
 	WriteDescriptors()
@@ -277,22 +583,33 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 
 	// Rebuild when the level changes. Comparing the node count as well catches
 	// a level object being reused for a different map, which the engine does.
-	if (Scene.SourceLevel == level && Scene.SourceNodeCount == level->Model->Nodes.Num() && Accel->IsBuilt())
-		return;
-
-	debugf(TEXT("PathTracer: building the scene"));
-
-	if (!Scene.Build(level))
+	// Rebuild from scratch only when the level changes. Comparing the node count
+	// as well catches a level object being reused for a different map.
+	if (Scene.SourceLevel != level || Scene.SourceNodeCount != level->Model->Nodes.Num())
 	{
-		debugf(TEXT("PathTracer: nothing to build from"));
-		return;
+		debugf(TEXT("PathTracer: building the scene"));
+
+		Accel->Reset();
+		if (!Scene.BuildStatic(level))
+		{
+			debugf(TEXT("PathTracer: nothing to build from"));
+			return;
+		}
+
+		debugf(TEXT("PathTracer: %d static triangles, %d lights"),
+			(int)(Scene.Geometries[0].Positions.size() / 3), (int)Scene.Lights.size());
 	}
 
-	Accel->Build(Scene);
-	DescriptorsDirty = true;
-	AccumulatedFrames = 0;
+	// Every frame: where the movers and the mesh actors are now. New shapes get
+	// a bottom level structure the first time they are seen.
+	Scene.CollectDynamic(level);
+	Accel->SyncGeometry(Scene);
 
-	debugf(TEXT("PathTracer: %d triangles, %d lights"), Scene.TriangleCount(), (int)Scene.Lights.size());
+	if (Accel->AttributesChanged())
+	{
+		Accel->ClearAttributesChanged();
+		DescriptorsDirty = true;
+	}
 }
 
 void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
@@ -351,6 +668,8 @@ void UPathTracerRenderDevice::Lock(FPlane FlashScale, FPlane FlashFog, FPlane Sc
 	{
 		CreateSwapChainResources();
 		HaveCamera = false;
+		TileVertices.clear();
+		TileBatches.clear();
 	}
 	catch (const std::exception& e)
 	{
@@ -364,18 +683,22 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 {
 	guard(UPathTracerRenderDevice::Unlock);
 
-	if (!Blit || !HaveCamera || !Accel || !Accel->IsBuilt() || !AccumImage)
+	if (!Blit || !HaveCamera || !Accel || !AccumImage)
 		return;
 
 	try
 	{
-		UpdateDescriptors();
-
 		// Accumulate only while the view is still. Any movement and the samples
 		// behind it describe a different picture, so start again.
 		const bool cameraMoved =
 			memcmp(&PushConstants.CameraOrigin, &LastCamera.CameraOrigin, sizeof(vec4) * 4) != 0;
-		if (cameraMoved)
+		// A door swinging past is as much a change as the camera turning, and
+		// the instance count is a cheap proxy for the scene having moved. It
+		// misses an actor that moves while the count holds, which is why the
+		// accumulation is capped rather than trusted indefinitely.
+		const bool sceneChanged = Scene.Instances.size() != LastInstanceCount;
+		LastInstanceCount = Scene.Instances.size();
+		if (cameraMoved || sceneChanged)
 			AccumulatedFrames = 0;
 		LastCamera = PushConstants;
 
@@ -410,10 +733,25 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		auto commands = CommandPool->createBuffer();
 		commands->begin();
 
+		// The top level structure is rebuilt every frame, because the movers and
+		// the actors have all moved since the last one.
+		Accel->BuildTopLevel(Scene, commands.get());
+
+		if (!Accel->IsReady())
+		{
+			commands->end();
+			return;
+		}
+
+		UpdateDescriptors();
+
 		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
 		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet);
 		commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
 		commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+
+		// HUD, menus and console on top of the traced world.
+		RenderTiles(commands.get());
 
 		// The trace writes the output image; the blit reads it.
 		PipelineBarrier()
@@ -477,6 +815,13 @@ void UPathTracerRenderDevice::Flush(UBOOL AllowPrecache)
 {
 	guard(UPathTracerRenderDevice::Flush);
 	AccumulatedFrames = 0;
+	TileVertices.clear();
+	TileBatches.clear();
+	if (Textures)
+	{
+		if (Device) vkDeviceWaitIdle(Device->device);
+		Textures->Clear();
+	}
 	unguard;
 }
 
@@ -522,6 +867,18 @@ void UPathTracerRenderDevice::Exit()
 	AccumView.reset();
 	AccumImage.reset();
 
+	TileFramebuffer.reset();
+	TileVertexBuffer.reset();
+	for (auto& p : TilePipelines) p.reset();
+	TileFragmentShader.reset();
+	TileVertexShader.reset();
+	TileRenderPass.reset();
+	TilePipelineLayout.reset();
+	Textures.reset();
+	TileDescriptorPool.reset();
+	TileSetLayout.reset();
+	TileSampler.reset();
+
 	TracePipeline.reset();
 	TraceShader.reset();
 	PipelineLayout.reset();
@@ -548,7 +905,79 @@ void UPathTracerRenderDevice::Exit()
 
 void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet) {}
 void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span) {}
-void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags) {}
+// The engine's 2D drawing: HUD, menus, console, subtitles, the mouse cursor.
+//
+// Collected here rather than drawn, because the traced image does not exist yet
+// when these arrive - the whole frame is traced in Unlock. Batches are merged
+// while the texture and blend mode hold, which for a menu is most of it.
+void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags)
+{
+	guardSlow(UPathTracerRenderDevice::DrawTile);
+
+	if (!Textures || TraceWidth <= 0 || TraceHeight <= 0)
+		return;
+
+	// A texture can carry PF_Masked itself rather than the caller passing it.
+	// Modulated art is excluded: its transparency is carried by the grey level
+	// rather than by a palette hole, and punching alpha into it would leave
+	// gaps where the texture happens to use index zero as a real colour.
+	const DWORD flags = PolyFlags | (Info.Texture ? Info.Texture->PolyFlags : 0);
+	const bool masked = (flags & PF_Masked) != 0 && (flags & PF_Modulated) == 0;
+	CachedTexture* texture = Textures->Get(Info, masked);
+	if (!texture)
+		return;
+
+	int blendMode = 0;
+	if (flags & PF_Translucent)
+		blendMode = 1;
+	else if (flags & PF_Modulated)
+		blendMode = 2;
+
+	// The engine gives tile positions in viewport pixels including the frame's
+	// own offset, and texture coordinates in texels.
+	const float x0 = (X + Frame->XB);
+	const float y0 = (Y + Frame->YB);
+	const float x1 = x0 + XL;
+	const float y1 = y0 + YL;
+
+	const float sx = 2.0f / (float)TraceWidth;
+	const float sy = 2.0f / (float)TraceHeight;
+
+	const float uScale = Info.USize > 0 ? 1.0f / (Info.UScale * Info.USize) : 0.0f;
+	const float vScale = Info.VSize > 0 ? 1.0f / (Info.VScale * Info.VSize) : 0.0f;
+
+	const float u0 = U * uScale;
+	const float v0 = V * vScale;
+	const float u1 = (U + UL) * uScale;
+	const float v1 = (V + VL) * vScale;
+
+	vec4 colour = vec4(Color.X, Color.Y, Color.Z, 1.0f);
+	if (flags & PF_Modulated)
+		colour = vec4(1.0f, 1.0f, 1.0f, 1.0f);
+
+	TileVertex corners[4];
+	corners[0] = { vec2(x0 * sx - 1.0f, y0 * sy - 1.0f), vec2(u0, v0), colour };
+	corners[1] = { vec2(x1 * sx - 1.0f, y0 * sy - 1.0f), vec2(u1, v0), colour };
+	corners[2] = { vec2(x1 * sx - 1.0f, y1 * sy - 1.0f), vec2(u1, v1), colour };
+	corners[3] = { vec2(x0 * sx - 1.0f, y1 * sy - 1.0f), vec2(u0, v1), colour };
+
+	if (TileBatches.empty() || TileBatches.back().Texture != texture || TileBatches.back().BlendMode != blendMode)
+	{
+		TileBatch batch;
+		batch.Texture = texture;
+		batch.BlendMode = blendMode;
+		batch.FirstVertex = (int)TileVertices.size();
+		batch.VertexCount = 0;
+		TileBatches.push_back(batch);
+	}
+
+	const int order[6] = { 0, 1, 2, 0, 2, 3 };
+	for (int i = 0; i < 6; i++)
+		TileVertices.push_back(corners[order[i]]);
+	TileBatches.back().VertexCount += 6;
+
+	unguardSlow;
+}
 void UPathTracerRenderDevice::Draw2DLine(FSceneNode* Frame, FPlane Color, DWORD LineFlags, FVector P1, FVector P2) {}
 void UPathTracerRenderDevice::Draw2DPoint(FSceneNode* Frame, FPlane Color, DWORD LineFlags, FLOAT X1, FLOAT Y1, FLOAT X2, FLOAT Y2, FLOAT Z) {}
 void UPathTracerRenderDevice::ClearZ(FSceneNode* Frame) {}

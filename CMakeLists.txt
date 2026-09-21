@@ -228,6 +228,7 @@ add_library(PathTracerDrv SHARED
 	"${PATHTRACERDRV_DIR}/PathTracerDrv.cpp"
 	"${PATHTRACERDRV_DIR}/Precomp.cpp"
 	"${PATHTRACERDRV_DIR}/Shaders.cpp"
+	"${PATHTRACERDRV_DIR}/TextureCache.cpp"
 	"${PATHTRACERDRV_DIR}/UPathTracerRenderDevice.cpp")
 
 target_include_directories(PathTracerDrv PRIVATE "${PATHTRACERDRV_DIR}")

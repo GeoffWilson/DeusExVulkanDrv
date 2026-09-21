@@ -4,8 +4,26 @@
 #include "mat.h"
 #include "LevelScene.h"
 #include "AccelStructure.h"
+#include "TextureCache.h"
 #include <functional>
 #include <memory>
+
+// One corner of a 2D tile, in normalised device coordinates.
+struct TileVertex
+{
+	vec2 Position;
+	vec2 TexCoord;
+	vec4 Color;
+};
+
+// A run of tile vertices that share a texture and a blend mode.
+struct TileBatch
+{
+	CachedTexture* Texture = nullptr;
+	int BlendMode = 0;      // 0 alpha, 1 additive, 2 modulated
+	int FirstVertex = 0;
+	int VertexCount = 0;
+};
 
 struct TracePushConstants
 {
@@ -57,6 +75,9 @@ public:
 	void GetStats(TCHAR* Result) override;
 	void ReadPixels(FColor* Pixels) override;
 
+	// Made per cached texture, since a tile draw binds nothing else.
+	std::unique_ptr<VulkanDescriptorSet> AllocateTileDescriptorSet(VulkanImageView* view);
+
 	VulkanDevice* GetDevice() const { return Device.get(); }
 
 	// Runs a command buffer to completion. Used for uploads and structure
@@ -76,6 +97,8 @@ private:
 	void CreateSwapChainResources();
 	void ReleaseSwapChainResources();
 	void CreateTracePipeline();
+	void CreateTilePipeline();
+	void RenderTiles(VulkanCommandBuffer* commands);
 	void EnsureSceneBuilt(ULevel* level);
 	void UpdateDescriptors();
 
@@ -105,6 +128,22 @@ private:
 	int TraceWidth = 0;
 	int TraceHeight = 0;
 
+	// The 2D pass.
+	std::unique_ptr<TextureCache> Textures;
+	std::unique_ptr<VulkanDescriptorSetLayout> TileSetLayout;
+	std::unique_ptr<VulkanDescriptorPool> TileDescriptorPool;
+	std::unique_ptr<VulkanSampler> TileSampler;
+	std::unique_ptr<VulkanPipelineLayout> TilePipelineLayout;
+	std::unique_ptr<VulkanRenderPass> TileRenderPass;
+	std::unique_ptr<VulkanPipeline> TilePipelines[3];
+	std::unique_ptr<VulkanShader> TileVertexShader;
+	std::unique_ptr<VulkanShader> TileFragmentShader;
+	std::unique_ptr<VulkanFramebuffer> TileFramebuffer;
+	std::unique_ptr<VulkanBuffer> TileVertexBuffer;
+	size_t TileVertexCapacity = 0;
+	std::vector<TileVertex> TileVertices;
+	std::vector<TileBatch> TileBatches;
+
 	LevelScene Scene;
 	std::unique_ptr<AccelStructure> Accel;
 
@@ -112,10 +151,23 @@ private:
 	// device has to notice when something has.
 	TracePushConstants LastCamera = {};
 	uint32_t AccumulatedFrames = 0;
+	size_t LastInstanceCount = 0;
 	uint32_t FrameIndex = 0;
 	bool DescriptorsDirty = true;
 
 	TracePushConstants PushConstants = {};
 	bool HaveCamera = false;
 	UBOOL UsingVsync = 0;
+
+	// The windowed style and rectangle to return to. Fullscreen here is a
+	// borderless window rather than a display mode change.
+	struct
+	{
+		RECT WindowPos = {};
+		LONG Style = 0;
+		LONG ExStyle = 0;
+		bool Enabled = false;
+	} FullscreenState;
+
+	bool InSetResCall = false;
 };
