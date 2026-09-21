@@ -15,6 +15,9 @@ std::string Shaders::Trace()
 		layout(binding = 0) uniform accelerationStructureEXT topLevel;
 		layout(binding = 1, rgba32f) uniform image2D accumImage;
 		layout(binding = 2, rgba16f) uniform image2D outImage;
+		// xyz: the world position this pixel hit last frame. w: which instance
+		// owned it, or -1 for the sky.
+		layout(binding = 7, rgba32f) uniform image2D historyImage;
 
 		struct TriangleAttributes
 		{
@@ -51,6 +54,7 @@ std::string Shaders::Trace()
 			uvec4 Counts;         // x frame, y light count, z bounces, w accumulated frames
 			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w debug mode
 			uint TextureCount;    // 0 when the device cannot index the array
+			uint MaxSamples;      // ceiling on samples averaged into one pixel
 		};
 
 		// Does this point on the triangle actually exist? UE1 masked art keys
@@ -58,22 +62,6 @@ std::string Shaders::Trace()
 		// alpha of zero. Rendering those texels rather than seeing through them
 		// is what put magenta - the key colour in Deus Ex's packages - across
 		// every window and railing.
-		bool texelPresent(int attributeBase, int primitive, vec2 bary)
-		{
-			TriangleAttributes attr = tris[attributeBase + primitive];
-			if (attr.UV2Tex.w < 0.5)
-				return true;
-
-			int index = int(attr.UV2Tex.z);
-			if (index < 0 || uint(index) >= TextureCount)
-				return true;
-
-			vec2 uv = attr.UV01.xy * (1.0 - bary.x - bary.y)
-			        + attr.UV01.zw * bary.x
-			        + attr.UV2Tex.xy * bary.y;
-			return texture(sceneTextures[nonuniformEXT(index)], uv).a > 0.5;
-		}
-
 		// The triangle's own colour, textured where there is a texture to read.
 		// UE1 surface coordinates run well outside 0..1 - one texture tiles
 		// across a whole wall - which the sampler's repeat mode handles.
@@ -136,6 +124,45 @@ std::string Shaders::Trace()
 			return normalize(t * (cos(phi) * sinTheta) + b * (sin(phi) * sinTheta) + n * sqrt(max(0.0, 1.0 - r2)));
 		}
 
+		// Should traversal accept this candidate triangle?
+		//
+		//   opaque      always.
+		//   masked      only where the texture's alpha says the texel is there.
+		//               UE1 keys transparency to palette index zero, and drawing
+		//               those texels put the key colour across every grate.
+		//   translucent with a probability equal to its opacity, so most rays
+		//               carry on through a window and some stop on the glass.
+		//
+		// Accepting stochastically rather than tinting as the ray passes. A ray
+		// query reports candidates in whatever order traversal reaches them,
+		// including ones beyond what turns out to be the closest opaque hit, so
+		// tinting during traversal let glass behind a wall colour the pixel in
+		// front of it. Deciding here shrinks the ray properly, and averaging
+		// over frames is what makes the glass look partly transparent.
+		bool confirmCandidate(int attributeBase, int primitive, vec2 bary)
+		{
+			TriangleAttributes attr = tris[attributeBase + primitive];
+			float kind = attr.UV2Tex.w;
+			if (kind < 0.5)
+				return true;
+
+			int index = int(attr.UV2Tex.z);
+			bool textured = index >= 0 && uint(index) < TextureCount;
+
+			vec2 uv = attr.UV01.xy * (1.0 - bary.x - bary.y)
+			        + attr.UV01.zw * bary.x
+			        + attr.UV2Tex.xy * bary.y;
+
+			if (kind < 1.5)
+				return textured ? texture(sceneTextures[nonuniformEXT(index)], uv).a > 0.5 : true;
+
+			// A mirror is solid; it reflects rather than letting anything past.
+			if (kind > 2.5)
+				return true;
+
+			return randomFloat() < 0.25;
+		}
+
 		// Is anything between two points? Terminate on the first hit rather than
 		// looking for the closest one: a shadow ray only asks whether, not what.
 		bool occluded(vec3 origin, vec3 dir, float dist)
@@ -146,11 +173,13 @@ std::string Shaders::Trace()
 				0xFF, origin, Params.z, dir, dist);
 			// A hole in a grate lets light through, so a candidate only counts
 			// as occluding once its texel is known to be there.
+			// Light passes through glass and through the holes in a grate, so a
+			// candidate only occludes once it is confirmed.
 			while (rayQueryProceedEXT(rq))
 			{
 				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 				{
-					if (texelPresent(
+					if (confirmCandidate(
 							rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 							rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
 							rayQueryGetIntersectionBarycentricsEXT(rq, false)))
@@ -272,6 +301,12 @@ std::string Shaders::Trace()
 			vec3 radiance = vec3(0.0);
 			vec3 throughput = vec3(1.0);
 
+			// What this pixel is looking at, recorded on the first bounce so the
+			// accumulated history can be checked against it.
+			vec3 primaryPosition = origin + direction * 100000.0;
+			float primaryInstance = -1.0;
+			float primaryDistance = 100000.0;
+
 			uint bounces = max(Counts.z, 1u);
 			for (uint bounce = 0u; bounce < bounces; bounce++)
 			{
@@ -279,11 +314,12 @@ std::string Shaders::Trace()
 				rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsNoneEXT, 0xFF, origin, Params.z, direction, 100000.0);
 				while (rayQueryProceedEXT(rq))
 				{
-					// Only geometry holding masked art is non-opaque, so this
-					// runs for grates, fences and windows and nothing else.
+					// Only geometry holding masked or translucent art is
+					// non-opaque, so this runs for grates, windows and glass and
+					// nothing else.
 					if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 					{
-						if (texelPresent(
+						if (confirmCandidate(
 								rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 								rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
 								rayQueryGetIntersectionBarycentricsEXT(rq, false)))
@@ -299,6 +335,13 @@ std::string Shaders::Trace()
 
 				float t = rayQueryGetIntersectionTEXT(rq, true);
 				int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+
+				if (bounce == 0u)
+				{
+					primaryDistance = t;
+					primaryPosition = origin + direction * t;
+					primaryInstance = float(rayQueryGetIntersectionInstanceIdEXT(rq, true));
+				}
 
 				// Each instance carries the offset of its geometry's shading
 				// data as its custom index, so one buffer serves every shape.
@@ -316,6 +359,23 @@ std::string Shaders::Trace()
 				// though it had never turned.
 				mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 				vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
+
+				// A reflective surface - the polished floor of the UNATCO lobby
+				// is the one that shows. Half the rays carry on in the mirrored
+				// direction and half shade the surface itself, which averages
+				// out to a floor that is both marble and a reflection. Without
+				// this the flag meant nothing and the floor was a flat slab of
+				// whatever colour its texture averaged to.
+				if (attr.UV2Tex.w > 2.5 && randomFloat() < 0.5)
+				{
+					// Tinted by the floor but not dimmed to nothing by it: dark
+					// marble has an albedo near 0.1, and multiplying the
+					// reflection by that made it invisible.
+					throughput *= 0.55 + 0.45 * clamp(attr.Albedo.rgb * 2.5, vec3(0.0), vec3(1.0));
+					origin = position + normal * Params.z;
+					direction = reflect(direction, normal);
+					continue;
+				}
 
 				// Debug: light every instance that is not the static world, so
 				// that "the actors are not being drawn" can be told apart from
@@ -392,14 +452,52 @@ std::string Shaders::Trace()
 			// Average with what has already been traced from this viewpoint.
 			// Reset by the device whenever the camera or the scene moves, so a
 			// still image converges and a moving one stays responsive.
-			uint accumulated = Counts.w;
-			vec3 result = radiance;
-			if (accumulated > 0u)
+			// Accumulation is judged per pixel rather than for the whole frame.
+			// The device resets everything when the camera moves, but an actor
+			// walking past moves nothing the device can see: the instance count
+			// does not change and neither does the view, so those pixels went on
+			// averaging against the wall behind them. That is what turned a
+			// moving character into a fading smear.
+			vec4 stored = imageLoad(accumImage, pixel);
+			vec4 previousHit = imageLoad(historyImage, pixel);
+
+			float samples = stored.a;
+			if (Counts.w == 0u)
 			{
-				vec3 previous = imageLoad(accumImage, pixel).rgb;
-				result = mix(previous, radiance, 1.0 / float(accumulated + 1u));
+				// The device invalidated everything, typically a camera move.
+				samples = 0.0;
 			}
-			imageStore(accumImage, pixel, vec4(result, 1.0));
+			else if (previousHit.w != primaryInstance)
+			{
+				// A different object is under this pixel than last frame.
+				samples = 0.0;
+			}
+			else if (primaryInstance >= 0.0 && instanceAmbient[int(primaryInstance)].w > 0.5)
+			{
+				// The scene says this instance moved or changed shape since the
+				// last frame, so nothing accumulated for it still describes it.
+				// Exact, where judging by how far the hit point shifted was not:
+				// anything slower than the tolerance kept its history and
+				// smeared, which is what a medical bot crossing a room does.
+				samples = 0.0;
+			}
+			else
+			{
+				// The same object, in the same place. The hit point still wanders
+				// by about a pixel's footprint because the ray is jittered inside
+				// the pixel, which is all this tolerance is for.
+				float tolerance = max(0.05, primaryDistance * 0.004);
+				if (distance(previousHit.xyz, primaryPosition) > tolerance)
+					samples = 0.0;
+			}
+
+			vec3 result = radiance;
+			if (samples > 0.0)
+				result = mix(stored.rgb, radiance, 1.0 / (samples + 1.0));
+
+			samples = min(samples + 1.0, float(max(MaxSamples, 1u)));
+			imageStore(accumImage, pixel, vec4(result, samples));
+			imageStore(historyImage, pixel, vec4(primaryPosition, primaryInstance));
 
 			// Tonemap and encode here rather than in a present pass: the result
 			// is blitted straight to the swap chain, so this is the last thing

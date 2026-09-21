@@ -92,6 +92,7 @@ public:
 	int SourceNodeCount = 0;
 
 private:
+	void AddBrushPolys(UModel* brush, SceneGeometry& out);
 	void AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals);
 	void AddLights(ULevel* level);
 
@@ -117,6 +118,27 @@ private:
 
 	std::unordered_map<UTexture*, int> TextureIndex;
 
+	// What each actor's placement was last frame, so that an instance which has
+	// actually moved can be told apart from one that merely looks different.
+	// Two maps swapped each frame rather than one that grows for ever.
+	struct PlacedPose
+	{
+		int GeometryIndex = -1;
+		float Transform[12] = {};
+		bool operator!=(const PlacedPose& other) const
+		{
+			if (GeometryIndex != other.GeometryIndex)
+				return true;
+			for (int i = 0; i < 12; i++)
+				if (Transform[i] != other.Transform[i])
+					return true;
+			return false;
+		}
+	};
+	int MirroredSurfaces = 0;
+	std::unordered_map<AActor*, PlacedPose> PreviousPoses;
+	std::unordered_map<AActor*, PlacedPose> CurrentPoses;
+
 public:
 	// How many distinct poses an animation is quantised into. Bounds the number
 	// of structures at this many per mesh, at the cost of steppier movement.
@@ -135,6 +157,7 @@ public:
 	// rather than wrong.
 	static const int MaxTextures = 1024;
 	std::vector<UTexture*> Textures;
+	int MirroredCount() const { return MirroredSurfaces; }
 	int TextureFor(UTexture* texture);
 
 private:

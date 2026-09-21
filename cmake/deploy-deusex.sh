@@ -69,7 +69,12 @@ esac
 if [ -n "$DEV" ]; then
 	for f in "${INIS[@]}"; do
 		sed -i "s|^GameRenderDevice=.*|GameRenderDevice=$DEV|" "$f"
-		echo "$(basename "$f"): GameRenderDevice=$DEV"
+		# These devices present through Vulkan or D3D and never through
+		# DirectDraw, but the engine still asks DirectDraw for a real display
+		# mode change when going fullscreen. Under wine that fails and the engine
+		# gives up with EndFullscreen the moment it has entered.
+		sed -i "s|^UseDirectDraw=.*|UseDirectDraw=False|" "$f"
+		echo "$(basename "$f"): GameRenderDevice=$DEV, UseDirectDraw=False"
 	done
 fi
 

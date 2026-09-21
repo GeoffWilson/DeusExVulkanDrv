@@ -69,7 +69,12 @@ namespace
 
 	// The engine's rotators are 16 bit units; FCoords does the work, this just
 	// flattens the result into the 3x4 row major form Vulkan wants.
-	void MakeTransform(const FVector& location, const FRotator& rotation, const FVector& scale, float out[12])
+	// prePivot is the actor's own draw offset, applied in the object's space
+	// before the rotation - the order ABrush::ToWorld spells out:
+	//   UnitCoords / -PrePivot / MainScale / Rotation / PostScale / Location
+	// Folding it into the translation keeps the cached geometry untouched, since
+	// the offset belongs to the actor rather than to the shape.
+	void MakeTransform(const FVector& location, const FRotator& rotation, const FVector& scale, const FVector& prePivot, float out[12])
 	{
 		FCoords coords = GMath.UnitCoords / rotation;
 
@@ -87,9 +92,17 @@ namespace
 			out[1 * 4 + col] = axes[col].Y * s[col];
 			out[2 * 4 + col] = axes[col].Z * s[col];
 		}
-		out[0 * 4 + 3] = location.X;
-		out[1 * 4 + 3] = location.Y;
-		out[2 * 4 + 3] = location.Z;
+		// location + R * (scale * prePivot). The engine's chain reads
+		// "/ -PrePivot", and its / operator already subtracts, so the two
+		// negatives cancel and the offset is added.
+		const FVector offset =
+			axes[0] * (prePivot.X * s[0]) +
+			axes[1] * (prePivot.Y * s[1]) +
+			axes[2] * (prePivot.Z * s[2]);
+
+		out[0 * 4 + 3] = location.X + offset.X;
+		out[1 * 4 + 3] = location.Y + offset.Y;
+		out[2 * 4 + 3] = location.Z + offset.Z;
 	}
 
 	void MakeIdentity(float out[12])
@@ -107,6 +120,8 @@ void LevelScene::Clear()
 	Instances.clear();
 	BrushGeometry.clear();
 	MeshGeometry.clear();
+	PreviousPoses.clear();
+	CurrentPoses.clear();
 	Textures.clear();
 	TextureIndex.clear();
 	GeometryAdded = false;
@@ -167,6 +182,14 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		if (skipPortals)
 			skip |= PF_FakeBackdrop | PF_Portal;
 		if (surf.PolyFlags & skip)
+			continue;
+
+		// A mover's polygons are in the level's own BSP as well as in the brush
+		// the mover carries, so drawing both put every door in the scene twice:
+		// once wherever it currently is, and once frozen at the position the
+		// level was built with. FBspSurf records which brush actor owns the
+		// surface, and a moving brush is placed as an instance instead.
+		if (skipPortals && surf.Actor && surf.Actor->IsMovingBrush())
 			continue;
 
 		vec3 normal = vec3(node.Plane.X, node.Plane.Y, node.Plane.Z);
@@ -255,10 +278,15 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 				const vec2 uv1 = surfaceUV(p1);
 				const vec2 uv2 = surfaceUV(p2);
 				const bool masked = (surf.Texture->PolyFlags & PF_Masked) != 0;
-				if (masked)
+				const bool translucent = (surf.PolyFlags & (PF_Translucent | PF_Modulated)) != 0;
+				const bool mirrored = (surf.PolyFlags & PF_Mirrored) != 0;
+				if (mirrored)
+					MirroredSurfaces++;
+				const float kind = mirrored ? 3.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f));
+				if (kind == 1.0f || kind == 2.0f)
 					out.HasMasked = true;
 				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
-				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, masked ? 1.0f : 0.0f);
+				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, kind);
 			}
 
 			out.Positions.push_back(v0);
@@ -303,6 +331,101 @@ void LevelScene::AddLights(ULevel* level)
 	unguard;
 }
 
+// A brush's own polygons, which is what the engine treats as its geometry.
+//
+// The node tree a mover carries is a coarser description of the same shape: a
+// door with a window came out as a solid slab, because the detail lives in the
+// polygon list. The level's BSP had it right, which is why the door looked
+// correct while it was being drawn twice.
+void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
+{
+	guard(LevelScene::AddBrushPolys);
+
+	UPolys* polys = brush->Polys;
+	if (!polys)
+		return;
+
+	for (INT i = 0; i < polys->Element.Num(); i++)
+	{
+		const FPoly& poly = polys->Element(i);
+		if (poly.NumVertices < 3)
+			continue;
+		if (poly.PolyFlags & PF_Invisible)
+			continue;
+
+		const vec3 normal = vec3(poly.Normal.X, poly.Normal.Y, poly.Normal.Z);
+		const vec3 albedo = AverageColour(poly.Texture, vec3(0.5f, 0.5f, 0.5f));
+
+		bool unlit = false;
+		if (poly.PolyFlags & PF_Unlit)
+			unlit = true;
+
+		TriangleAttributes attr;
+		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
+		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, 0.0f);
+		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
+		// A mover is instanced into whatever room it stands in, so its ambient
+		// comes from the instance.
+		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+
+		const int textureIndex = TextureFor(poly.Texture);
+		const bool masked = poly.Texture && (poly.Texture->PolyFlags & PF_Masked) != 0;
+		const bool translucent = (poly.PolyFlags & (PF_Translucent | PF_Modulated)) != 0;
+		const bool mirrored = (poly.PolyFlags & PF_Mirrored) != 0;
+		const float kind = mirrored ? 3.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f));
+		if (kind == 1.0f || kind == 2.0f)
+			out.HasMasked = true;
+
+		const bool textured = textureIndex >= 0 && poly.Texture->USize > 0 && poly.Texture->VSize > 0;
+		const float uScale = textured ? 1.0f / (float)poly.Texture->USize : 0.0f;
+		const float vScale = textured ? 1.0f / (float)poly.Texture->VSize : 0.0f;
+		auto polyUV = [&](const FVector& point) -> vec2
+		{
+			const FVector d = point - poly.Base;
+			return vec2(
+				((d | poly.TextureU) + poly.PanU) * uScale,
+				((d | poly.TextureV) + poly.PanV) * vScale);
+		};
+
+		// Triangulated as a fan, which is valid because brush polygons are
+		// convex by construction.
+		const FVector& p0 = poly.Vertex[0];
+		const vec3 v0 = ToVec3(p0);
+		for (INT t = 1; t + 1 < poly.NumVertices; t++)
+		{
+			const FVector& p1 = poly.Vertex[t];
+			const FVector& p2 = poly.Vertex[t + 1];
+			const vec3 v1 = ToVec3(p1);
+			const vec3 v2 = ToVec3(p2);
+
+			const vec3 cr = cross(v1 - v0, v2 - v0);
+			if (dot(cr, cr) <= 1e-6f)
+				continue;
+
+			if (textured)
+			{
+				const vec2 uv0 = polyUV(p0);
+				const vec2 uv1 = polyUV(p1);
+				const vec2 uv2 = polyUV(p2);
+				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
+				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, kind);
+			}
+			else
+			{
+				attr.UV01 = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+				attr.UV2Tex = vec4(0.0f, 0.0f, -1.0f, kind);
+			}
+
+			out.Positions.push_back(v0);
+			out.Positions.push_back(v1);
+			out.Positions.push_back(v2);
+			out.Attributes.push_back(attr);
+		}
+	}
+
+	unguard;
+}
+
 int LevelScene::GeometryForBrush(UModel* brush)
 {
 	auto it = BrushGeometry.find(brush);
@@ -311,9 +434,12 @@ int LevelScene::GeometryForBrush(UModel* brush)
 
 	Geometries.emplace_back();
 	SceneGeometry& geometry = Geometries.back();
-	// A mover's brush is its own little model in its own local space, and its
-	// portal flags mean nothing here.
-	AddBspSurfaces(brush, geometry, false);
+	// A mover's brush is its own little model in its own local space. Built from
+	// its polygon list rather than its nodes, which is both what the engine
+	// treats as the brush's geometry and the only one carrying its detail.
+	AddBrushPolys(brush, geometry);
+	if (geometry.Positions.empty())
+		AddBspSurfaces(brush, geometry, false);
 
 	const int index = (int)Geometries.size() - 1;
 	BrushGeometry[brush] = index;
@@ -538,12 +664,15 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 
 		const int textureIndex = TextureFor(skin);
 		const bool masked = skin && (skin->PolyFlags & PF_Masked) != 0;
-		if (masked)
+		const bool translucent = (tri.PolyFlags & (PF_Translucent | PF_Modulated)) != 0;
+		const bool mirrored = (tri.PolyFlags & PF_Mirrored) != 0;
+		const float kind = mirrored ? 3.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f));
+		if (kind == 1.0f || kind == 2.0f)
 			geometry.HasMasked = true;
 		attr.UV01 = vec4(tri.Tex[0].U / 255.0f, tri.Tex[0].V / 255.0f,
 		                 tri.Tex[1].U / 255.0f, tri.Tex[1].V / 255.0f);
 		attr.UV2Tex = vec4(tri.Tex[2].U / 255.0f, tri.Tex[2].V / 255.0f,
-		                   (float)textureIndex, masked ? 1.0f : 0.0f);
+		                   (float)textureIndex, kind);
 
 		// A mesh is instanced into whatever room the actor is standing in, so
 		// its ambient comes from the instance rather than from here.
@@ -615,6 +744,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 	GeometryAdded = false;
 	Instances.clear();
+	CurrentPoses.clear();
 
 	if (Geometries.empty())
 		return;
@@ -739,14 +869,37 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 		SceneInstance instance;
 		instance.GeometryIndex = geometryIndex;
-		MakeTransform(actor->Location, actor->Rotation, scale, instance.Transform);
+		// A brush and a mesh take the pre-pivot in opposite directions. For a
+		// brush it comes off the points before the rotation, the way
+		// ABrush::ToWorld spells out; for a mesh actor it offsets the drawn mesh
+		// instead. Measured both ways round: with one sign the seated characters
+		// sit correctly and the doors ride up, with the other the reverse.
+		const bool isBrush = (actor->DrawType == DT_Brush && actor->Brush);
+		const FVector prePivot = isBrush ? -actor->PrePivot : actor->PrePivot;
+		MakeTransform(actor->Location, actor->Rotation, scale, prePivot, instance.Transform);
 		const vec3 ambient = ZoneAmbient(actor->Region.Zone);
-		// w marks a character, purely so the debug view can tell one from a
-		// chair.
-		instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, isCharacterActor ? 1.0f : 0.0f);
+
+		// Did this actor actually move or change shape since the last frame?
+		// The trace uses it to throw away the accumulated history of the pixels
+		// covering it. Judging that from the hit position alone needed a
+		// distance tolerance, and anything moving slower than the tolerance -
+		// a medical bot crossing a room - kept its history and smeared.
+		PlacedPose pose;
+		pose.GeometryIndex = geometryIndex;
+		memcpy(pose.Transform, instance.Transform, sizeof(pose.Transform));
+		auto previous = PreviousPoses.find(actor);
+		const bool moved = (previous == PreviousPoses.end()) || previous->second != pose;
+		CurrentPoses[actor] = pose;
+
+		instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, moved ? 1.0f : 0.0f);
 		Instances.push_back(instance);
 
 	}
+
+	// This frame's placements become next frame's comparison. Swapped rather
+	// than copied, and the old contents are cleared at the start of the next
+	// pass, so an actor that has gone away stops being tracked.
+	PreviousPoses.swap(CurrentPoses);
 
 	if (!SummaryLogged)
 	{

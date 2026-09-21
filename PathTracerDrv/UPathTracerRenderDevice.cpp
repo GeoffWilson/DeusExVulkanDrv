@@ -152,12 +152,13 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.AddBinding(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device.get());
 
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures)
 		.MaxSets(1)
@@ -528,6 +529,8 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	TileFramebuffer.reset();
 	AccumView.reset();
 	AccumImage.reset();
+	HistoryView.reset();
+	HistoryImage.reset();
 	OutputView.reset();
 	OutputImage.reset();
 
@@ -538,6 +541,17 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 		.DebugName("PathTracerAccum")
 		.Create(Device.get());
 	AccumView = ImageViewBuilder().Image(AccumImage.get(), VK_FORMAT_R32G32B32A32_SFLOAT).DebugName("PathTracerAccumView").Create(Device.get());
+
+	// What each pixel was looking at last frame: the world position it hit and
+	// which instance owned it. Compared against this frame to decide whether the
+	// pixel's accumulated history still describes the same thing.
+	HistoryImage = ImageBuilder()
+		.Size(width, height)
+		.Format(VK_FORMAT_R32G32B32A32_SFLOAT)
+		.Usage(VK_IMAGE_USAGE_STORAGE_BIT)
+		.DebugName("PathTracerHistory")
+		.Create(Device.get());
+	HistoryView = ImageViewBuilder().Image(HistoryImage.get(), VK_FORMAT_R32G32B32A32_SFLOAT).DebugName("PathTracerHistoryView").Create(Device.get());
 
 	OutputImage = ImageBuilder()
 		.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
@@ -569,6 +583,7 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	{
 		PipelineBarrier()
 			.AddImage(AccumImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
+			.AddImage(HistoryImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
 			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
 			.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	});
@@ -650,6 +665,7 @@ void UPathTracerRenderDevice::UpdateDescriptors()
 		.AddAccelerationStructure(DescriptorSet, 0, Accel->GetTopLevel())
 		.AddStorageImage(DescriptorSet, 1, AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(DescriptorSet, 2, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(DescriptorSet, 7, HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddBuffer(DescriptorSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
 		.AddBuffer(DescriptorSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
 		.AddBuffer(DescriptorSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
@@ -694,8 +710,9 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 			return;
 		}
 
-		debugf(TEXT("PathTracer: %d static triangles, %d lights"),
-			(int)(Scene.Geometries[0].Positions.size() / 3), (int)Scene.Lights.size());
+		debugf(TEXT("PathTracer: %d static triangles, %d lights, %d mirrored surfaces"),
+			(int)(Scene.Geometries[0].Positions.size() / 3), (int)Scene.Lights.size(),
+			Scene.MirroredCount());
 	}
 
 	// Every frame: where the movers and the mesh actors are now. New shapes get
@@ -824,6 +841,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		PushConstants.Counts[3] = AccumulatedFrames;
 		UpdateSceneTextures();
 		PushConstants.TextureCount = (uint32_t)BoundSceneTextures;
+		PushConstants.MaxSamples = (uint32_t)Max(MaxAccumulatedFrames, 1);
 		PushConstants.Params = vec4(
 			0.2f + Exposure * (2.0f / 255.0f),
 			SkyIntensity * (2.0f / 255.0f),
@@ -1001,6 +1019,8 @@ void UPathTracerRenderDevice::Exit()
 	OutputImage.reset();
 	AccumView.reset();
 	AccumImage.reset();
+	HistoryView.reset();
+	HistoryImage.reset();
 
 	TileFramebuffer.reset();
 	TileVertexBuffer.reset();

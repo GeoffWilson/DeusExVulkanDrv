@@ -37,7 +37,10 @@ struct TracePushConstants
 	// device could not offer descriptor indexing, and every surface falls back
 	// to the single averaged colour it carries.
 	uint32_t TextureCount;
-	uint32_t Pad[3];
+	// The ceiling on how many samples one pixel may average. Sent separately
+	// from the frame counter, which only says whether history is valid at all.
+	uint32_t MaxSamples;
+	uint32_t Pad[2];
 };
 
 // A path traced render device for Deus Ex.
@@ -133,6 +136,8 @@ private:
 
 	std::unique_ptr<VulkanImage> AccumImage;
 	std::unique_ptr<VulkanImageView> AccumView;
+	std::unique_ptr<VulkanImage> HistoryImage;
+	std::unique_ptr<VulkanImageView> HistoryView;
 	std::unique_ptr<VulkanImage> OutputImage;
 	std::unique_ptr<VulkanImageView> OutputView;
 	int TraceWidth = 0;
