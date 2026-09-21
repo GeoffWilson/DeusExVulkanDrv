@@ -216,3 +216,13 @@ add_library(D3D12Drv SHARED
 target_include_directories(D3D12Drv PRIVATE "${D3D12DRV_DIR}")
 configure_deusex_renderdevice(D3D12Drv D3D12DRV_EXPORTS)
 target_link_libraries(D3D12Drv PRIVATE d3d12 dxgi d3dcompiler dxguid)
+
+# ------------------------------------------------------------------- spikes ---
+
+# Not built by default: one-question programs about the environment, not part of
+# any driver. See spike/README.md.
+#   cmake --build build-deusex --target vkrtcheck
+add_executable(vkrtcheck EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/spike/vkrtcheck.cpp")
+target_include_directories(vkrtcheck PRIVATE "${ZVULKAN_DIR}/include")
+target_compile_options(vkrtcheck PRIVATE /MT /EHsc)
+set_target_properties(vkrtcheck PROPERTIES OUTPUT_NAME "vkrtcheck")
