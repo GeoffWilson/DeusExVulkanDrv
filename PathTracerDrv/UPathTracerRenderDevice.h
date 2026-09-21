@@ -91,6 +91,11 @@ public:
 	INT MaxAccumulatedFrames;
 	INT VkDeviceIndex;
 	BITFIELD VkDebug;
+	// 0 off, 1 paints every instanced shape magenta, 2 shows albedo with no
+	// lighting at all - which separates "not there" from "there but unlit".
+	INT DebugMode;
+	// Animation poses per mesh. 1 builds each character once, like a prop.
+	INT PoseBuckets;
 	BITFIELD UseVSync;
 
 private:

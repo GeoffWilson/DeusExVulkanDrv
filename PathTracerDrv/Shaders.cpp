@@ -18,6 +18,7 @@ std::string Shaders::Trace()
 			vec4 Normal;
 			vec4 Albedo;
 			vec4 Emission;
+			vec4 Ambient;
 		};
 
 		struct SceneLight
@@ -28,6 +29,9 @@ std::string Shaders::Trace()
 
 		layout(binding = 3, std430) readonly buffer Attributes { TriangleAttributes tris[]; };
 		layout(binding = 4, std430) readonly buffer Lights { SceneLight lights[]; };
+		// Per instance, indexed by the intersection's instance id: what varies
+		// by where a shape is rather than by what it is.
+		layout(binding = 5, std430) readonly buffer InstanceData { vec4 instanceAmbient[]; };
 
 		layout(push_constant) uniform PushConstants
 		{
@@ -95,37 +99,82 @@ std::string Shaders::Trace()
 		// linear to zero at the radius rather than an inverse square that never
 		// quite reaches it. Keeping it means a level lights the way its author
 		// saw it, which matters more here than being physically right.
+		// Pick one light in proportion to what it would contribute if nothing
+		// were in the way, then trace a single shadow ray at it.
+		//
+		// Choosing uniformly instead is what made this scene look black. A Deus
+		// Ex level holds hundreds of lights and a given surface is in range of
+		// perhaps two, so a uniform pick misses almost every time and the few
+		// that land are scaled back up by the light count. The average is right
+		// and every individual pixel is wrong, which is exactly the salt and
+		// pepper of bright speckles on near black.
+		//
+		// The loop is over every light, but only to weigh them - a distance and
+		// a dot product each, no rays. The one shadow ray is still the
+		// expensive part, and now it is nearly always aimed at a light that
+		// actually reaches the surface.
 		vec3 directLight(vec3 position, vec3 normal, vec3 albedo)
 		{
 			uint count = Counts.y;
 			if (count == 0u)
 				return vec3(0.0);
 
-			// One light per bounce, chosen uniformly, weighted back up by the
-			// count. Sampling every light would be exact and would also make the
-			// cost of a frame scale with how many lamps the level author felt
-			// like placing.
-			uint index = min(uint(randomFloat() * float(count)), count - 1u);
-			SceneLight light = lights[index];
+			float weightSum = 0.0;
+			int chosen = -1;
+			float chosenWeight = 0.0;
+			vec3 chosenDir = vec3(0.0);
+			float chosenDistance = 0.0;
+			vec3 chosenValue = vec3(0.0);
 
-			vec3 toLight = light.PositionRadius.xyz - position;
-			float distance = length(toLight);
-			float radius = light.PositionRadius.w;
-			if (distance >= radius || distance <= 0.0001)
+			for (uint i = 0u; i < count; i++)
+			{
+				SceneLight light = lights[i];
+
+				vec3 toLight = light.PositionRadius.xyz - position;
+				float distance = length(toLight);
+				float radius = light.PositionRadius.w;
+				if (distance >= radius || distance <= 0.0001)
+					continue;
+
+				vec3 dir = toLight / distance;
+				float cosTheta = dot(normal, dir);
+				if (cosTheta <= 0.0)
+					continue;
+
+				// The engine's own falloff, linear to zero at the radius, which
+				// is what its lightmaps were baked with. Keeping it means a
+				// level lights the way its author saw it.
+				float falloff = 1.0 - distance / radius;
+				falloff = falloff * falloff;
+
+				vec3 value = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * cosTheta);
+				float weight = dot(value, vec3(0.2126, 0.7152, 0.0722));
+				if (weight <= 0.0)
+					continue;
+
+				weightSum += weight;
+				// Reservoir sampling: each candidate replaces the held one with
+				// probability equal to its share of the weight seen so far, so
+				// one pass leaves a sample drawn in proportion to weight.
+				if (randomFloat() < weight / weightSum)
+				{
+					chosen = int(i);
+					chosenWeight = weight;
+					chosenDir = dir;
+					chosenDistance = distance;
+					chosenValue = value;
+				}
+			}
+
+			if (chosen < 0 || chosenWeight <= 0.0)
 				return vec3(0.0);
 
-			vec3 dir = toLight / distance;
-			float cosTheta = dot(normal, dir);
-			if (cosTheta <= 0.0)
+			if (occluded(position, chosenDir, chosenDistance - Params.z * 2.0))
 				return vec3(0.0);
 
-			if (occluded(position, dir, distance - Params.z * 2.0))
-				return vec3(0.0);
-
-			float falloff = 1.0 - distance / radius;
-			falloff = falloff * falloff;
-
-			return albedo * light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * cosTheta * float(count));
+			// Divide by the probability it was chosen with, which is its share
+			// of the total weight.
+			return albedo * chosenValue * (weightSum / chosenWeight);
 		}
 
 		vec3 skyLight(vec3 dir)
@@ -189,6 +238,42 @@ std::string Shaders::Trace()
 				mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 				vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
 
+				// Debug: light every instance that is not the static world, so
+				// that "the actors are not being drawn" can be told apart from
+				// "the actors are drawn and too dark to see". The static world
+				// is the only geometry whose attributes start at zero.
+				// Albedo only: no lights, no ambient, no bounces. If something is
+				// invisible in the finished image but plain here, it is lit
+				// wrongly rather than missing.
+				if (Params.w > 1.5)
+				{
+					radiance = attr.Albedo.rgb;
+					break;
+				}
+
+				if (Params.w > 0.5)
+				{
+					// Two different questions, told apart by colour.
+					//   magenta: an instanced shape was hit and carried its
+					//            attribute offset, so everything works.
+					//   green:   an instanced shape was hit but its custom index
+					//            arrived as zero, so the shading data is being
+					//            read from the wrong place.
+					//   dim:     the static world, which is instance zero.
+					int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+					if (instanceId > 0)
+					{
+						// Green for a character, magenta for anything else, so
+						// "people are not traced" can be told from "people are
+						// traced and shaded black".
+						bool isCharacter = instanceAmbient[instanceId].w > 0.5;
+						radiance = (isCharacter ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 1.0)) * 4.0;
+						break;
+					}
+					radiance += throughput * attr.Albedo.rgb * 0.1;
+					break;
+				}
+
 				// These surfaces are single sided in the engine but solid from
 				// either direction here, so face the normal back at the ray.
 				if (dot(normal, direction) > 0.0)
@@ -196,6 +281,14 @@ std::string Shaders::Trace()
 
 				radiance += throughput * attr.Emission.rgb;
 				radiance += throughput * directLight(position, normal, attr.Albedo.rgb);
+
+				// The zone's ambient. Level surfaces carry their own, because a
+				// zone is a property of the surface; an instanced shape takes it
+				// from wherever the actor happens to be standing. Without this
+				// anything the light actors do not reach is pure black, which is
+				// not what the engine shows.
+				vec3 ambient = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
+				radiance += throughput * attr.Albedo.rgb * ambient;
 
 				throughput *= attr.Albedo.rgb;
 

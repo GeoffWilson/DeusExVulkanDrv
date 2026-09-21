@@ -28,6 +28,12 @@ public:
 
 	void Reset();
 
+	// Diagnostic: give the static world a zero ray mask so nothing can hit it,
+	// leaving only the instanced shapes. Answers "are they traced at all"
+	// without relying on what the shader reads back from an intersection.
+	bool HideStatic = false;
+
+
 	bool IsReady() const { return TopLevel != nullptr && !Bottom.empty(); }
 	bool AttributesChanged() const { return attributesChanged; }
 	void ClearAttributesChanged() { attributesChanged = false; }
@@ -35,7 +41,11 @@ public:
 	VulkanAccelerationStructure* GetTopLevel() const { return TopLevel.get(); }
 	VulkanBuffer* GetAttributeBuffer() const { return AttributeBuffer.get(); }
 	VulkanBuffer* GetLightBuffer() const { return LightBuffer.get(); }
+	// One entry per instance, indexed in the shader by the intersection's
+	// instance id. Carries what varies by placement rather than by shape.
+	VulkanBuffer* GetInstanceDataBuffer() const { return InstanceDataBuffer.get(); }
 	int LightCount() const { return Lights; }
+	int BottomCount() const { return (int)Bottom.size(); }
 
 	// Where each geometry's attributes begin, which is what an instance carries
 	// as its custom index.
@@ -48,6 +58,7 @@ private:
 		std::unique_ptr<VulkanBuffer> Buffer;
 		std::unique_ptr<VulkanAccelerationStructure> Structure;
 		uint32_t AttributeBase = 0;
+		int TriangleCount = 0;
 	};
 
 	std::unique_ptr<VulkanBuffer> UploadBuffer(const void* data, size_t size, VkBufferUsageFlags usage, const char* debugName);
@@ -62,6 +73,7 @@ private:
 	std::unique_ptr<VulkanBuffer> AttributeBuffer;
 	std::unique_ptr<VulkanBuffer> LightBuffer;
 	std::unique_ptr<VulkanBuffer> InstanceBuffer;
+	std::unique_ptr<VulkanBuffer> InstanceDataBuffer;
 	std::unique_ptr<VulkanBuffer> TopBuffer;
 	std::unique_ptr<VulkanBuffer> TopScratch;
 	std::unique_ptr<VulkanAccelerationStructure> TopLevel;
@@ -69,4 +81,5 @@ private:
 	size_t TopCapacity = 0;
 	int Lights = 0;
 	bool attributesChanged = false;
+	bool LoggedInstances = false;
 };

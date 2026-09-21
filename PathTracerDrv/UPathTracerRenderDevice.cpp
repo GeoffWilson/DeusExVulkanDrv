@@ -37,6 +37,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	MaxAccumulatedFrames = 256;
 	VkDeviceIndex = 0;
 	VkDebug = 0;
+	DebugMode = 0;
+	PoseBuckets = 12;
 	UseVSync = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
@@ -45,6 +47,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("MaxAccumulatedFrames"), RF_Public) UIntProperty(CPP_PROPERTY(MaxAccumulatedFrames), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDeviceIndex"), RF_Public) UIntProperty(CPP_PROPERTY(VkDeviceIndex), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDebug"), RF_Public) UBoolProperty(CPP_PROPERTY(VkDebug), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("DebugMode"), RF_Public) UIntProperty(CPP_PROPERTY(DebugMode), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("PoseBuckets"), RF_Public) UIntProperty(CPP_PROPERTY(PoseBuckets), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
 
 	unguard;
@@ -134,13 +138,14 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.AddBinding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device.get());
 
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3)
 		.MaxSets(1)
 		.DebugName("PathTracerDescriptorPool")
 		.Create(Device.get());
@@ -210,16 +215,24 @@ void UPathTracerRenderDevice::CreateTilePipeline()
 		.Create(Device.get());
 
 	// The traced image is loaded rather than cleared: the tiles go on top of it.
+	//
+	// GENERAL throughout rather than COLOR_ATTACHMENT_OPTIMAL. The output image
+	// is written by a compute dispatch, drawn into here, and then blitted, and
+	// the blit's barrier names GENERAL as the layout it starts from. Leaving the
+	// pass in COLOR_ATTACHMENT_OPTIMAL made that barrier declare a layout the
+	// image was not in, which leaves the contents undefined - a black frame
+	// whenever the driver acted on it rather than ignoring it. GENERAL is valid
+	// for a colour attachment and keeps one layout across the whole frame.
 	TileRenderPass = RenderPassBuilder()
 		.AddAttachment(
 			VK_FORMAT_R16G16B16A16_SFLOAT,
 			VK_SAMPLE_COUNT_1_BIT,
 			VK_ATTACHMENT_LOAD_OP_LOAD,
 			VK_ATTACHMENT_STORE_OP_STORE,
-			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+			VK_IMAGE_LAYOUT_GENERAL,
+			VK_IMAGE_LAYOUT_GENERAL)
 		.AddSubpass()
-		.AddSubpassColorAttachmentRef(0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+		.AddSubpassColorAttachmentRef(0, VK_IMAGE_LAYOUT_GENERAL)
 		.DebugName("PathTracerTileRenderPass")
 		.Create(Device.get());
 
@@ -310,8 +323,10 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 	memcpy(mapped, TileVertices.data(), byteSize);
 	TileVertexBuffer->Unmap();
 
+	// The trace wrote this image; the tiles are about to read and blend over it.
+	// The layout does not change - only the ordering and visibility do.
 	PipelineBarrier()
-		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 		.Execute(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
 	RenderPassBegin()
@@ -546,7 +561,7 @@ void UPathTracerRenderDevice::ReleaseSwapChainResources()
 
 void UPathTracerRenderDevice::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView)
+	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer())
 		return;
 
 	WriteDescriptors()
@@ -555,6 +570,7 @@ void UPathTracerRenderDevice::UpdateDescriptors()
 		.AddStorageImage(DescriptorSet, 2, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddBuffer(DescriptorSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
 		.AddBuffer(DescriptorSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
+		.AddBuffer(DescriptorSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
 		.Execute(Device.get());
 
 	DescriptorsDirty = false;
@@ -602,8 +618,17 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 
 	// Every frame: where the movers and the mesh actors are now. New shapes get
 	// a bottom level structure the first time they are seen.
+	const size_t geometriesBefore = Scene.Geometries.size();
 	Scene.CollectDynamic(level);
 	Accel->SyncGeometry(Scene);
+
+	// Only when something new appeared, so this says what is being traced
+	// without filling the log every frame.
+	if (Scene.Geometries.size() != geometriesBefore)
+	{
+		debugf(TEXT("PathTracer: %d shapes, %d instances this frame"),
+			(int)Scene.Geometries.size(), (int)Scene.Instances.size());
+	}
 
 	if (Accel->AttributesChanged())
 	{
@@ -621,6 +646,10 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// separately - taking the first keeps the camera stable.
 	if (HaveCamera)
 		return;
+
+	// Whose view this is, so the actor collection can skip the player's own body
+	// and honour the owner-only visibility flags.
+	Scene.ViewActor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
 
 	EnsureSceneBuilt(Frame->Level);
 
@@ -683,7 +712,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 {
 	guard(UPathTracerRenderDevice::Unlock);
 
-	if (!Blit || !HaveCamera || !Accel || !AccumImage)
+	// Deliberately not conditional on HaveCamera. A frame that draws no world -
+	// a menu, or a conversation - never calls SetSceneNode, and returning here
+	// left an acquired swap chain image unpresented, which the compositor shows
+	// as black. Whether the world can be traced and whether the frame must be
+	// presented are different questions.
+	if (!Blit || !Accel || !AccumImage)
 		return;
 
 	try
@@ -710,7 +744,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			0.2f + Exposure * (2.0f / 255.0f),
 			SkyIntensity * (2.0f / 255.0f),
 			0.5f,     // ray epsilon, in world units: these levels are big
-			0.0f);
+			(float)DebugMode);
 
 		int windowWidth = 0, windowHeight = 0;
 		RECT box = {};
@@ -735,29 +769,39 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 
 		// The top level structure is rebuilt every frame, because the movers and
 		// the actors have all moved since the last one.
-		Accel->BuildTopLevel(Scene, commands.get());
-
-		if (!Accel->IsReady())
+		bool traceThisFrame = HaveCamera;
+		if (traceThisFrame)
 		{
-			commands->end();
-			return;
+			Accel->HideStatic = (DebugMode == 1);
+				Accel->BuildTopLevel(Scene, commands.get());
+			traceThisFrame = Accel->IsReady();
 		}
 
-		UpdateDescriptors();
+		// One line per frame for the first few seconds: the black frames are
+		// intermittent, so the pattern is the evidence. Guessing at this from a
+		// screenshot has been wrong twice.
+		// Without a trace the output image keeps the last traced world, which is
+		// what the engine expects behind a menu or a conversation.
+		if (traceThisFrame)
+		{
+			UpdateDescriptors();
 
-		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
-		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet);
-		commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
-		commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
+			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet);
+			commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
+			commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+		}
 
 		// HUD, menus and console on top of the traced world.
 		RenderTiles(commands.get());
 
 		// The trace writes the output image; the blit reads it.
+		// Waits on the tile pass as well as the trace: the HUD is drawn as a
+		// colour attachment write, which the compute stage alone does not cover.
 		PipelineBarrier()
-			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
 			.AddImage(SwapChain->GetImage(imageIndex), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
-			.Execute(commands.get(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+			.Execute(commands.get(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
 		// Letterbox: keep the traced image's aspect inside the window rather
 		// than stretching it, the same as the other devices here.

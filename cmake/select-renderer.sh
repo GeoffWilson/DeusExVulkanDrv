@@ -6,7 +6,6 @@ set -euo pipefail
 
 WHICH="${1:-}"
 SYSTEM_DIR="${2:-$HOME/.local/share/Steam/steamapps/common/Deus Ex/System}"
-INI="$SYSTEM_DIR/DeusEx.ini"
 
 case "$WHICH" in
 	vulkan) DEV="VulkanDrv.VulkanRenderDevice" ;;
@@ -17,5 +16,15 @@ case "$WHICH" in
 	*) echo "usage: $0 vulkan|d3d11|d3d12|pathtracer|d3d [SystemDir]" >&2; exit 1 ;;
 esac
 
-sed -i "s|^GameRenderDevice=.*|GameRenderDevice=$DEV|" "$INI"
-echo "GameRenderDevice=$DEV"
+# UE1 names its ini after the executable, so the retail DeusEx.exe from the
+# 1112fm patch reads DeusExRetail.ini and the Steam one reads DeusEx.ini. Two
+# copies of the same settings, and editing the wrong one changes nothing while
+# looking like it worked. Write every one that exists.
+written=0
+for f in "$SYSTEM_DIR"/DeusEx.ini "$SYSTEM_DIR"/DeusExRetail.ini; do
+	[ -f "$f" ] || continue
+	sed -i "s|^GameRenderDevice=.*|GameRenderDevice=$DEV|" "$f"
+	echo "$(basename "$f"): GameRenderDevice=$DEV"
+	written=1
+done
+[ "$written" = 1 ] || { echo "No DeusEx ini found in $SYSTEM_DIR" >&2; exit 1; }

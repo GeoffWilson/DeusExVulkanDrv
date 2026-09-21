@@ -15,6 +15,10 @@ struct TriangleAttributes
 	vec4 Normal;
 	vec4 Albedo;
 	vec4 Emission;
+	// The zone's ambient light. A property of the surface for level geometry,
+	// which is why it lives here rather than only per instance: one room can be
+	// lit and the next pitch dark, and the engine's own lighting says so.
+	vec4 Ambient;
 };
 
 // A light as the engine describes it, converted to something physical.
@@ -38,6 +42,9 @@ struct SceneInstance
 	int GeometryIndex = 0;
 	uint32_t AttributeBase = 0;
 	float Transform[12] = {};   // 3x4, row major, as Vulkan wants it
+	// An actor carries its zone's ambient with it, because the same mesh is
+	// instanced in rooms with different lighting.
+	vec4 Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
 };
 
 // Turns the engine's level into geometry, lights and placements.
@@ -80,8 +87,15 @@ private:
 
 	// Geometry index for a mover's brush, built on first sight.
 	int GeometryForBrush(UModel* brush);
-	// Geometry index for a mesh at a particular animation frame.
-	int GeometryForMesh(UMesh* mesh, int frame);
+	// Geometry index for a mesh at a particular animation frame and skin set.
+	// The skins are part of the key: Deus Ex puts a character's appearance on
+	// the actor rather than the mesh, so two people sharing a mesh are only the
+	// same shape if they are also wearing the same thing.
+	int GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]);
+
+	// One shot diagnostics, reset per level.
+	int MeshesLogged = 0;
+	bool SummaryLogged = false;
 
 	std::unordered_map<void*, int> BrushGeometry;
 	std::unordered_map<uint64_t, int> MeshGeometry;
@@ -89,5 +103,19 @@ private:
 	// A ceiling on how many poses are kept. Each one is a bottom level
 	// structure, and a level with many characters could otherwise build them
 	// without limit.
-	static const int MaxMeshGeometries = 768;
+	static const int MaxMeshGeometries = 2048;
+
+public:
+	// How many distinct poses an animation is quantised into. Bounds the number
+	// of structures at this many per mesh, at the cost of steppier movement.
+	// One means a character is built once, exactly like a prop - which is the
+	// only structural difference between the two, and props render.
+	int PoseBuckets = 12;
+
+	// Diagnostic: give characters a prop's geometry instead of their own.
+	// Whose eyes this is being traced from. Set each frame from the scene node's
+	// viewport, and used to apply the engine's owner visibility rules.
+	AActor* ViewActor = nullptr;
+
+private:
 };

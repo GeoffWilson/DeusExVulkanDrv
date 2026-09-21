@@ -2,6 +2,13 @@
 #include "AccelStructure.h"
 #include "UPathTracerRenderDevice.h"
 
+// The driver strides through the instance array by its own idea of this
+// struct's size. This package compiles the engine's 4 byte packed headers
+// alongside the Vulkan ones, and getting that wrong here would look exactly
+// like the first instance working and none of the others existing.
+static_assert(sizeof(VkAccelerationStructureInstanceKHR) == 64, "instance struct is the wrong size");
+static_assert(offsetof(VkAccelerationStructureInstanceKHR, accelerationStructureReference) == 56, "instance struct is laid out wrong");
+
 AccelStructure::AccelStructure(UPathTracerRenderDevice* renderer) : renderer(renderer)
 {
 }
@@ -17,6 +24,7 @@ void AccelStructure::Reset()
 	TopScratch.reset();
 	TopBuffer.reset();
 	InstanceBuffer.reset();
+	InstanceDataBuffer.reset();
 	LightBuffer.reset();
 	AttributeBuffer.reset();
 	Bottom.clear();
@@ -24,6 +32,7 @@ void AccelStructure::Reset()
 	TopCapacity = 0;
 	Lights = 0;
 	attributesChanged = false;
+	LoggedInstances = false;
 }
 
 std::unique_ptr<VulkanBuffer> AccelStructure::UploadBuffer(const void* data, size_t size, VkBufferUsageFlags usage, const char* debugName)
@@ -38,9 +47,16 @@ std::unique_ptr<VulkanBuffer> AccelStructure::UploadBuffer(const void* data, siz
 	memcpy(mapped, data, size);
 	staging->Unmap();
 
+	// Aligned explicitly. A buffer handed to an acceleration structure build has
+	// an alignment requirement on its device address, and without asking, a
+	// small allocation gets suballocated wherever it fits inside a larger block.
+	// A large buffer tends to land on a well aligned boundary by luck, which is
+	// exactly how this hid: the static world is about a megabyte and built
+	// correctly, while every prop and character is a few kilobytes and did not.
 	auto buffer = BufferBuilder()
 		.Size(size)
 		.Usage(usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+		.MinAlignment(256)
 		.DebugName(debugName)
 		.Create(renderer->GetDevice());
 
@@ -59,6 +75,8 @@ void AccelStructure::BuildBottomLevel(const SceneGeometry& geometry, BottomLevel
 	guard(AccelStructure::BuildBottomLevel);
 
 	VulkanDevice* device = renderer->GetDevice();
+
+	out.TriangleCount = (int)(geometry.Positions.size() / 3);
 
 	out.Vertices = UploadBuffer(
 		geometry.Positions.data(), geometry.Positions.size() * sizeof(vec3),
@@ -183,9 +201,18 @@ void AccelStructure::EnsureTopLevelCapacity(size_t instanceCount)
 	// reallocate the structure every frame.
 	TopCapacity = std::max<size_t>(instanceCount * 2, 256);
 
+	// Written by the host every frame like the instance records themselves.
+	InstanceDataBuffer = BufferBuilder()
+		.Size(TopCapacity * sizeof(vec4))
+		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+		.MinAlignment(256)
+		.DebugName("PathTracerInstanceData")
+		.Create(device);
+
 	InstanceBuffer = BufferBuilder()
 		.Size(TopCapacity * sizeof(VkAccelerationStructureInstanceKHR))
 		.Usage(VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+		.MinAlignment(256)   // instance data has its own 16 byte minimum
 		.DebugName("PathTracerInstances")
 		.Create(device);
 
@@ -241,8 +268,10 @@ void AccelStructure::BuildTopLevel(const LevelScene& scene, VulkanCommandBuffer*
 	const size_t count = std::min(scene.Instances.size(), TopCapacity);
 
 	auto* mapped = (VkAccelerationStructureInstanceKHR*)InstanceBuffer->Map(0, count * sizeof(VkAccelerationStructureInstanceKHR));
+	auto* instanceData = (vec4*)InstanceDataBuffer->Map(0, count * sizeof(vec4));
 	for (size_t i = 0; i < count; i++)
 	{
+		instanceData[i] = scene.Instances[i].Ambient;
 		const SceneInstance& src = scene.Instances[i];
 		VkAccelerationStructureInstanceKHR& dst = mapped[i];
 		dst = {};
@@ -250,11 +279,20 @@ void AccelStructure::BuildTopLevel(const LevelScene& scene, VulkanCommandBuffer*
 		// The custom index is how the trace shader finds this instance's
 		// shading data: it is the offset of its geometry's attributes.
 		dst.instanceCustomIndex = Bottom[src.GeometryIndex].AttributeBase;
-		dst.mask = 0xFF;
+		dst.mask = (HideStatic && src.GeometryIndex == 0) ? 0x00 : 0xFF;
 		dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 		dst.accelerationStructureReference = Bottom[src.GeometryIndex].Structure->GetDeviceAddress();
 	}
+	InstanceDataBuffer->Unmap();
 	InstanceBuffer->Unmap();
+
+	// Once per level: what the top level structure was actually built from.
+	if (!LoggedInstances)
+	{
+		LoggedInstances = true;
+		debugf(TEXT("PathTracer tlas: %d instances, %d bottom level structures, %d attributes"),
+			(int)count, (int)Bottom.size(), (int)AllAttributes.size());
+	}
 
 	VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 	geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
