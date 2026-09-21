@@ -42,5 +42,25 @@ compute or fragment shader, without a ray tracing pipeline and its shader
 binding table. The limits are nowhere near a constraint - a whole Deus Ex level
 is a few thousand BSP surfaces.
 
-Not yet measured on native Windows. The driver is the same codebase, so the
-answer is very likely the same, but it is one command to confirm.
+**That measurement was taken in the wrong place.** It used the distribution's
+own wine. The game runs under Proton, whose winevulkan does not pass the ray
+tracing extensions through to a 32 bit client at all:
+
+| Environment            | ray tracing | device extensions |
+| ---------------------- | ----------- | ----------------- |
+| wine 11.17             | yes         | 276               |
+| Proton-CachyOS         | no          | 250               |
+| GE-Proton 10-34 … 11-6 | no          | 249-262           |
+| DW-Proton              | no          | 259               |
+
+Every Proton on the machine was tested; none offer them. So the environment has
+to be measured, not the GPU - run this under the same wine and prefix the game
+will use:
+
+```sh
+WINEPREFIX=~/.local/share/Steam/steamapps/compatdata/<appid>/pfx   "<proton>/files/bin/wine" build-deusex/vkrtcheck.exe
+```
+
+Not yet measured on native Windows, where there is no translation layer in the
+way at all. The driver is the same codebase, so the answer is very likely yes,
+but it is one command to confirm.

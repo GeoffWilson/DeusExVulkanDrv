@@ -1,0 +1,9 @@
+[Public]
+Object=(Name=PathTracerDrv.PathTracerRenderDevice,Class=Class,MetaClass=Engine.RenderDevice,Autodetect=vulkan-1.dll)
+Preferences=(Caption="Rendering",Parent="Advanced Options")
+Preferences=(Caption="PathTracer",Parent="Rendering",Class=PathTracerDrv.PathTracerRenderDevice,Immediate=True)
+
+[PathTracerRenderDevice]
+ClassCaption="PathTracer"
+AskInstalled=Do you want to use the path tracer?
+AskUse=

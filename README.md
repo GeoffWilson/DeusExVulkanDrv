@@ -341,6 +341,70 @@ has and Deus Ex's does not, so that they still compile.
   been blamed on the setting, silently reset it, and never reached the recovery
   path at all.
 
+### PathTracerDrv
+
+A second render device that does not rasterise anything. It is a separate
+package, `PathTracerDrv.PathTracerRenderDevice`, so it sits next to Vulkan in
+the renderer list rather than replacing it.
+
+**Where the scene comes from.** Not from the render device API. A render device
+is only handed what survived the engine's frustum and BSP culling, and a path
+tracer needs the geometry *behind* the camera as much as in front of it - that
+is where the bounce light comes from. So `DrawComplexSurface` and the rest are
+ignored entirely, and the level is read straight out of `UModel`, which a render
+device can reach through `FSceneNode::Level`:
+
+- Every BSP node with three or more vertices, fan triangulated. The node's own
+  plane is the normal; these surfaces are flat by construction, so there is no
+  smoothing to reconstruct.
+- Albedo from `UBitmap::MipZero`, the engine's own average colour for each
+  texture. One colour per surface, no texture sampling yet.
+- Lights from the level's actors, converted with the engine's own `FGetHSV` so
+  a lamp is the colour its author saw, at the engine's `LightRadius * 25`.
+
+Then one bottom level acceleration structure over the triangle soup, one top
+level structure holding it, and a compute shader tracing with `VK_KHR_ray_query`
+- no ray tracing pipeline and no shader binding table. Multiple diffuse bounces,
+next event estimation against one light per bounce, Russian roulette after two,
+and progressive accumulation that resets whenever the view moves. The result is
+tonemapped in the shader and blitted to the swap chain, letterboxed.
+
+**What it cannot do yet**, in the order the gaps are felt:
+
+- No 2D. `DrawTile` is a stub, so there is no HUD and there are no menus. The
+  world is all you get, and settings have to be edited in the ini.
+- Static geometry only: no characters, no weapon, and movers are traced where
+  they stood when the level loaded.
+- Flat average colours rather than textures.
+- Emissive surfaces are a guess. Nothing in this engine marks a surface as
+  emitting, so `PF_Unlit` - the author saying "do not light this, it is already
+  bright" - is treated as a weak emitter. A hand authored material table keyed
+  on texture name is what would replace both this and the flat albedo.
+
+**Running it.** It needs `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`
+in a 32 bit process, and that is a property of the environment rather than of the
+GPU. No Proton build tested passes them through to a 32 bit client; upstream
+wine does. See `spike/README.md`, which measures it. On Linux that means running
+the game under the distribution's wine:
+
+```sh
+cmake/run-deusex-wine.sh
+```
+
+which uses the retail `DeusEx.exe` from the 1112fm patch rather than Steam's
+64K launcher stub. Native Windows has no translation layer in the way and should
+simply work, though that is not yet confirmed.
+
+	[PathTracerDrv.PathTracerRenderDevice]
+	Bounces=3
+	Exposure=128
+	SkyIntensity=128
+	MaxAccumulatedFrames=256
+
+`Bounces` is where the cost is. `Exposure` and `SkyIntensity` are bytes around a
+midpoint of 128. `MaxAccumulatedFrames` caps how long a still image keeps
+refining; the noise falls away within a second or two of standing still.
+
 ### Recommended settings for Deus Ex
 
 	RenderScale=2.000000

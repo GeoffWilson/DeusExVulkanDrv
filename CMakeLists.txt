@@ -217,6 +217,23 @@ target_include_directories(D3D12Drv PRIVATE "${D3D12DRV_DIR}")
 configure_deusex_renderdevice(D3D12Drv D3D12DRV_EXPORTS)
 target_link_libraries(D3D12Drv PRIVATE d3d12 dxgi d3dcompiler dxguid)
 
+# ------------------------------------------------------------- PathTracerDrv ---
+
+set(PATHTRACERDRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/PathTracerDrv")
+
+add_library(PathTracerDrv SHARED
+	"${PATHTRACERDRV_DIR}/AccelStructure.cpp"
+	"${PATHTRACERDRV_DIR}/LevelScene.cpp"
+	"${PATHTRACERDRV_DIR}/mat.cpp"
+	"${PATHTRACERDRV_DIR}/PathTracerDrv.cpp"
+	"${PATHTRACERDRV_DIR}/Precomp.cpp"
+	"${PATHTRACERDRV_DIR}/Shaders.cpp"
+	"${PATHTRACERDRV_DIR}/UPathTracerRenderDevice.cpp")
+
+target_include_directories(PathTracerDrv PRIVATE "${PATHTRACERDRV_DIR}")
+configure_deusex_renderdevice(PathTracerDrv PATHTRACERDRV_EXPORTS)
+target_link_libraries(PathTracerDrv PRIVATE zvulkan)
+
 # ------------------------------------------------------------------- spikes ---
 
 # Not built by default: one-question programs about the environment, not part of
