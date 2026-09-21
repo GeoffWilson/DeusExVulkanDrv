@@ -32,7 +32,12 @@ struct TracePushConstants
 	vec4 CameraUp;
 	vec4 CameraForward;
 	uint32_t Counts[4];   // frame, light count, bounces, accumulated frames
-	vec4 Params;          // exposure, sky intensity, ray epsilon, unused
+	vec4 Params;          // exposure, sky intensity, ray epsilon, debug mode
+	// How many slots of the texture array hold a real texture. Zero means the
+	// device could not offer descriptor indexing, and every surface falls back
+	// to the single averaged colour it carries.
+	uint32_t TextureCount;
+	uint32_t Pad[3];
 };
 
 // A path traced render device for Deus Ex.
@@ -138,6 +143,16 @@ private:
 	std::unique_ptr<VulkanDescriptorSetLayout> TileSetLayout;
 	std::unique_ptr<VulkanDescriptorPool> TileDescriptorPool;
 	std::unique_ptr<VulkanSampler> TileSampler;
+
+	// Textures the trace samples, in the order LevelScene registered them. The
+	// array binding is written as it grows; slots past what the scene uses hold
+	// a 1x1 white image so every descriptor is valid whether or not it is read.
+	std::unique_ptr<VulkanSampler> SceneSampler;
+	size_t BoundSceneTextures = 0;
+	bool SceneTexturesInitialised = false;
+	int TextureFailuresLogged = 0;
+	bool CanSampleTextures = false;
+	void UpdateSceneTextures();
 	std::unique_ptr<VulkanPipelineLayout> TilePipelineLayout;
 	std::unique_ptr<VulkanRenderPass> TileRenderPass;
 	std::unique_ptr<VulkanPipeline> TilePipelines[3];

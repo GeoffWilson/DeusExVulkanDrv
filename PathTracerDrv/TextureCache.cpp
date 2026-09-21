@@ -14,6 +14,9 @@ TextureCache::~TextureCache()
 void TextureCache::Clear()
 {
 	Textures.clear();
+	SceneTextures.clear();
+	// The white pixel is deliberately kept: it belongs to no level and the
+	// texture array's unused slots still have to point somewhere valid.
 }
 
 CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
@@ -30,7 +33,7 @@ CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
 	return result;
 }
 
-std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked)
+std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet)
 {
 	guard(TextureCache::Upload);
 
@@ -168,9 +171,91 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 			.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 	});
 
-	cached->Set = renderer->AllocateTileDescriptorSet(cached->View.get());
+	// What actually landed in the image, so a texture that comes out the wrong
+	// colour on screen can be compared against what the engine says it is,
+	// rather than reasoned about.
+	if (withDescriptorSet)
+		cached->Set = renderer->AllocateTileDescriptorSet(cached->View.get());
 
 	return cached;
 
 	unguard;
+}
+
+
+CachedTexture* TextureCache::GetForScene(UTexture* texture)
+{
+	guard(TextureCache::GetForScene);
+
+	if (!texture)
+		return nullptr;
+
+	auto it = SceneTextures.find(texture);
+	if (it != SceneTextures.end())
+		return it->second.get();
+
+	// Entered as null first so a texture that cannot be uploaded is not retried
+	// on every frame that references it.
+	SceneTextures[texture] = nullptr;
+
+	if (texture->Mips.Num() < 1)
+		return nullptr;
+
+	// The mip data is read straight off the object rather than through
+	// UTexture::Lock. Lock expects to be called while the engine is handing
+	// surfaces to a render device, and this runs at a different point entirely;
+	// it also takes an FTextureInfo that the engine partly reads, which as an
+	// uninitialised local was undefined behaviour.
+	FMipmap& mip = texture->Mips(0);
+	if (mip.USize <= 0 || mip.VSize <= 0 || mip.DataArray.Num() <= 0)
+		return nullptr;
+
+	// The mip has to actually hold a full image. A lazy array that did not load,
+	// or a format whose bytes per pixel is not one, would otherwise be read past
+	// its end - which produces whatever palette entries happen to follow.
+	if (texture->Format == TEXF_P8 && mip.DataArray.Num() < mip.USize * mip.VSize)
+		return nullptr;
+
+	FTextureInfo info = {};
+	info.Texture = texture;
+	info.NumMips = 1;
+	info.Mips[0] = &mip;
+	info.Format = (ETextureFormat)texture->Format;
+	info.USize = mip.USize;
+	info.VSize = mip.VSize;
+	info.Palette = (texture->Palette && texture->Palette->Colors.Num() > 0)
+		? &texture->Palette->Colors(0) : nullptr;
+
+	// Indexing the lazy array is what pulls it off disk if it is not resident.
+	mip.DataPtr = &mip.DataArray(0);
+
+	auto uploaded = Upload(info, (texture->PolyFlags & PF_Masked) != 0, false);
+
+	CachedTexture* result = uploaded.get();
+	SceneTextures[texture] = std::move(uploaded);
+	return result;
+
+	unguard;
+}
+
+CachedTexture* TextureCache::White()
+{
+	if (WhitePixel)
+		return WhitePixel.get();
+
+	// Built by hand rather than uploaded: there is no engine texture behind it.
+	FTextureInfo info = {};
+	FMipmapBase mip;
+	BYTE pixel[4] = { 255, 255, 255, 255 };
+	mip.DataPtr = pixel;
+	mip.USize = 1;
+	mip.VSize = 1;
+	info.NumMips = 1;
+	info.Mips[0] = &mip;
+	info.Format = TEXF_RGBA8;
+	info.USize = 1;
+	info.VSize = 1;
+
+	WhitePixel = Upload(info, false, false);
+	return WhitePixel.get();
 }

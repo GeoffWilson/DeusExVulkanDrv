@@ -19,6 +19,12 @@ struct TriangleAttributes
 	// which is why it lives here rather than only per instance: one room can be
 	// lit and the next pitch dark, and the engine's own lighting says so.
 	vec4 Ambient;
+	// Texture coordinates at the three corners, and which texture they index.
+	// Interpolated in the shader from the hit's barycentrics. Texture is stored
+	// as a float purely to keep the record to whole vec4s; it is an integer
+	// index into the bound texture array, or -1 for an untextured surface.
+	vec4 UV01;      // u0 v0 u1 v1
+	vec4 UV2Tex;    // u2 v2 texture unused
 };
 
 // A light as the engine describes it, converted to something physical.
@@ -31,6 +37,10 @@ struct SceneLight
 // Triangles that share a bottom level acceleration structure.
 struct SceneGeometry
 {
+	// Whether anything in here needs its texture's alpha consulted before a hit
+	// counts. Geometry without it can be marked opaque, which lets traversal
+	// accept a hit without ever calling back into the shader.
+	bool HasMasked = false;
 	std::vector<vec3> Positions;
 	std::vector<TriangleAttributes> Attributes;
 };
@@ -105,6 +115,8 @@ private:
 	// without limit.
 	static const int MaxMeshGeometries = 2048;
 
+	std::unordered_map<UTexture*, int> TextureIndex;
+
 public:
 	// How many distinct poses an animation is quantised into. Bounds the number
 	// of structures at this many per mesh, at the cost of steppier movement.
@@ -116,6 +128,14 @@ public:
 	// Whose eyes this is being traced from. Set each frame from the scene node's
 	// viewport, and used to apply the engine's owner visibility rules.
 	AActor* ViewActor = nullptr;
+
+	// Every texture the scene references, in the order the shader's array binds
+	// them. An index rather than a pointer travels into the attribute buffer.
+	// The shader binds a fixed sized array; anything past it renders untextured
+	// rather than wrong.
+	static const int MaxTextures = 1024;
+	std::vector<UTexture*> Textures;
+	int TextureFor(UTexture* texture);
 
 private:
 };

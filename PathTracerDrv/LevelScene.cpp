@@ -38,8 +38,14 @@ namespace
 		if (!texture)
 			return fallback;
 
+		// MipZero is the engine's cached average of the whole image, including
+		// the texels that masked art uses as its transparency key - which in
+		// these packages is magenta. Trusting it made the fallback colour of
+		// every grate, fence and banner in the game bright pink. For masked art
+		// the palette average below is the honest answer.
+		const bool masked = (texture->PolyFlags & PF_Masked) != 0;
 		const FColor& c = texture->MipZero;
-		if (c.R > 4 || c.G > 4 || c.B > 4)
+		if (!masked && (c.R > 4 || c.G > 4 || c.B > 4))
 			return SrgbToLinear(c.R / 255.0f, c.G / 255.0f, c.B / 255.0f);
 
 		if (texture->Palette && texture->Palette->Colors.Num() > 0)
@@ -101,6 +107,8 @@ void LevelScene::Clear()
 	Instances.clear();
 	BrushGeometry.clear();
 	MeshGeometry.clear();
+	Textures.clear();
+	TextureIndex.clear();
 	GeometryAdded = false;
 	MeshesLogged = 0;
 	SummaryLogged = false;
@@ -168,9 +176,9 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		// Nothing in this engine marks a surface as emissive. PF_Unlit is the
 		// closest it has: the author saying "do not light this, it is already
 		// bright". A heuristic, and the main thing a material table replaces.
-		vec3 emission = vec3(0.0f, 0.0f, 0.0f);
+		bool unlit = false;
 		if (surf.PolyFlags & PF_Unlit)
-			emission = albedo * 2.0f;
+			unlit = true;
 
 		// The zone in front of this node is the one the surface faces into.
 		AZoneInfo* zone = nullptr;
@@ -181,24 +189,77 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		TriangleAttributes attr;
 		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
 		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, 0.0f);
-		attr.Emission = vec4(emission.x, emission.y, emission.z, 0.0f);
+		// w marks the surface as self lit. The colour it emits is whatever it
+		// turns out to be once sampled, so it cannot be decided here: doing so
+		// is what made unlit masked surfaces glow the key colour.
+		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
 		attr.Ambient = vec4(ambient.x, ambient.y, ambient.z, 0.0f);
+
+		// A BSP surface has no stored texture coordinates: the engine derives
+		// them from two axis vectors and an origin point, which is what lets one
+		// texture run unbroken across many nodes. Projecting a vertex onto those
+		// axes gives its position in texture space, in texels, which the texture
+		// size turns into the 0..1 the sampler wants.
+		const int textureIndex = TextureFor(surf.Texture);
+		FVector textureU(0, 0, 0), textureV(0, 0, 0), textureBase(0, 0, 0);
+		float uScale = 0.0f, vScale = 0.0f;
+		if (textureIndex >= 0 &&
+			surf.vTextureU < model->Vectors.Num() && surf.vTextureV < model->Vectors.Num() &&
+			surf.pBase < model->Points.Num() &&
+			surf.Texture->USize > 0 && surf.Texture->VSize > 0)
+		{
+			textureU = model->Vectors(surf.vTextureU);
+			textureV = model->Vectors(surf.vTextureV);
+			textureBase = model->Points(surf.pBase);
+			uScale = 1.0f / (float)surf.Texture->USize;
+			vScale = 1.0f / (float)surf.Texture->VSize;
+		}
+		else
+		{
+			attr.UV01 = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+			attr.UV2Tex = vec4(0.0f, 0.0f, -1.0f, 0.0f);
+		}
+
+		auto surfaceUV = [&](const FVector& point) -> vec2
+		{
+			const FVector d = point - textureBase;
+			return vec2(
+				((d | textureU) + surf.PanU) * uScale,
+				((d | textureV) + surf.PanV) * vScale);
+		};
 
 		const INT vertPool = node.iVertPool;
 		if (vertPool < 0 || vertPool + node.NumVertices > model->Verts.Num())
 			continue;
 
-		const vec3 v0 = ToVec3(model->Points(model->Verts(vertPool).pVertex));
+		const FVector& p0 = model->Points(model->Verts(vertPool).pVertex);
+		const vec3 v0 = ToVec3(p0);
 		for (INT t = 1; t + 1 < node.NumVertices; t++)
 		{
-			const vec3 v1 = ToVec3(model->Points(model->Verts(vertPool + t).pVertex));
-			const vec3 v2 = ToVec3(model->Points(model->Verts(vertPool + t + 1).pVertex));
+			const FVector& p1 = model->Points(model->Verts(vertPool + t).pVertex);
+			const FVector& p2 = model->Points(model->Verts(vertPool + t + 1).pVertex);
+			const vec3 v1 = ToVec3(p1);
+			const vec3 v2 = ToVec3(p2);
 
 			const vec3 e1 = v1 - v0;
 			const vec3 e2 = v2 - v0;
 			const vec3 cr = cross(e1, e2);
 			if (dot(cr, cr) <= 1e-6f)
 				continue;
+
+			// The fan shares vertex zero, but each triangle needs its own
+			// coordinates, so they are computed per triangle rather than once.
+			if (textureIndex >= 0)
+			{
+				const vec2 uv0 = surfaceUV(p0);
+				const vec2 uv1 = surfaceUV(p1);
+				const vec2 uv2 = surfaceUV(p2);
+				const bool masked = (surf.Texture->PolyFlags & PF_Masked) != 0;
+				if (masked)
+					out.HasMasked = true;
+				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
+				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, masked ? 1.0f : 0.0f);
+			}
 
 			out.Positions.push_back(v0);
 			out.Positions.push_back(v1);
@@ -260,6 +321,26 @@ int LevelScene::GeometryForBrush(UModel* brush)
 	return index;
 }
 
+// The index this texture will have in the shader's array, uploading nothing:
+// the upload happens once per frame for whatever the registry ended up holding.
+int LevelScene::TextureFor(UTexture* texture)
+{
+	if (!texture)
+		return -1;
+
+	auto it = TextureIndex.find(texture);
+	if (it != TextureIndex.end())
+		return it->second;
+
+	if (Textures.size() >= (size_t)MaxTextures)
+		return -1;
+
+	const int index = (int)Textures.size();
+	Textures.push_back(texture);
+	TextureIndex[texture] = index;
+	return index;
+}
+
 int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8])
 {
 	// The skin set is part of the identity. Hashed rather than compared, so two
@@ -317,6 +398,10 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 	struct SourceTriangle
 	{
 		INT iVertex[3];
+		// UE1 stores mesh texture coordinates as a byte per axis spanning the
+		// whole texture, so they divide out to 0..1 rather than needing the
+		// texture's size the way a BSP surface does.
+		FMeshUV Tex[3];
 		DWORD PolyFlags;
 		INT TextureIndex;
 	};
@@ -344,6 +429,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 			{
 				const _WORD iWedge = face.iWedge[v];
 				if (iWedge >= lod->Wedges.Num()) { ok = false; break; }
+				tri.Tex[v] = lod->Wedges(iWedge).TexUV;
 				INT iVertex = lod->Wedges(iWedge).iVertex;
 				if (remap)
 				{
@@ -366,6 +452,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 			tri.iVertex[0] = src.iVertex[0];
 			tri.iVertex[1] = src.iVertex[1];
 			tri.iVertex[2] = src.iVertex[2];
+			tri.Tex[0] = src.Tex[0];
+			tri.Tex[1] = src.Tex[1];
+			tri.Tex[2] = src.Tex[2];
 			tri.PolyFlags = src.PolyFlags;
 			tri.TextureIndex = src.TextureIndex;
 			triangles.push_back(tri);
@@ -435,14 +524,27 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 			skin = mesh->Textures(tri.TextureIndex);
 		const vec3 albedo = AverageColour(skin, vec3(0.6f, 0.6f, 0.6f));
 
-		vec3 emission = vec3(0.0f, 0.0f, 0.0f);
+		bool unlit = false;
 		if (tri.PolyFlags & PF_Unlit)
-			emission = albedo * 2.0f;
+			unlit = true;
 
 		TriangleAttributes attr;
 		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
 		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, 0.0f);
-		attr.Emission = vec4(emission.x, emission.y, emission.z, 0.0f);
+		// w marks the surface as self lit. The colour it emits is whatever it
+		// turns out to be once sampled, so it cannot be decided here: doing so
+		// is what made unlit masked surfaces glow the key colour.
+		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
+
+		const int textureIndex = TextureFor(skin);
+		const bool masked = skin && (skin->PolyFlags & PF_Masked) != 0;
+		if (masked)
+			geometry.HasMasked = true;
+		attr.UV01 = vec4(tri.Tex[0].U / 255.0f, tri.Tex[0].V / 255.0f,
+		                 tri.Tex[1].U / 255.0f, tri.Tex[1].V / 255.0f);
+		attr.UV2Tex = vec4(tri.Tex[2].U / 255.0f, tri.Tex[2].V / 255.0f,
+		                   (float)textureIndex, masked ? 1.0f : 0.0f);
+
 		// A mesh is instanced into whatever room the actor is standing in, so
 		// its ambient comes from the instance rather than from here.
 		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -596,9 +698,26 @@ void LevelScene::CollectDynamic(ULevel* level)
 			// NOT actor->Texture: on a pawn that is the editor's sprite icon -
 			// S_Pawn, a little green man - and letting it override the skins
 			// paints every character in the game the colour of an icon.
+			// The order UMesh::GetTexture uses: the actor's per-material skin
+			// first, then the mesh's own list, then the actor's single Skin
+			// override. Taking only MultiSkins left anything that uses Skin -
+			// the street signs among them - with no texture at all, falling
+			// back to one averaged colour.
+			//
+			// Deliberately not actor->Texture: on a pawn that is the editor's
+			// S_Pawn sprite icon.
 			UTexture* skins[8] = {};
 			for (int i = 0; i < 8; i++)
-				skins[i] = actor->MultiSkins[i];
+			{
+				if (actor->MultiSkins[i])
+					skins[i] = actor->MultiSkins[i];
+				else if (i != 0 && i < actor->Mesh->Textures.Num() && actor->Mesh->Textures(i))
+					skins[i] = actor->Mesh->Textures(i);
+				else if (actor->Skin)
+					skins[i] = actor->Skin;
+				else if (i < actor->Mesh->Textures.Num())
+					skins[i] = actor->Mesh->Textures(i);
+			}
 
 			geometryIndex = GeometryForMesh(actor->Mesh, frame, skins);
 			if (geometryIndex < 0)

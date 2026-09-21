@@ -78,8 +78,20 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 		// nothing about which requirement or why - and the usual reason here is
 		// not the GPU at all but what the translation layer chose to pass on.
 		deviceBuilder.OptionalRayQuery();
+		// Needed to index the texture array by what the ray happened to hit,
+		// which differs between neighbouring invocations. Optional: without it
+		// the trace falls back to one averaged colour per surface.
+		deviceBuilder.OptionalDescriptorIndexing();
 		deviceBuilder.SelectDevice(VkDeviceIndex);
 		Device = deviceBuilder.Create(Instance);
+
+		// Texturing needs to index the array by whatever each ray hit, which is
+		// not uniform across a workgroup. Without it the trace still runs.
+		CanSampleTextures =
+			Device->EnabledFeatures.DescriptorIndexing.runtimeDescriptorArray &&
+			Device->EnabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing;
+		if (!CanSampleTextures)
+			debugf(TEXT("PathTracer: no descriptor indexing, surfaces will use one averaged colour each."));
 
 		if (!Device->EnabledFeatures.RayQuery.rayQuery || !Device->EnabledFeatures.AccelerationStructure.accelerationStructure)
 		{
@@ -139,6 +151,7 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.AddBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device.get());
 
@@ -146,6 +159,7 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures)
 		.MaxSets(1)
 		.DebugName("PathTracerDescriptorPool")
 		.Create(Device.get());
@@ -188,6 +202,13 @@ std::unique_ptr<VulkanDescriptorSet> UPathTracerRenderDevice::AllocateTileDescri
 
 void UPathTracerRenderDevice::CreateTilePipeline()
 {
+	SceneSampler = SamplerBuilder()
+		.MinFilter(VK_FILTER_LINEAR)
+		.MagFilter(VK_FILTER_LINEAR)
+		.AddressMode(VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT)
+		.DebugName("PathTracerSceneSampler")
+		.Create(Device.get());
+
 	TileSampler = SamplerBuilder()
 		.MinFilter(VK_FILTER_LINEAR)
 		.MagFilter(VK_FILTER_LINEAR)
@@ -559,6 +580,67 @@ void UPathTracerRenderDevice::ReleaseSwapChainResources()
 {
 }
 
+// Bind whatever textures the scene has registered since the last frame.
+//
+// Written incrementally: the registry only ever grows within a level, and
+// rewriting a thousand descriptors every frame to add one is wasteful.
+void UPathTracerRenderDevice::UpdateSceneTextures()
+{
+	guard(UPathTracerRenderDevice::UpdateSceneTextures);
+
+	if (!CanSampleTextures || !DescriptorSet || !Textures || !SceneSampler)
+		return;
+
+	CachedTexture* white = Textures->White();
+	if (!white || !white->View)
+		return;
+
+	// Every slot starts valid. A descriptor that is never read still has to be
+	// something, and filling the array once is cheaper than tracking which
+	// slots the shader might reach.
+	if (!SceneTexturesInitialised)
+	{
+		SceneTexturesInitialised = true;
+		WriteDescriptors writes;
+		for (int i = 0; i < LevelScene::MaxTextures; i++)
+			writes.AddCombinedImageSampler(DescriptorSet, 6, i, white->View.get(), SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		writes.Execute(Device.get());
+	}
+
+	// A new level empties the registry, so what is already bound can outnumber
+	// what the scene now wants. Start again rather than leave stale slots.
+	if (Scene.Textures.size() < BoundSceneTextures)
+		BoundSceneTextures = 0;
+
+	const size_t wanted = std::min<size_t>(Scene.Textures.size(), LevelScene::MaxTextures);
+	if (wanted <= BoundSceneTextures)
+		return;
+
+	WriteDescriptors writes;
+	for (size_t i = BoundSceneTextures; i < wanted; i++)
+	{
+		UTexture* texture = Scene.Textures[i];
+		CachedTexture* cached = Textures->GetForScene(texture);
+		VulkanImageView* view = (cached && cached->View) ? cached->View.get() : white->View.get();
+
+		// Named, so a texture that comes out wrong on screen can be identified
+		// rather than guessed at.
+		if (!cached && TextureFailuresLogged < 24)
+		{
+			TextureFailuresLogged++;
+			debugf(TEXT("PathTracer texture %d '%s' (%s) %dx%d could not be uploaded"),
+				(int)i, texture->GetName(),
+				texture->GetClass() ? texture->GetClass()->GetName() : TEXT("?"),
+				(int)texture->USize, (int)texture->VSize);
+		}
+		writes.AddCombinedImageSampler(DescriptorSet, 6, (int)i, view, SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+	writes.Execute(Device.get());
+	BoundSceneTextures = wanted;
+
+	unguard;
+}
+
 void UPathTracerRenderDevice::UpdateDescriptors()
 {
 	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer())
@@ -740,6 +822,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
 		PushConstants.Counts[2] = (uint32_t)Max(Bounces, 1);
 		PushConstants.Counts[3] = AccumulatedFrames;
+		UpdateSceneTextures();
+		PushConstants.TextureCount = (uint32_t)BoundSceneTextures;
 		PushConstants.Params = vec4(
 			0.2f + Exposure * (2.0f / 255.0f),
 			SkyIntensity * (2.0f / 255.0f),
@@ -865,6 +949,13 @@ void UPathTracerRenderDevice::Flush(UBOOL AllowPrecache)
 	{
 		if (Device) vkDeviceWaitIdle(Device->device);
 		Textures->Clear();
+
+		// Clearing the cache destroys the image views that the trace's texture
+		// array still points at, so those descriptors have to be rewritten
+		// before anything samples them again. Going fullscreen calls Flush, and
+		// the next dispatch read freed images.
+		BoundSceneTextures = 0;
+		SceneTexturesInitialised = false;
 	}
 	unguard;
 }
@@ -922,6 +1013,12 @@ void UPathTracerRenderDevice::Exit()
 	TileDescriptorPool.reset();
 	TileSetLayout.reset();
 	TileSampler.reset();
+	// Released here with everything else. Left to the member destructor it
+	// outlived the device and destroyed itself against a dead handle, which
+	// crashed on exit and brought up the safe mode prompt on the next launch.
+	SceneSampler.reset();
+	BoundSceneTextures = 0;
+	SceneTexturesInitialised = false;
 
 	TracePipeline.reset();
 	TraceShader.reset();

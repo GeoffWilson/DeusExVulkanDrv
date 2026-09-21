@@ -6,6 +6,9 @@ std::string Shaders::Trace()
 	return R"(
 		#version 460
 		#extension GL_EXT_ray_query : enable
+		// Each ray lands on whatever triangle it lands on, so the texture index
+		// differs between neighbouring invocations.
+		#extension GL_EXT_nonuniform_qualifier : enable
 
 		layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -19,6 +22,8 @@ std::string Shaders::Trace()
 			vec4 Albedo;
 			vec4 Emission;
 			vec4 Ambient;
+			vec4 UV01;      // u0 v0 u1 v1
+			vec4 UV2Tex;    // u2 v2 texture unused
 		};
 
 		struct SceneLight
@@ -32,6 +37,10 @@ std::string Shaders::Trace()
 		// Per instance, indexed by the intersection's instance id: what varies
 		// by where a shape is rather than by what it is.
 		layout(binding = 5, std430) readonly buffer InstanceData { vec4 instanceAmbient[]; };
+		// Sized to match the layout rather than left open: an unsized array needs
+		// the runtime descriptor array capability, and a device without it would
+		// fail to create the pipeline at all rather than simply not texture.
+		layout(binding = 6) uniform sampler2D sceneTextures[1024];
 
 		layout(push_constant) uniform PushConstants
 		{
@@ -40,8 +49,52 @@ std::string Shaders::Trace()
 			vec4 CameraUp;        // xyz, already scaled by the vertical half extent
 			vec4 CameraForward;   // xyz unit vector down the middle of the view
 			uvec4 Counts;         // x frame, y light count, z bounces, w accumulated frames
-			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w unused
+			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w debug mode
+			uint TextureCount;    // 0 when the device cannot index the array
 		};
+
+		// Does this point on the triangle actually exist? UE1 masked art keys
+		// transparency to palette index zero, which the upload turns into an
+		// alpha of zero. Rendering those texels rather than seeing through them
+		// is what put magenta - the key colour in Deus Ex's packages - across
+		// every window and railing.
+		bool texelPresent(int attributeBase, int primitive, vec2 bary)
+		{
+			TriangleAttributes attr = tris[attributeBase + primitive];
+			if (attr.UV2Tex.w < 0.5)
+				return true;
+
+			int index = int(attr.UV2Tex.z);
+			if (index < 0 || uint(index) >= TextureCount)
+				return true;
+
+			vec2 uv = attr.UV01.xy * (1.0 - bary.x - bary.y)
+			        + attr.UV01.zw * bary.x
+			        + attr.UV2Tex.xy * bary.y;
+			return texture(sceneTextures[nonuniformEXT(index)], uv).a > 0.5;
+		}
+
+		// The triangle's own colour, textured where there is a texture to read.
+		// UE1 surface coordinates run well outside 0..1 - one texture tiles
+		// across a whole wall - which the sampler's repeat mode handles.
+		vec3 surfaceAlbedo(TriangleAttributes attr, vec2 bary)
+		{
+			int index = int(attr.UV2Tex.z);
+			if (index < 0 || uint(index) >= TextureCount)
+				return attr.Albedo.rgb;
+
+			// Barycentrics from a ray query are the weights of the second and
+			// third vertices; the first takes up the remainder.
+			vec2 uv = attr.UV01.xy * (1.0 - bary.x - bary.y)
+			        + attr.UV01.zw * bary.x
+			        + attr.UV2Tex.xy * bary.y;
+
+			vec4 texel = texture(sceneTextures[nonuniformEXT(index)], uv);
+
+			// The engine's art is authored in sRGB; the trace works in linear.
+			vec3 linearRgb = pow(max(texel.rgb, vec3(0.0)), vec3(2.2));
+			return linearRgb;
+		}
 
 		// A small hash based generator. Path tracing needs a different stream per
 		// pixel, per frame and per bounce, and wants it cheap rather than good:
@@ -89,9 +142,21 @@ std::string Shaders::Trace()
 		{
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, topLevel,
-				gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+				gl_RayFlagsTerminateOnFirstHitEXT,
 				0xFF, origin, Params.z, dir, dist);
-			while (rayQueryProceedEXT(rq)) { }
+			// A hole in a grate lets light through, so a candidate only counts
+			// as occluding once its texel is known to be there.
+			while (rayQueryProceedEXT(rq))
+			{
+				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+				{
+					if (texelPresent(
+							rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+							rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
+							rayQueryGetIntersectionBarycentricsEXT(rq, false)))
+						rayQueryConfirmIntersectionEXT(rq);
+				}
+			}
 			return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 		}
 
@@ -211,8 +276,20 @@ std::string Shaders::Trace()
 			for (uint bounce = 0u; bounce < bounces; bounce++)
 			{
 				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsOpaqueEXT, 0xFF, origin, Params.z, direction, 100000.0);
-				while (rayQueryProceedEXT(rq)) { }
+				rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsNoneEXT, 0xFF, origin, Params.z, direction, 100000.0);
+				while (rayQueryProceedEXT(rq))
+				{
+					// Only geometry holding masked art is non-opaque, so this
+					// runs for grates, fences and windows and nothing else.
+					if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+					{
+						if (texelPresent(
+								rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+								rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
+								rayQueryGetIntersectionBarycentricsEXT(rq, false)))
+							rayQueryConfirmIntersectionEXT(rq);
+					}
+				}
 
 				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
 				{
@@ -227,6 +304,8 @@ std::string Shaders::Trace()
 				// data as its custom index, so one buffer serves every shape.
 				int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 				TriangleAttributes attr = tris[attributeBase + primitive];
+				vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+				attr.Albedo = vec4(surfaceAlbedo(attr, bary), attr.Albedo.w);
 
 				vec3 position = origin + direction * t;
 
@@ -279,7 +358,11 @@ std::string Shaders::Trace()
 				if (dot(normal, direction) > 0.0)
 					normal = -normal;
 
-				radiance += throughput * attr.Emission.rgb;
+				// Self lit surfaces emit the colour they actually are, which is
+				// only known once the texture has been sampled. Emission.w is
+				// the flag; the rgb carries nothing.
+				if (attr.Emission.w > 0.5)
+					radiance += throughput * attr.Albedo.rgb;
 				radiance += throughput * directLight(position, normal, attr.Albedo.rgb);
 
 				// The zone's ambient. Level surfaces carry their own, because a

@@ -87,7 +87,10 @@ void AccelStructure::BuildBottomLevel(const SceneGeometry& geometry, BottomLevel
 
 	VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 	geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-	geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+	// Opaque wherever nothing is masked, which is nearly everything: traversal
+	// then accepts a hit outright instead of asking the shader about every
+	// candidate triangle it crosses.
+	geom.flags = geometry.HasMasked ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
 	geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
 	geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
 	geom.geometry.triangles.vertexData.deviceAddress = out.Vertices->GetDeviceAddress();

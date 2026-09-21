@@ -30,14 +30,29 @@ public:
 	// Returns null if the texture could not be represented.
 	CachedTexture* Get(const FTextureInfo& info, bool masked);
 
+	// The same upload for a texture the trace references. Takes a UTexture
+	// rather than an FTextureInfo because the scene walks the level's own
+	// objects rather than being handed surfaces by the engine, and skips the
+	// per-texture descriptor set: the trace binds one array, not one set each.
+	CachedTexture* GetForScene(UTexture* texture);
+
+	// A 1x1 white image, so that unused slots in the trace's texture array are
+	// still valid descriptors.
+	CachedTexture* White();
+
 	void Clear();
 
 private:
-	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked);
+	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet = true);
 
 	UPathTracerRenderDevice* renderer = nullptr;
 
 	// Keyed on the engine's cache id and whether it was wanted masked: the same
 	// texture can be drawn both ways in one frame and the alpha differs.
 	std::unordered_map<uint64_t, std::unique_ptr<CachedTexture>> Textures;
+
+	// Keyed on the object itself: the scene refers to textures by pointer, and
+	// the same texture is wanted once however many surfaces use it.
+	std::unordered_map<UTexture*, std::unique_ptr<CachedTexture>> SceneTextures;
+	std::unique_ptr<CachedTexture> WhitePixel;
 };
