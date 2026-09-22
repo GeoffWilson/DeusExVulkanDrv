@@ -147,6 +147,7 @@ void LevelScene::Clear()
 	Geometries.clear();
 	StaticGeometries = 0;
 	Lights.clear();
+	FogLights.clear();
 	Instances.clear();
 	BrushGeometry.clear();
 	MeshGeometry.clear();
@@ -414,6 +415,50 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 	unguard;
 }
 
+// Rotor lights whose pattern should turn the other way from the engine's, to
+// follow the model it stands for. Named by map and light, because nothing in
+// the light itself says which way its fan turns.
+static bool IsReversedRotor(AActor* actor)
+{
+	static const struct { const TCHAR* Map; const TCHAR* Light; } reversed[] = {
+		{ TEXT("09_NYC_ShipFan"), TEXT("Light10") },
+	};
+	UObject* map = actor->XLevel ? actor->XLevel->GetOuter() : nullptr;
+	if (!map)
+		return false;
+	for (const auto& r : reversed)
+		if (!appStricmp(map->GetName(), r.Map) && !appStricmp(actor->GetName(), r.Light))
+			return true;
+	return false;
+}
+
+// A light's glow in the air of a fog zone: the engine's volumetric lighting,
+// which it bakes into fog maps over each surface and into a fog colour at
+// each vertex of a mesh. Everything here is as Render.dll sets it up
+// (FLightManager's per light setup and its Fog routine): the glow reaches
+// (VolumeRadius + 1) * 25, its strength is VolumeBrightness times the light's
+// current brightness over 64, and VolumeFog out of 255 is how much of the
+// scene behind it the glow replaces rather than adds to. The colour is the
+// light's own scaled by its brightness and the level's, left in display
+// terms because the shader blends it over the finished picture exactly as the
+// other devices blend a fog map.
+void LevelScene::AddFogLight(AActor* actor, const FPlane& colour, float brightness)
+{
+	if (!actor->VolumeRadius || !actor->VolumeBrightness)
+		return;
+	if (!actor->Region.Zone || !actor->Region.Zone->bFogZone)
+		return;
+
+	const float levelBrightness = actor->Level ? actor->Level->Brightness : 1.0f;
+	const float scale = Min(brightness, 1.0f) * levelBrightness;
+
+	SceneLight fog = {};
+	fog.PositionRadius = vec4(actor->Location.X, actor->Location.Y, actor->Location.Z, (actor->VolumeRadius + 1) * 25.0f);
+	fog.ColorBrightness = vec4(colour.X * scale, colour.Y * scale, colour.Z * scale, actor->VolumeBrightness * Min(brightness, 1.0f) / 64.0f);
+	fog.DirectionCone = vec4(actor->VolumeFog / 255.0f, 0.0f, 0.0f, 0.0f);
+	FogLights.push_back(fog);
+}
+
 void LevelScene::AddLight(AActor* actor)
 {
 	guardSlow(LevelScene::AddLight);
@@ -440,7 +485,7 @@ void LevelScene::AddLight(AActor* actor)
 	// one. Every light used to be taken as steady, so nothing in the game
 	// ever pulsed, blinked or flickered.
 	float brightness = actor->LightBrightness / 255.0f;
-	bool changing = actor->LightEffect == LE_Disco;
+	bool changing = actor->LightEffect == LE_Disco || actor->LightEffect == LE_Searchlight || actor->LightEffect == LE_Rotor;
 	const double seconds = actor->Level ? (double)actor->Level->TimeSeconds : 0.0;
 	const double cycle = seconds * 35.0 / Max((int)actor->LightPeriod, 1) + actor->LightPhase / 256.0;
 	const float wave = (float)std::sin(cycle * 2.0 * PI);
@@ -474,6 +519,8 @@ void LevelScene::AddLight(AActor* actor)
 	if (brightness <= 0.0f)
 		return;
 
+	AddFogLight(actor, c, brightness);
+
 	vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
 	if (HighlightSpecialLights)
 	{
@@ -489,22 +536,49 @@ void LevelScene::AddLight(AActor* actor)
 
 	// Spotlights shine along the actor's rotation, within a cone set by
 	// LightCone out of 256: the engine takes one minus that as the cosine
-	// of the cone's edge.
+	// of the cone's edge, and scales by the square of how far inside it a
+	// point is - all as Render.dll does it. A pawn's spotlight follows where
+	// it is looking rather than which way its body faces.
 	light.DirectionCone = vec4(0.0f, 0.0f, 0.0f, -1.0f);
 	if (actor->LightEffect == LE_Spotlight || actor->LightEffect == LE_StaticSpot)
 	{
-		const FVector dir = actor->Rotation.Vector();
+		APawn* pawn = Cast<APawn>(actor);
+		const FVector dir = (pawn ? pawn->ViewRotation : actor->Rotation).Vector();
 		light.DirectionCone = vec4(dir.X, dir.Y, dir.Z, 1.0f - actor->LightCone / 256.0f);
 	}
-	// Disco: worked out in the shader from the level's clock, with the
-	// engine's own formula. Flagged here, nothing more.
-	const float discoTurn = actor->LightEffect == LE_Disco ? 0.0f : -1.0f;
+	// Patterns worked out in the shader with the engine's own formulas, read
+	// out of Render.dll: 0 disco, 1 searchlight, 2 rotor, -1 none.
+	float pattern = -1.0f;
+	if (actor->LightEffect == LE_Disco)
+		pattern = 0.0f;
+	else if (actor->LightEffect == LE_Rotor)
+	{
+		pattern = 2.0f;
+		// Which way it turns, in DirectionCone.x. The engine turns every
+		// rotor the same way, which leaves the one over the ship's big fan
+		// spinning against the blades casting it; that one light is turned
+		// round to match its fan.
+		light.DirectionCone.x = IsReversedRotor(actor) ? -1.0f : 1.0f;
+	}
+	else if (actor->LightEffect == LE_Searchlight)
+	{
+		pattern = 1.0f;
+		// The sweep's offset: the clock over the period, plus the phase in
+		// 64ths of a turn, plus a whole turn. Worked out here in double
+		// precision and brought down to one turn above two, so the shader's
+		// angle stays positive the way the engine's does once any time has
+		// passed.
+		const double sweep = actor->LightPeriod ? seconds * 35.0 / actor->LightPeriod : 0.0;
+		double offset = actor->LightPhase * (PI / 32.0) + sweep + 2.0 * PI;
+		offset = std::fmod(offset, 2.0 * PI) + 4.0 * PI;
+		light.DirectionCone.x = (float)offset;
+	}
 
 	light.Flags = vec4(
 		actor->LightEffect == LE_NonIncidence ? 1.0f : 0.0f,
 		actor->LightEffect == LE_Cylinder ? 1.0f : 0.0f,
 		changing ? 1.0f : 0.0f,
-		discoTurn);
+		pattern);
 
 	Lights.push_back(light);
 
@@ -1482,6 +1556,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 	GeometryAdded = false;
 	Instances.clear();
 	Lights.clear();
+	FogLights.clear();
 	CurrentPoses.clear();
 	MeshBuilds = 0;
 

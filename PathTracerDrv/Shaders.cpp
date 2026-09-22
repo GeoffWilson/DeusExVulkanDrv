@@ -34,7 +34,7 @@ std::string Shaders::Trace()
 			vec4 PositionRadius;
 			vec4 ColorBrightness;
 			vec4 DirectionCone;   // xyz spot direction, w cosine of its edge or -1
-			vec4 Flags;           // x no incidence, y cylinder, z brightness changes, w 0 disco or -1
+			vec4 Flags;           // x no incidence, y cylinder, z brightness changes, w pattern: 0 disco 1 searchlight 2 rotor, -1 none
 		};
 
 		layout(binding = 3, std430) readonly buffer Attributes { TriangleAttributes tris[]; };
@@ -60,7 +60,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -334,27 +334,55 @@ std::string Shaders::Trace()
 				// range: the player's light augmentation has a radius of only
 				// 100 units, so at one metre it had already fallen to a quarter
 				// and at two metres to nothing.
-				// Disco, as Render.dll does it: two sets of eleven bands, one
-				// around the light and one down from it, both drifting with
-				// the clock at five radians a second - which is why the
-				// patches travel up and down as well as round. A point is lit
-				// where it falls between bands on both, and close to the
-				// light's vertical axis the pattern fades out.
+				// Patterned lights, each as Render.dll draws it. All three
+				// work from the angle around the light and fade their pattern
+				// near the light's vertical axis, measured in world units.
 				float disco = 1.0;
-				if (light.Flags.w >= 0.0)
+				if (light.Flags.w > -0.5)
 				{
 					vec3 v = -dir;
-					float across2 = v.x * v.x + v.y * v.y;
-					float t = Time * 5.0;
-					float a = 0.5 + 0.5 * cos(11.0 * atan(v.x, v.y) + t);
-					float b = 0.5 + 0.5 * cos(11.0 * atan(sqrt(across2), v.z) + t);
-					float f = a + b - a * b;
-					// The engine measures this in world units; dir here is a
-					// unit vector, so the distance comes back in.
-					float nearAxis = across2 * distance * distance * 5.0e-5;
-					if (nearAxis < 1.0)
-						f *= nearAxis;
-					disco = 1.0 - f;
+					float across2 = (v.x * v.x + v.y * v.y) * distance * distance;
+					float yaw = atan(v.x, v.y);
+					if (light.Flags.w < 0.5)
+					{
+						// Disco: eleven bands around and eleven down from the
+						// light, both drifting at five radians a second, so
+						// the patches travel up and down as well as round.
+						float t = Time * 5.0;
+						float a = 0.5 + 0.5 * cos(11.0 * yaw + t);
+						float b = 0.5 + 0.5 * cos(11.0 * atan(sqrt(v.x * v.x + v.y * v.y), v.z) + t);
+						float f = a + b - a * b;
+						float nearAxis = across2 * 5.0e-5;
+						if (nearAxis < 1.0)
+							f *= nearAxis;
+						disco = 1.0 - f;
+					}
+					else if (light.Flags.w < 1.5)
+					{
+						// Searchlight: four beams, each a quarter turn apart
+						// and an eighth wide, sweeping round. Dark in the
+						// first half of each quarter, and ramping up across
+						// the beam to its trailing edge. C's fmod keeps the
+						// sign, which is what the engine used.
+						float x = 4.0 * yaw + light.DirectionCone.x;
+						x = x - 6.2831853 * trunc(x / 6.2831853);
+						if (x < 3.1415927)
+							continue;
+						disco = 0.5 + 0.5 * cos(x);
+						float nearAxis = across2 * 6.0e-5;
+						if (nearAxis < 1.0)
+							disco *= nearAxis;
+					}
+					else
+					{
+						// Rotor: six blades turning at three and a half
+						// radians a second - the way DirectionCone.x says -
+						// filling in to full brightness near the axis.
+						disco = 0.5 + 0.5 * cos(6.0 * yaw + light.DirectionCone.x * Time * 3.5);
+						float nearAxis = across2 * 1.0e-4;
+						if (nearAxis < 1.0)
+							disco = 1.0 - nearAxis + nearAxis * disco;
+					}
 					if (disco <= 0.0)
 						continue;
 				}
@@ -404,6 +432,53 @@ std::string Shaders::Trace()
 			return mix(vec3(0.02, 0.02, 0.03), vec3(0.10, 0.12, 0.16), t) * Params.y;
 		}
 
+		// The engine's volumetric lighting: how much a fog light glows in the
+		// air between the eye and what the eye sees, and how much of that
+		// thing the glow hides. Render.dll's own Fog routine, per pixel rather
+		// than per fog map texel. Along the view ray, measured from the point
+		// nearest the light, the glow integrates 3(1 - r^2/R^2) over the part
+		// of the ray inside the light's sphere, scaled by the light's
+		// strength, clamped to one, then doubled. Each light blends over the
+		// ones before it, as the engine accumulates them.
+		vec4 volumetricFog(vec3 origin, vec3 dir, float len)
+		{
+			vec4 fog = vec4(0.0);
+			uint first = Counts.y;
+			uint count = lightGrid[7];
+			for (uint i = 0u; i < count; i++)
+			{
+				SceneLight light = lights[first + i];
+				float radius = light.PositionRadius.w;
+				vec3 toLight = light.PositionRadius.xyz - origin;
+				float along = dot(toLight, dir);
+				float distance2 = dot(toLight, toLight);
+				// Behind the eye only counts from inside the glow.
+				if (along < 0.0 && distance2 >= radius * radius)
+					continue;
+				float across2 = max(distance2 - along * along, 0.0);
+				if (across2 > radius * radius)
+					continue;
+				float halfChord = sqrt(radius * radius - across2);
+				// The stretch of ray inside the sphere, measured back from the
+				// point nearest the light: the eye sits at along, the surface at
+				// along - len.
+				float upper = min(halfChord, along);
+				float lower = max(-halfChord, along - len);
+				if (lower >= upper)
+					continue;
+				float k = 3.0 - 3.0 * across2 / (radius * radius);
+				float u = upper / radius, l = lower / radius;
+				float glow = ((k - u * u) * u - (k - l * l) * l) * light.ColorBrightness.w;
+				glow = 2.0 * clamp(glow, 0.0, 1.0);
+				if (glow <= 0.0)
+					continue;
+				float hides = min(glow * light.DirectionCone.x, 1.0);
+				fog.rgb = min(fog.rgb * (1.0 - hides) + glow * light.ColorBrightness.rgb, vec3(1.0));
+				fog.a = min(fog.a + hides, 1.0);
+			}
+			return fog;
+		}
+
 		void main()
 		{
 			ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -420,6 +495,7 @@ std::string Shaders::Trace()
 
 			vec3 origin = CameraOrigin.xyz;
 			vec3 direction = normalize(CameraForward.xyz + CameraRight.xyz * uv.x + CameraUp.xyz * uv.y);
+			vec3 viewDirection = direction;
 
 			vec3 radiance = vec3(0.0);
 			vec3 throughput = vec3(1.0);
@@ -806,6 +882,17 @@ std::string Shaders::Trace()
 			// devices draw it with, in display terms and after the history, so
 			// a flash does not linger in the accumulation: the picture scaled,
 			// then the flash colour added.
+			// Volumetric fog, blended over the picture the way a fog map is
+			// drawn over a surface: the glow added, what it hides taken away.
+			// Worked out afresh each frame from the first surface the eye
+			// meets, so it never enters the history and follows a moving
+			// light or eye at once.
+			if ((Disable & 32u) == 0u)
+			{
+				vec4 fog = volumetricFog(CameraOrigin.xyz, viewDirection, primaryDistance);
+				mapped = fog.rgb + mapped * (1.0 - fog.a);
+			}
+
 			vec3 flashFog = vec3(CameraRight.w, CameraUp.w, CameraForward.w);
 			mapped = flashFog + mapped * CameraOrigin.w;
 

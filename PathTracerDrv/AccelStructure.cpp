@@ -191,8 +191,10 @@ void AccelStructure::SyncGeometry(const LevelScene& scene)
 	// Rewritten every frame rather than built once. A light that moves, a flare
 	// that is thrown, and the player's own light augmentation all change the
 	// list, and a list uploaded at level load could express none of them.
+	// The fog lights follow the ordinary ones in the same buffer, and the grid
+	// carries how many there are: the push constants have no room left.
 	Lights = (int)scene.Lights.size();
-	const size_t wanted = std::max<size_t>(scene.Lights.size(), 1);
+	const size_t wanted = std::max<size_t>(scene.Lights.size() + scene.FogLights.size(), 1);
 	if (!LightBuffer || wanted > LightCapacity)
 	{
 		LightCapacity = std::max<size_t>(wanted * 2, 256);
@@ -218,6 +220,8 @@ void AccelStructure::SyncGeometry(const LevelScene& scene)
 		{
 			memcpy(mapped, scene.Lights.data(), scene.Lights.size() * sizeof(SceneLight));
 		}
+		if (!scene.FogLights.empty())
+			memcpy(mapped + scene.Lights.size(), scene.FogLights.data(), scene.FogLights.size() * sizeof(SceneLight));
 		LightBuffer->Unmap();
 	}
 
@@ -340,6 +344,7 @@ void AccelStructure::WriteLightGrid(const LevelScene& scene)
 	LightGrid[4] = dims[0];
 	LightGrid[5] = dims[1];
 	LightGrid[6] = dims[2];
+	LightGrid[7] = (uint32_t)scene.FogLights.size();
 
 	uint32_t next = header + cells * 2;
 	for (uint32_t c = 0; c < cells; c++)

@@ -37,8 +37,9 @@ struct SceneLight
 	// -1 for a light that shines every way.
 	vec4 DirectionCone;
 	// x no incidence falloff, y distance measured horizontally (a cylinder),
-	// z brightness changes from frame to frame, w zero for a disco light and
-	// -1 for any other.
+	// z brightness changes from frame to frame, w the light's pattern: 0
+	// disco, 1 searchlight (its sweep offset in DirectionCone.x), 2 rotor
+	// (which way it turns, 1 or -1, in DirectionCone.x), -1 none.
 	vec4 Flags;
 };
 
@@ -98,6 +99,12 @@ public:
 	// and the part whose surfaces the shader has to judge.
 	int StaticGeometries = 0;
 	std::vector<SceneLight> Lights;
+	// Lights that also glow in the air of a fog zone, in the same record:
+	// PositionRadius holds the glow's own radius, ColorBrightness the colour
+	// it tints the air in display terms with its strength in w, and
+	// DirectionCone.x how much of what lies behind it the glow hides. See
+	// AddFogLight.
+	std::vector<SceneLight> FogLights;
 
 	// Rebuilt each frame. The first entry is always the static world.
 	std::vector<SceneInstance> Instances;
@@ -115,6 +122,7 @@ private:
 	void AddBrushPolys(UModel* brush, SceneGeometry& out);
 	void AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals);
 	void AddLight(AActor* actor);
+	void AddFogLight(AActor* actor, const FPlane& colour, float brightness);
 
 	// A unit quad carrying one texture in one style, shared by every sprite
 	// showing it. Its size and facing come from the instance.

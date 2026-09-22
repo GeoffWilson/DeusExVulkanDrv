@@ -1114,8 +1114,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				AActor* a = level->Actors(i);
 				if (!a || a->LightType == LT_None || a->LightBrightness == 0)
 					continue;
-				if (a->LightType == LT_Steady && a->LightEffect != LE_Spotlight && a->LightEffect != LE_StaticSpot &&
-					a->LightEffect != LE_NonIncidence && a->LightEffect != LE_Cylinder)
+				if (a->LightType == LT_Steady && a->LightEffect == LE_None)
 					continue;
 				found.push_back({ (a->Location - player->Location).Size(), a });
 			}
@@ -1126,9 +1125,13 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				AActor* a = found[n].second;
 				const FVector d = a->Location - player->Location;
 				const float ahead = d | view.XAxis, right = d | view.YAxis;
+				static const TCHAR* effects[] = { TEXT(""), TEXT(" torchwaver"), TEXT(" firewaver"), TEXT(" wateryshimmer"),
+					TEXT(" searchlight"), TEXT(" slowwave"), TEXT(" fastwave"), TEXT(" cloudcast"), TEXT(" staticspot"),
+					TEXT(" shock"), TEXT(" disco"), TEXT(" warp"), TEXT(" spot"), TEXT(" nonincidence"), TEXT(" shell"),
+					TEXT(" omnibumpmap"), TEXT(" interference"), TEXT(" cylinder"), TEXT(" rotor"), TEXT(" unused") };
 				Ar.Logf(TEXT("  %s %s%s cone %d: %.0f %s, %.0f %s, %.0f %s"),
 					a->GetName(), a->LightType < 10 ? types[a->LightType] : TEXT("?"),
-					(a->LightEffect == LE_Spotlight || a->LightEffect == LE_StaticSpot) ? TEXT(" spot") : TEXT(""),
+					a->LightEffect < 20 ? effects[a->LightEffect] : TEXT(" ?"),
 					(int)a->LightCone,
 					std::fabs(ahead), ahead >= 0 ? TEXT("ahead") : TEXT("behind"),
 					std::fabs(right), right >= 0 ? TEXT("right") : TEXT("left"),
@@ -1139,7 +1142,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 
 		struct Switch { const TCHAR* Name; uint32_t Bit; };
 		static const Switch switches[] = {
-			{ TEXT("NOLIGHTS"), 1u }, { TEXT("NOSHADOWS"), 2u }, { TEXT("NOSKY"), 4u }, { TEXT("OPAQUE"), 8u }, { TEXT("HIGHLIGHT"), 16u },
+			{ TEXT("NOLIGHTS"), 1u }, { TEXT("NOSHADOWS"), 2u }, { TEXT("NOSKY"), 4u }, { TEXT("OPAQUE"), 8u }, { TEXT("HIGHLIGHT"), 16u }, { TEXT("NOFOG"), 32u },
 		};
 		bool handled = false;
 		for (const Switch& s : switches)
@@ -1164,7 +1167,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		Ar.Logf(TEXT("PT: lights %s, shadows %s, sky %s, per-triangle checks %s, bounces %d%s"),
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
-			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | OPAQUE | BOUNCES n | RESET)"));
+			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | OPAQUE | BOUNCES n | RESET)"));
 		return 1;
 	}
 
