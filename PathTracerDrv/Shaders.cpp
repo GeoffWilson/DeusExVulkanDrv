@@ -311,6 +311,13 @@ std::string Shaders::Trace()
 			// with a pane and a frame would otherwise use up the ray's budget
 			// before it reached anything solid.
 			uint passes = 0u;
+			// How far along the ray to start looking. Generous for a bounce off
+			// a surface, because these levels are big and a surface acne
+			// artefact is worse than a lost millimetre - but tiny when carrying
+			// on through a surface, since the thing behind it may be flush
+			// against it. A laser dot sits on a wall, and stepping a whole unit
+			// past it skipped the wall entirely and put a hole in the level.
+			float rayMin = Params.z;
 
 			// What this pixel is looking at, recorded on the first bounce so the
 			// accumulated history can be checked against it.
@@ -322,7 +329,7 @@ std::string Shaders::Trace()
 			for (uint bounce = 0u; bounce < bounces; bounce++)
 			{
 				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsNoneEXT, 0xFF, origin, Params.z, direction, 100000.0);
+				rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsNoneEXT, 0xFF, origin, rayMin, direction, 100000.0);
 				while (rayQueryProceedEXT(rq))
 				{
 					// Only geometry holding masked or translucent art is
@@ -395,7 +402,8 @@ std::string Shaders::Trace()
 						radiance += throughput * attr.Albedo.rgb;
 					}
 
-					origin = position + direction * (Params.z * 2.0);
+					origin = position;
+					rayMin = 0.01;
 					if (passes < 8u)
 					{
 						passes++;
@@ -417,6 +425,7 @@ std::string Shaders::Trace()
 					// reflection by that made it invisible.
 					throughput *= 0.55 + 0.45 * clamp(attr.Albedo.rgb * 2.5, vec3(0.0), vec3(1.0));
 					origin = position + normal * Params.z;
+					rayMin = Params.z;
 					direction = reflect(direction, normal);
 					continue;
 				}
@@ -490,6 +499,7 @@ std::string Shaders::Trace()
 				}
 
 				origin = position + normal * Params.z;
+				rayMin = Params.z;
 				direction = cosineDirection(normal);
 			}
 
