@@ -42,7 +42,8 @@ struct TracePushConstants
 	uint32_t MaxSamples;
 	// The level's clock in seconds, wrapped so it keeps its precision.
 	float Time;
-	uint32_t Pad;
+	// Diagnostic switches, set from the console with PT: see Exec.
+	uint32_t Disable;
 	// xyz where the sky zone is seen from; w is 1 when there is one.
 	vec4 SkyOrigin;
 };
@@ -196,6 +197,11 @@ private:
 	TracePushConstants LastCamera = {};
 	uint32_t AccumulatedFrames = 0;
 	size_t LastInstanceCount = 0;
+
+	// The engine's screen flash for this frame, from Lock.
+	uint32_t DisableBits = 0;
+	FPlane FlashScale = FPlane(0.5f, 0.5f, 0.5f, 0.0f);
+	FPlane FlashFog = FPlane(0.0f, 0.0f, 0.0f, 0.0f);
 
 	// Where each frame's time goes, averaged and logged every few hundred
 	// frames when LogTimings is set.

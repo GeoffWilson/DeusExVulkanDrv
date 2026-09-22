@@ -145,6 +145,7 @@ namespace
 void LevelScene::Clear()
 {
 	Geometries.clear();
+	StaticGeometries = 0;
 	Lights.clear();
 	Instances.clear();
 	BrushGeometry.clear();
@@ -177,8 +178,43 @@ bool LevelScene::BuildStatic(ULevel* level)
 	if (!level || !level->Model)
 		return false;
 
+	// Split in two. A geometry that is not opaque sends every triangle a ray
+	// crosses back to the shader to be judged, rather than letting the
+	// hardware accept it, and one masked grate or translucent sheet anywhere
+	// in the level made the whole level so. Adding the sea to Liberty Island
+	// is what did it there: looking back along the dock, every long ray paid
+	// for every triangle it passed. Now only the surfaces that need judging
+	// are in the slow half.
+	SceneGeometry all;
+	AddBspSurfaces(level->Model, all, true);
+
 	Geometries.emplace_back();
-	AddBspSurfaces(level->Model, Geometries.back(), true);
+	Geometries.emplace_back();
+	SceneGeometry& opaque = Geometries[0];
+	SceneGeometry& judged = Geometries[1];
+	opaque.HasMasked = false;
+	judged.HasMasked = true;
+	for (size_t t = 0; t < all.Attributes.size(); t++)
+	{
+		// Masked, translucent and modulated need the shader; plain, mirrored
+		// and sky windows do not.
+		const float kind = all.Attributes[t].UV2Tex.w;
+		const bool needsShader = kind == 1.0f || kind == 2.0f || kind == 4.0f;
+		SceneGeometry& to = needsShader ? judged : opaque;
+		to.Positions.insert(to.Positions.end(), all.Positions.begin() + t * 3, all.Positions.begin() + t * 3 + 3);
+		to.Attributes.push_back(all.Attributes[t]);
+	}
+	// A geometry with nothing in it cannot have an acceleration structure, so
+	// a level with no such surfaces carries one placeholder triangle of no
+	// size, which nothing can hit.
+	if (judged.Positions.empty())
+	{
+		judged.Positions.assign(3, vec3(0.0f, 0.0f, 0.0f));
+		TriangleAttributes none = {};
+		none.UV2Tex = vec4(0.0f, 0.0f, -1.0f, 0.0f);
+		judged.Attributes.push_back(none);
+	}
+	StaticGeometries = 2;
 	// Lights are gathered per frame in CollectDynamic rather than here. The
 	// light augmentation turns the player into a light, a thrown flare is a
 	// light that moves, and a lamp that is shot out stops being one - none of
@@ -399,8 +435,76 @@ void LevelScene::AddLight(AActor* actor)
 	const float radius = actor->LightRadius * 25.0f;
 	light.PositionRadius = vec4(actor->Location.X, actor->Location.Y, actor->Location.Z, actor->bSpecialLit ? -radius : radius);
 
-	const vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
-	light.ColorBrightness = vec4(colour.x, colour.y, colour.z, actor->LightBrightness / 255.0f * LightScale);
+	// How bright it is right now. The engine's own light types, on its clock:
+	// a period of LightPeriod/35 seconds, offset by LightPhase in 256ths of
+	// one. Every light used to be taken as steady, so nothing in the game
+	// ever pulsed, blinked or flickered.
+	float brightness = actor->LightBrightness / 255.0f;
+	bool changing = actor->LightEffect == LE_Disco;
+	const double seconds = actor->Level ? (double)actor->Level->TimeSeconds : 0.0;
+	const double cycle = seconds * 35.0 / Max((int)actor->LightPeriod, 1) + actor->LightPhase / 256.0;
+	const float wave = (float)std::sin(cycle * 2.0 * PI);
+	switch (actor->LightType)
+	{
+	case LT_Pulse:       brightness *= 0.6f + 0.39f * wave; changing = true; break;
+	case LT_SubtlePulse: brightness *= 0.9f + 0.09f * wave; changing = true; break;
+	case LT_Blink:
+	{
+		// The engine's own test, read out of Render.dll: off whenever the low
+		// bit of this counter is set. It runs at 35*65536 counts a second, so
+		// in practice it is a rapid flicker rather than a slow on and off.
+		const double counter = seconds * (35.0 * 65536.0) / (actor->LightPeriod + 1) + actor->LightPhase * 256.0;
+		if (((long long)counter) & 1)
+			brightness = 0.0f;
+		changing = true;
+		break;
+	}
+	case LT_Flicker:
+	{
+		const float r = appFrand();
+		brightness = (r < 0.5f) ? 0.0f : brightness * r;
+		changing = true;
+		break;
+	}
+	// One toggle shared by every strobe light, flipped once a frame: on and
+	// off on alternate frames, as the engine does it.
+	case LT_Strobe:      if (StrobeOff) brightness = 0.0f; changing = true; break;
+	default:             break;
+	}
+	if (brightness <= 0.0f)
+		return;
+
+	vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
+	if (HighlightSpecialLights)
+	{
+		const bool spot = actor->LightEffect == LE_Spotlight || actor->LightEffect == LE_StaticSpot;
+		const bool shaped = actor->LightEffect == LE_NonIncidence || actor->LightEffect == LE_Cylinder;
+		if (changing || spot || shaped)
+		{
+			colour = changing ? vec3(0.0f, 1.0f, 0.0f) : (spot ? vec3(1.0f, 0.0f, 1.0f) : vec3(0.0f, 1.0f, 1.0f));
+			brightness *= 8.0f;
+		}
+	}
+	light.ColorBrightness = vec4(colour.x, colour.y, colour.z, brightness * LightScale);
+
+	// Spotlights shine along the actor's rotation, within a cone set by
+	// LightCone out of 256: the engine takes one minus that as the cosine
+	// of the cone's edge.
+	light.DirectionCone = vec4(0.0f, 0.0f, 0.0f, -1.0f);
+	if (actor->LightEffect == LE_Spotlight || actor->LightEffect == LE_StaticSpot)
+	{
+		const FVector dir = actor->Rotation.Vector();
+		light.DirectionCone = vec4(dir.X, dir.Y, dir.Z, 1.0f - actor->LightCone / 256.0f);
+	}
+	// Disco: worked out in the shader from the level's clock, with the
+	// engine's own formula. Flagged here, nothing more.
+	const float discoTurn = actor->LightEffect == LE_Disco ? 0.0f : -1.0f;
+
+	light.Flags = vec4(
+		actor->LightEffect == LE_NonIncidence ? 1.0f : 0.0f,
+		actor->LightEffect == LE_Cylinder ? 1.0f : 0.0f,
+		changing ? 1.0f : 0.0f,
+		discoTurn);
 
 	Lights.push_back(light);
 
@@ -1384,6 +1488,13 @@ void LevelScene::CollectDynamic(ULevel* level)
 	// Where the sky is seen from: the sky zone of whichever zone the viewer
 	// is in, or failing that the level's only one. The engine draws it from
 	// that point with the view's own direction, so it never shows parallax.
+	// Strobe lights all share one switch, flipped whenever the clock moves.
+	if (level && level->GetLevelInfo() && level->GetLevelInfo()->TimeSeconds != LastStrobeTime)
+	{
+		LastStrobeTime = level->GetLevelInfo()->TimeSeconds;
+		StrobeOff = !StrobeOff;
+	}
+
 	HasSky = false;
 	{
 		AZoneInfo* zone = ViewActor ? ViewActor->Region.Zone : nullptr;
@@ -1412,9 +1523,10 @@ void LevelScene::CollectDynamic(ULevel* level)
 	// full of people, which is the whole question here.
 	int brushCount = 0, meshCount = 0, animatedCount = 0, skippedMesh = 0, hiddenCount = 0;
 
+	for (int g = 0; g < StaticGeometries; g++)
 	{
 		SceneInstance world;
-		world.GeometryIndex = 0;
+		world.GeometryIndex = g;
 		MakeIdentity(world.Transform);
 		Instances.push_back(world);
 	}

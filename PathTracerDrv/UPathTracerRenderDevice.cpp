@@ -166,13 +166,14 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.AddBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device.get());
 
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures)
 		.MaxSets(1)
 		.DebugName("PathTracerDescriptorPool")
@@ -671,7 +672,7 @@ void UPathTracerRenderDevice::UpdateSceneTextures()
 
 void UPathTracerRenderDevice::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer())
+	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer())
 		return;
 
 	WriteDescriptors()
@@ -682,6 +683,7 @@ void UPathTracerRenderDevice::UpdateDescriptors()
 		.AddBuffer(DescriptorSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
 		.AddBuffer(DescriptorSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
 		.AddBuffer(DescriptorSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
+		.AddBuffer(DescriptorSet, 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightGridBuffer())
 		.Execute(Device.get());
 
 	DescriptorsDirty = false;
@@ -755,6 +757,7 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	// a bottom level structure the first time they are seen.
 	const size_t geometriesBefore = Scene.Geometries.size();
 	Scene.LightScale = Max(LightScale, 1) / 100.0f;
+	Scene.HighlightSpecialLights = (DisableBits & 16u) != 0;
 	// Gathering is CPU only, so it runs while the GPU is still tracing the
 	// last frame. Uploading is not: the buffers it writes are the ones that
 	// trace is reading.
@@ -836,7 +839,7 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	unguardSlow;
 }
 
-void UPathTracerRenderDevice::Lock(FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* HitData, INT* HitSize)
+void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* HitData, INT* HitSize)
 {
 	guard(UPathTracerRenderDevice::Lock);
 
@@ -847,6 +850,8 @@ void UPathTracerRenderDevice::Lock(FPlane FlashScale, FPlane FlashFog, FPlane Sc
 	{
 		CreateSwapChainResources();
 		HaveCamera = false;
+		FlashScale = InFlashScale;
+		FlashFog = InFlashFog;
 		TileVertices.clear();
 		TileBatches.clear();
 	}
@@ -879,8 +884,14 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	{
 		// Accumulate only while the view is still. Any movement and the samples
 		// behind it describe a different picture, so start again.
+		// Compared without w, which carries the screen flash rather than any
+		// part of the view.
+		auto sameXyz = [](const vec4& a, const vec4& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
 		const bool cameraMoved =
-			memcmp(&PushConstants.CameraOrigin, &LastCamera.CameraOrigin, sizeof(vec4) * 4) != 0;
+			!sameXyz(PushConstants.CameraOrigin, LastCamera.CameraOrigin) ||
+			!sameXyz(PushConstants.CameraRight, LastCamera.CameraRight) ||
+			!sameXyz(PushConstants.CameraUp, LastCamera.CameraUp) ||
+			!sameXyz(PushConstants.CameraForward, LastCamera.CameraForward);
 		// A door swinging past is as much a change as the camera turning, and
 		// the instance count is a cheap proxy for the scene having moved. It
 		// misses an actor that moves while the count holds, which is why the
@@ -891,6 +902,15 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			AccumulatedFrames = 0;
 		LastCamera = PushConstants;
 
+		// The screen flash, as the other devices blend it: the picture times
+		// min(2 * scale, 1), plus the flash colour. Neutral is a scale of one
+		// half and no colour.
+		PushConstants.CameraOrigin.w = Min(FlashScale.X * 2.0f, 1.0f);
+		PushConstants.CameraRight.w = FlashFog.X;
+		PushConstants.CameraUp.w = FlashFog.Y;
+		PushConstants.CameraForward.w = FlashFog.Z;
+
+		PushConstants.Disable = DisableBits;
 		PushConstants.Counts[0] = FrameIndex++;
 		PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
 		PushConstants.Counts[2] = (uint32_t)Max(Bounces, 1);
@@ -1070,6 +1090,83 @@ void UPathTracerRenderDevice::Flush(UBOOL AllowPrecache)
 UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 {
 	guard(UPathTracerRenderDevice::Exec);
+
+	// Diagnostic switches for finding what a frame's time goes on, flipped
+	// live from the console while watching the frame rate. Each turns one
+	// part of the trace off; whichever gives the time back is the cost.
+	if (ParseCommand(&Cmd, TEXT("PT")))
+	{
+		// The nearest lights that are not plain steady ones, relative to where
+		// the player is looking, so they can be walked to without knowing
+		// which way the level's axes run.
+		if (ParseCommand(&Cmd, TEXT("LIGHTS")))
+		{
+			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
+			ULevel* level = player ? player->XLevel : nullptr;
+			if (!level)
+				return 1;
+			static const TCHAR* types[] = { TEXT("none"), TEXT("steady"), TEXT("pulse"), TEXT("blink"), TEXT("flicker"),
+				TEXT("strobe"), TEXT("backdrop"), TEXT("subtlepulse"), TEXT("paletteonce"), TEXT("paletteloop") };
+			const FCoords view = GMath.UnitCoords / player->ViewRotation;
+			std::vector<std::pair<float, AActor*>> found;
+			for (INT i = 0; i < level->Actors.Num(); i++)
+			{
+				AActor* a = level->Actors(i);
+				if (!a || a->LightType == LT_None || a->LightBrightness == 0)
+					continue;
+				if (a->LightType == LT_Steady && a->LightEffect != LE_Spotlight && a->LightEffect != LE_StaticSpot &&
+					a->LightEffect != LE_NonIncidence && a->LightEffect != LE_Cylinder)
+					continue;
+				found.push_back({ (a->Location - player->Location).Size(), a });
+			}
+			std::sort(found.begin(), found.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+			Ar.Logf(TEXT("PT: %d special lights, nearest:"), (int)found.size());
+			for (size_t n = 0; n < found.size() && n < 8; n++)
+			{
+				AActor* a = found[n].second;
+				const FVector d = a->Location - player->Location;
+				const float ahead = d | view.XAxis, right = d | view.YAxis;
+				Ar.Logf(TEXT("  %s %s%s cone %d: %.0f %s, %.0f %s, %.0f %s"),
+					a->GetName(), a->LightType < 10 ? types[a->LightType] : TEXT("?"),
+					(a->LightEffect == LE_Spotlight || a->LightEffect == LE_StaticSpot) ? TEXT(" spot") : TEXT(""),
+					(int)a->LightCone,
+					std::fabs(ahead), ahead >= 0 ? TEXT("ahead") : TEXT("behind"),
+					std::fabs(right), right >= 0 ? TEXT("right") : TEXT("left"),
+					std::fabs(d.Z), d.Z >= 0 ? TEXT("up") : TEXT("down"));
+			}
+			return 1;
+		}
+
+		struct Switch { const TCHAR* Name; uint32_t Bit; };
+		static const Switch switches[] = {
+			{ TEXT("NOLIGHTS"), 1u }, { TEXT("NOSHADOWS"), 2u }, { TEXT("NOSKY"), 4u }, { TEXT("OPAQUE"), 8u }, { TEXT("HIGHLIGHT"), 16u },
+		};
+		bool handled = false;
+		for (const Switch& s : switches)
+		{
+			if (ParseCommand(&Cmd, s.Name))
+			{
+				DisableBits ^= s.Bit;
+				handled = true;
+			}
+		}
+		if (ParseCommand(&Cmd, TEXT("BOUNCES")))
+		{
+			Bounces = Max(appAtoi(Cmd), 1);
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("RESET")))
+		{
+			DisableBits = 0;
+			handled = true;
+		}
+		AccumulatedFrames = 0;
+		Ar.Logf(TEXT("PT: lights %s, shadows %s, sky %s, per-triangle checks %s, bounces %d%s"),
+			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
+			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
+			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | OPAQUE | BOUNCES n | RESET)"));
+		return 1;
+	}
 
 	if (ParseCommand(&Cmd, TEXT("GetRes")))
 	{

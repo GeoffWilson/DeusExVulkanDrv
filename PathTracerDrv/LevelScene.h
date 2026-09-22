@@ -33,6 +33,13 @@ struct SceneLight
 {
 	vec4 PositionRadius;
 	vec4 ColorBrightness;
+	// xyz which way a spotlight points; w the cosine of its cone's edge, or
+	// -1 for a light that shines every way.
+	vec4 DirectionCone;
+	// x no incidence falloff, y distance measured horizontally (a cylinder),
+	// z brightness changes from frame to frame, w zero for a disco light and
+	// -1 for any other.
+	vec4 Flags;
 };
 
 // Triangles that share a bottom level acceleration structure.
@@ -87,6 +94,9 @@ public:
 	bool IsEmpty() const { return Geometries.empty(); }
 
 	std::vector<SceneGeometry> Geometries;
+	// How many of the first geometries are the level itself: the opaque part
+	// and the part whose surfaces the shader has to judge.
+	int StaticGeometries = 0;
 	std::vector<SceneLight> Lights;
 
 	// Rebuilt each frame. The first entry is always the static world.
@@ -177,6 +187,11 @@ public:
 	// One means a character is built once, exactly like a prop - which is the
 	// only structural difference between the two, and props render.
 	float LightScale = 1.0f;
+	// Diagnostic: paint animated and specially shaped lights in bright,
+	// obvious colours so they can be found.
+	bool HighlightSpecialLights = false;
+	bool StrobeOff = false;
+	FLOAT LastStrobeTime = -1.0f;
 
 	// Diagnostic: give characters a prop's geometry instead of their own.
 	// Whose eyes this is being traced from. Set each frame from the scene node's

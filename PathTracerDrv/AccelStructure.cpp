@@ -221,6 +221,159 @@ void AccelStructure::SyncGeometry(const LevelScene& scene)
 		LightBuffer->Unmap();
 	}
 
+	WriteLightGrid(scene);
+
+	unguard;
+}
+
+// A uniform grid over everywhere a light can reach, each cell listing the
+// lights whose reach touches it.
+//
+// Every shaded point used to weigh every light in the level. Liberty Island
+// has 126, most of them nowhere near any given point, and that loop - not the
+// shadow rays, not the geometry - was nearly the whole frame: with lighting
+// switched off the frame rate went from 56 to the cap.
+//
+// Laid out as one array of words: the grid's origin and cell size as floats,
+// its dimensions, then a start and count per cell, then the light indices the
+// starts point into.
+void AccelStructure::WriteLightGrid(const LevelScene& scene)
+{
+	guard(AccelStructure::WriteLightGrid);
+
+	const size_t lightCount = scene.Lights.size();
+	auto reachOf = [&](size_t i) { return std::abs(scene.Lights[i].PositionRadius.w); };
+
+	// The box around every light's reach.
+	vec3 lo(0.0f), hi(0.0f);
+	for (size_t i = 0; i < lightCount; i++)
+	{
+		const vec4& p = scene.Lights[i].PositionRadius;
+		const float r = reachOf(i);
+		const vec3 a(p.x - r, p.y - r, p.z - r), b(p.x + r, p.y + r, p.z + r);
+		if (i == 0) { lo = a; hi = b; }
+		else
+		{
+			lo = vec3(std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z));
+			hi = vec3(std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z));
+		}
+	}
+
+	// Cells sized so the grid holds a few tens of thousands at most, and no
+	// smaller than a room.
+	const vec3 extent = hi - lo;
+	const float volume = std::max(extent.x, 1.0f) * std::max(extent.y, 1.0f) * std::max(extent.z, 1.0f);
+	const float cellSize = std::max(256.0f, std::cbrt(volume / 32768.0f));
+	uint32_t dims[3];
+	for (int a = 0; a < 3; a++)
+		dims[a] = lightCount ? (uint32_t)std::min(64.0f, std::max(1.0f, std::ceil(extent[a] / cellSize))) : 0u;
+	const uint32_t cells = dims[0] * dims[1] * dims[2];
+
+	auto cellRange = [&](float centre, float r, int axis, int& first, int& last)
+	{
+		first = std::max(0, (int)std::floor((centre - r - lo[axis]) / cellSize));
+		last = std::min((int)dims[axis] - 1, (int)std::floor((centre + r - lo[axis]) / cellSize));
+	};
+
+	// Does this light's reach touch that cell? A sphere against a box, or for
+	// a cylinder light - whose reach is measured across the floor only - a
+	// circle against the box's footprint.
+	auto touches = [&](size_t i, int x, int y, int z)
+	{
+		const vec4& p = scene.Lights[i].PositionRadius;
+		const float r = reachOf(i);
+		const bool cylinder = scene.Lights[i].Flags.y > 0.5f;
+		float d2 = 0.0f;
+		const float centre[3] = { p.x, p.y, p.z };
+		const int cell[3] = { x, y, z };
+		for (int a = 0; a < (cylinder ? 2 : 3); a++)
+		{
+			const float c0 = lo[a] + cell[a] * cellSize, c1 = c0 + cellSize;
+			const float d = centre[a] < c0 ? c0 - centre[a] : (centre[a] > c1 ? centre[a] - c1 : 0.0f);
+			d2 += d * d;
+		}
+		return d2 < r * r;
+	};
+
+	// Two passes: count, then fill behind a running total.
+	const uint32_t header = 8;
+	std::vector<uint32_t> counts(cells, 0u);
+	auto forEachCell = [&](size_t i, auto&& fn)
+	{
+		const vec4& p = scene.Lights[i].PositionRadius;
+		const float r = reachOf(i);
+		const bool cylinder = scene.Lights[i].Flags.y > 0.5f;
+		int x0, x1, y0, y1, z0, z1;
+		cellRange(p.x, r, 0, x0, x1);
+		cellRange(p.y, r, 1, y0, y1);
+		if (cylinder) { z0 = 0; z1 = (int)dims[2] - 1; }
+		else cellRange(p.z, r, 2, z0, z1);
+		for (int z = z0; z <= z1; z++)
+			for (int y = y0; y <= y1; y++)
+				for (int x = x0; x <= x1; x++)
+					if (touches(i, x, y, z))
+						fn((uint32_t)((z * (int)dims[1] + y) * (int)dims[0] + x));
+	};
+	for (size_t i = 0; i < lightCount; i++)
+		forEachCell(i, [&](uint32_t c) { counts[c]++; });
+
+	uint32_t total = 0, busiest = 0;
+	for (uint32_t c : counts)
+	{
+		total += c;
+		busiest = std::max(busiest, c);
+	}
+	if (cells != LoggedGridCells)
+	{
+		LoggedGridCells = cells;
+		debugf(TEXT("PathTracer light grid: %d lights, %dx%dx%d cells of %.0f, %d entries, busiest cell %d, average %.1f"),
+			(int)lightCount, (int)dims[0], (int)dims[1], (int)dims[2], cellSize, (int)total, (int)busiest,
+			cells ? total / (float)cells : 0.0f);
+	}
+
+	LightGrid.assign(header + (size_t)cells * 2 + total, 0u);
+	auto floatBits = [](float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return u; };
+	LightGrid[0] = floatBits(lo.x);
+	LightGrid[1] = floatBits(lo.y);
+	LightGrid[2] = floatBits(lo.z);
+	LightGrid[3] = floatBits(cellSize);
+	LightGrid[4] = dims[0];
+	LightGrid[5] = dims[1];
+	LightGrid[6] = dims[2];
+
+	uint32_t next = header + cells * 2;
+	for (uint32_t c = 0; c < cells; c++)
+	{
+		LightGrid[header + c * 2] = next;
+		LightGrid[header + c * 2 + 1] = 0;
+		next += counts[c];
+	}
+	for (size_t i = 0; i < lightCount; i++)
+	{
+		forEachCell(i, [&](uint32_t c)
+		{
+			uint32_t& filled = LightGrid[header + c * 2 + 1];
+			LightGrid[LightGrid[header + c * 2] + filled] = (uint32_t)i;
+			filled++;
+		});
+	}
+
+	if (!LightGridBuffer || LightGrid.size() > LightGridCapacity)
+	{
+		LightGridCapacity = std::max<size_t>(LightGrid.size() * 2, 4096);
+		LightGridBuffer = BufferBuilder()
+			.Size(LightGridCapacity * sizeof(uint32_t))
+			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+			.MinAlignment(256)
+			.DebugName("PathTracerLightGrid")
+			.Create(renderer->GetDevice());
+		attributesChanged = true;
+	}
+
+	void* mapped = LightGridBuffer->Map(0, LightGrid.size() * sizeof(uint32_t));
+	memcpy(mapped, LightGrid.data(), LightGrid.size() * sizeof(uint32_t));
+	LightGridBuffer->Unmap();
+
 	unguard;
 }
 
@@ -317,7 +470,7 @@ void AccelStructure::BuildTopLevel(const LevelScene& scene, VulkanCommandBuffer*
 		// The custom index is how the trace shader finds this instance's
 		// shading data: it is the offset of its geometry's attributes.
 		dst.instanceCustomIndex = Bottom[src.GeometryIndex].AttributeBase;
-		dst.mask = (HideStatic && src.GeometryIndex == 0) ? 0x00 : 0xFF;
+		dst.mask = (HideStatic && src.GeometryIndex < scene.StaticGeometries) ? 0x00 : 0xFF;
 		dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 		dst.accelerationStructureReference = Bottom[src.GeometryIndex].Structure->GetDeviceAddress();
 	}

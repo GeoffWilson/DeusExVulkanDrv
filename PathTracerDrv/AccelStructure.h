@@ -41,6 +41,7 @@ public:
 	VulkanAccelerationStructure* GetTopLevel() const { return TopLevel.get(); }
 	VulkanBuffer* GetAttributeBuffer() const { return AttributeBuffer.get(); }
 	VulkanBuffer* GetLightBuffer() const { return LightBuffer.get(); }
+	VulkanBuffer* GetLightGridBuffer() const { return LightGridBuffer.get(); }
 	// One entry per instance, indexed in the shader by the intersection's
 	// instance id. Carries what varies by placement rather than by shape.
 	VulkanBuffer* GetInstanceDataBuffer() const { return InstanceDataBuffer.get(); }
@@ -95,6 +96,14 @@ private:
 	size_t TopCapacity = 0;
 	int Lights = 0;
 	size_t LightCapacity = 0;
+
+	// Which lights can reach which part of the level, so a shaded point only
+	// considers those. Rebuilt with the light list every frame.
+	void WriteLightGrid(const LevelScene& scene);
+	std::unique_ptr<VulkanBuffer> LightGridBuffer;
+	size_t LightGridCapacity = 0;
+	std::vector<uint32_t> LightGrid;
+	uint32_t LoggedGridCells = 0;
 	size_t AttributeCapacity = 0;
 	bool haveDynamic = false;
 	bool attributesChanged = false;

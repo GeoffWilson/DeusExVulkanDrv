@@ -33,6 +33,8 @@ std::string Shaders::Trace()
 		{
 			vec4 PositionRadius;
 			vec4 ColorBrightness;
+			vec4 DirectionCone;   // xyz spot direction, w cosine of its edge or -1
+			vec4 Flags;           // x no incidence, y cylinder, z brightness changes, w 0 disco or -1
 		};
 
 		layout(binding = 3, std430) readonly buffer Attributes { TriangleAttributes tris[]; };
@@ -40,6 +42,8 @@ std::string Shaders::Trace()
 		// Per instance, indexed by the intersection's instance id: what varies
 		// by where a shape is rather than by what it is.
 		layout(binding = 5, std430) readonly buffer InstanceData { vec4 instanceAmbient[]; };
+		// Which lights reach which cell of the level: see WriteLightGrid.
+		layout(binding = 8, std430) readonly buffer LightGrid { uint lightGrid[]; };
 		// Sized to match the layout rather than left open: an unsized array needs
 		// the runtime descriptor array capability, and a device without it would
 		// fail to create the pipeline at all rather than simply not texture.
@@ -56,7 +60,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint PadB;
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -200,12 +204,17 @@ std::string Shaders::Trace()
 		// The pixel's own surface has not changed, so nothing else would tell
 		// the accumulation that the light on it has.
 		bool shadowedByMover = false;
+		// Set when the light sampled is one whose brightness is changing -
+		// pulsing, blinking, flickering. The same short history applies.
+		bool litByChangingLight = false;
 
 		bool occluded(vec3 origin, vec3 dir, float dist)
 		{
+			if ((Disable & 2u) != 0u)
+				return false;
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, topLevel,
-				gl_RayFlagsTerminateOnFirstHitEXT,
+				gl_RayFlagsTerminateOnFirstHitEXT | ((Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : 0u),
 				0xFF, origin, Params.z, dir, dist);
 			// A hole in a grate lets light through, so a candidate only counts
 			// as occluding once its texel is known to be there.
@@ -254,6 +263,8 @@ std::string Shaders::Trace()
 		// rest. A special light carries its radius negated.
 		vec3 directLight(vec3 position, vec3 normal, vec3 albedo, bool specialLit)
 		{
+			if ((Disable & 1u) != 0u)
+				return vec3(0.0);
 			uint count = Counts.y;
 			if (count == 0u)
 				return vec3(0.0);
@@ -265,8 +276,21 @@ std::string Shaders::Trace()
 			float chosenDistance = 0.0;
 			vec3 chosenValue = vec3(0.0);
 
-			for (uint i = 0u; i < count; i++)
+			// Only the lights listed for the cell this point is in. A point
+			// outside the grid is beyond every light's reach.
+			vec3 gridOrigin = uintBitsToFloat(uvec3(lightGrid[0], lightGrid[1], lightGrid[2]));
+			float cellSize = uintBitsToFloat(lightGrid[3]);
+			ivec3 dims = ivec3(lightGrid[4], lightGrid[5], lightGrid[6]);
+			ivec3 cell = ivec3(floor((position - gridOrigin) / cellSize));
+			if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, dims)))
+				return vec3(0.0);
+			uint cellIndex = uint((cell.z * dims.y + cell.y) * dims.x + cell.x);
+			uint listStart = lightGrid[8u + cellIndex * 2u];
+			uint listCount = lightGrid[9u + cellIndex * 2u];
+
+			for (uint k = 0u; k < listCount; k++)
 			{
+				uint i = lightGrid[listStart + k];
 				SceneLight light = lights[i];
 
 				bool lightSpecial = light.PositionRadius.w < 0.0;
@@ -276,13 +300,32 @@ std::string Shaders::Trace()
 				vec3 toLight = light.PositionRadius.xyz - position;
 				float distance = length(toLight);
 				float radius = abs(light.PositionRadius.w);
-				if (distance >= radius || distance <= 0.0001)
+				// A cylinder light's reach is measured across the floor, not
+				// up and down.
+				float reach = light.Flags.y > 0.5 ? length(toLight.xy) : distance;
+				if (reach >= radius || distance <= 0.0001)
 					continue;
 
 				vec3 dir = toLight / distance;
 				float cosTheta = dot(normal, dir);
 				if (cosTheta <= 0.0)
 					continue;
+				// Non incidence: as bright on a surface edge on as face on.
+				if (light.Flags.x > 0.5)
+					cosTheta = 1.0;
+
+				// A spotlight, bright along its axis and fading to nothing at
+				// the cone's edge, with the engine's squared falloff.
+				float spot = 1.0;
+				if (light.DirectionCone.w >= 0.0)
+				{
+					float along = dot(-dir, light.DirectionCone.xyz);
+					float edge = light.DirectionCone.w;
+					if (along <= edge)
+						continue;
+					float f = (along - edge) / max(1.0 - edge, 0.0001);
+					spot = f * f;
+				}
 
 				// Linear to zero at the radius. The comment here used to say
 				// linear and then square it, which is the curve the baked
@@ -291,9 +334,34 @@ std::string Shaders::Trace()
 				// range: the player's light augmentation has a radius of only
 				// 100 units, so at one metre it had already fallen to a quarter
 				// and at two metres to nothing.
-				float falloff = 1.0 - distance / radius;
+				// Disco, as Render.dll does it: two sets of eleven bands, one
+				// around the light and one down from it, both drifting with
+				// the clock at five radians a second - which is why the
+				// patches travel up and down as well as round. A point is lit
+				// where it falls between bands on both, and close to the
+				// light's vertical axis the pattern fades out.
+				float disco = 1.0;
+				if (light.Flags.w >= 0.0)
+				{
+					vec3 v = -dir;
+					float across2 = v.x * v.x + v.y * v.y;
+					float t = Time * 5.0;
+					float a = 0.5 + 0.5 * cos(11.0 * atan(v.x, v.y) + t);
+					float b = 0.5 + 0.5 * cos(11.0 * atan(sqrt(across2), v.z) + t);
+					float f = a + b - a * b;
+					// The engine measures this in world units; dir here is a
+					// unit vector, so the distance comes back in.
+					float nearAxis = across2 * distance * distance * 5.0e-5;
+					if (nearAxis < 1.0)
+						f *= nearAxis;
+					disco = 1.0 - f;
+					if (disco <= 0.0)
+						continue;
+				}
 
-				vec3 value = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * cosTheta);
+				float falloff = 1.0 - reach / radius;
+
+				vec3 value = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * cosTheta * spot * disco);
 				float weight = dot(value, vec3(0.2126, 0.7152, 0.0722));
 				if (weight <= 0.0)
 					continue;
@@ -314,6 +382,9 @@ std::string Shaders::Trace()
 
 			if (chosen < 0 || chosenWeight <= 0.0)
 				return vec3(0.0);
+
+			if (lights[chosen].Flags.z > 0.5)
+				litByChangingLight = true;
 
 			if (occluded(position, chosenDir, chosenDistance - Params.z * 2.0))
 				return vec3(0.0);
@@ -380,7 +451,7 @@ std::string Shaders::Trace()
 			for (uint bounce = 0u; bounce < bounces; bounce++)
 			{
 				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsNoneEXT, 0xFF, origin, rayMin, direction, 100000.0);
+				rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, 0xFF, origin, rayMin, direction, 100000.0);
 				while (rayQueryProceedEXT(rq))
 				{
 					// Only geometry holding masked or translucent art is
@@ -460,7 +531,7 @@ std::string Shaders::Trace()
 				// zone behind this one, and the stand-in sky is all there is.
 				if (kind > 4.5)
 				{
-					if (SkyOrigin.w > 0.5 && !inSky)
+					if (SkyOrigin.w > 0.5 && !inSky && (Disable & 4u) == 0u)
 					{
 						inSky = true;
 						origin = SkyOrigin.xyz;
@@ -616,7 +687,7 @@ std::string Shaders::Trace()
 				}
 				radiance += throughput * directLight(position, normal, attr.Albedo.rgb, attr.Ambient.w > 0.5);
 				if (bounce == 0u)
-					primaryMoverShadow = shadowedByMover;
+					primaryMoverShadow = shadowedByMover || litByChangingLight;
 
 				// The zone's ambient. Level surfaces carry their own, because a
 				// zone is a property of the surface; an instanced shape takes it
@@ -729,6 +800,14 @@ std::string Shaders::Trace()
 			vec3 mapped = result * Params.x;
 			mapped = mapped / (mapped + vec3(1.0));
 			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
+
+			// The engine's screen flash - taking damage, being under water -
+			// carried in the camera vectors' spare w. The same blend the other
+			// devices draw it with, in display terms and after the history, so
+			// a flash does not linger in the accumulation: the picture scaled,
+			// then the flash colour added.
+			vec3 flashFog = vec3(CameraRight.w, CameraUp.w, CameraForward.w);
+			mapped = flashFog + mapped * CameraOrigin.w;
 
 			imageStore(outImage, pixel, vec4(mapped, 1.0));
 		}
