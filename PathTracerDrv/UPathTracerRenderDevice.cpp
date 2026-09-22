@@ -2,6 +2,12 @@
 #include "UPathTracerRenderDevice.h"
 #include "Shaders.h"
 #include <stdexcept>
+#include <chrono>
+
+static double NowMs()
+{
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 IMPLEMENT_CLASS(UPathTracerRenderDevice);
 
@@ -40,6 +46,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	DebugMode = 0;
 	LightScale = 100;
 	UseVSync = 1;
+	LogTimings = 0;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -50,6 +57,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("DebugMode"), RF_Public) UIntProperty(CPP_PROPERTY(DebugMode), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LightScale"), RF_Public) UIntProperty(CPP_PROPERTY(LightScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("LogTimings"), RF_Public) UBoolProperty(CPP_PROPERTY(LogTimings), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -724,8 +732,12 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	// a bottom level structure the first time they are seen.
 	const size_t geometriesBefore = Scene.Geometries.size();
 	Scene.LightScale = Max(LightScale, 1) / 100.0f;
+	const double collectStart = NowMs();
 	Scene.CollectDynamic(level);
+	const double syncStart = NowMs();
 	Accel->SyncGeometry(Scene);
+	Timings.Collect += syncStart - collectStart;
+	Timings.Sync += NowMs() - syncStart;
 
 	// Only when something new appeared, so this says what is being traced
 	// without filling the log every frame.
@@ -831,6 +843,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	if (!Blit || !Accel || !AccumImage)
 		return;
 
+	const double frameStart = NowMs();
+
 	try
 	{
 		// Accumulate only while the view is still. Any movement and the samples
@@ -887,8 +901,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// Textures that generate themselves get a chance to advance before the
 		// trace reads them, recorded into this frame's command buffer rather
 		// than submitted one at a time.
+		const double refreshStart = NowMs();
 		if (Textures && Viewport && Viewport->Actor && Viewport->Actor->Level)
 			Textures->RefreshRealtime(Viewport->Actor->Level->TimeSeconds, commands.get(), RealtimeStaging, Scene.FixedFrames);
+		Timings.Refresh += NowMs() - refreshStart;
 
 		// The top level structure is rebuilt every frame, because the movers and
 		// the actors have all moved since the last one.
@@ -896,7 +912,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		if (traceThisFrame)
 		{
 			Accel->HideStatic = (DebugMode == 1);
-				Accel->BuildTopLevel(Scene, commands.get());
+			const double topStart = NowMs();
+			Accel->BuildTopLevel(Scene, commands.get());
+			Timings.TopLevel += NowMs() - topStart;
 			traceThisFrame = Accel->IsReady();
 		}
 
@@ -964,8 +982,29 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		SwapChain->QueuePresent(imageIndex, RenderFinishedSemaphore.get());
 
 		VkFence handle = RenderFinishedFence->fence;
+		const double waitStart = NowMs();
 		vkWaitForFences(Device->device, 1, &handle, VK_TRUE, std::numeric_limits<uint64_t>::max());
+		Timings.Wait += NowMs() - waitStart;
 		vkResetFences(Device->device, 1, &handle);
+
+		// The scene gathering happens earlier, in SetSceneNode, so it is
+		// added to the frame's total rather than measured inside it.
+		Timings.Total += NowMs() - frameStart;
+		if (++Timings.Frames >= 300)
+		{
+			if (LogTimings && Timings.Logged < 100 && HaveCamera)
+			{
+				Timings.Logged++;
+				const double n = Timings.Frames;
+				debugf(TEXT("PathTracer ms/frame: collect %.2f sync %.2f refresh %.2f toplevel %.2f gpu-wait %.2f unlock %.2f | %d instances, %d textures, %d realtime staged, %d poses rebuilt"),
+					Timings.Collect / n, Timings.Sync / n, Timings.Refresh / n, Timings.TopLevel / n,
+					Timings.Wait / n, Timings.Total / n,
+					(int)Scene.Instances.size(), (int)Scene.Textures.size(), (int)RealtimeStaging.size(), Scene.MeshBuilds);
+			}
+			const int logged = Timings.Logged;
+			Timings = FrameTimings();
+			Timings.Logged = logged;
+		}
 
 		// The submission is done with them now.
 		RealtimeStaging.clear();

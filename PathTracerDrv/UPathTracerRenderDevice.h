@@ -111,6 +111,8 @@ public:
 	// brightnesses are faithful but conservative once traced rather than baked.
 	INT LightScale;
 	BITFIELD UseVSync;
+	// Log where each frame's time goes, averaged every few hundred frames.
+	BITFIELD LogTimings;
 
 private:
 	void CreateSwapChainResources();
@@ -186,6 +188,15 @@ private:
 	TracePushConstants LastCamera = {};
 	uint32_t AccumulatedFrames = 0;
 	size_t LastInstanceCount = 0;
+
+	// Where each frame's time goes, averaged and logged every few hundred
+	// frames when LogTimings is set.
+	struct FrameTimings
+	{
+		double Collect = 0, Sync = 0, Refresh = 0, TopLevel = 0, Wait = 0, Total = 0;
+		int Frames = 0;
+		int Logged = 0;
+	} Timings;
 	uint32_t FrameIndex = 0;
 	bool DescriptorsDirty = true;
 

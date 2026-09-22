@@ -139,6 +139,9 @@ private:
 
 	// One geometry per animated actor, rebuilt each frame at its exact pose.
 	std::unordered_map<AActor*, int> ActorGeometry;
+	// What each animated actor's shape was last built from, so an unchanged
+	// pose is not rebuilt.
+	std::unordered_map<AActor*, uint64_t> ActorPoseKeys;
 
 	// A ceiling on how many poses are kept. Each one is a bottom level
 	// structure, and a level with many characters could otherwise build them
@@ -192,6 +195,9 @@ public:
 	// The sky zone's viewpoint, if the level has one.
 	bool HasSky = false;
 	FVector SkyOrigin = FVector(0, 0, 0);
+
+	// How many animated shapes were rebuilt this frame.
+	int MeshBuilds = 0;
 	void AddViewModel();
 
 	// Every texture the scene references, in the order the shader's array binds

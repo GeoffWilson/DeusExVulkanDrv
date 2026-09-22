@@ -33,10 +33,38 @@ namespace
 	// it is left black, and a character shaded with it is invisible against a
 	// dark room, which is exactly how this looked. Fall back to averaging the
 	// palette, and to a plain grey if there is not one.
+	// Each texture's average, worked out once per level. It was being redone
+	// for every triangle of every animated character on every frame, and for a
+	// skin that means a pass over the whole palette each time - milliseconds a
+	// frame in a crowded level, for a colour that is only a fallback now that
+	// textures are sampled. Cleared with the scene, since a texture object can
+	// be freed and its address reused by the next level.
+	struct CachedAverage
+	{
+		bool Known = false;
+		vec3 Colour;
+	};
+	std::unordered_map<UTexture*, CachedAverage> AverageCache;
+
+	vec3 AverageColourUncached(UTexture* texture, vec3 fallback, bool& known);
+
 	vec3 AverageColour(UTexture* texture, vec3 fallback)
 	{
 		if (!texture)
 			return fallback;
+		auto it = AverageCache.find(texture);
+		if (it == AverageCache.end())
+		{
+			CachedAverage entry;
+			entry.Colour = AverageColourUncached(texture, fallback, entry.Known);
+			it = AverageCache.emplace(texture, entry).first;
+		}
+		return it->second.Known ? it->second.Colour : fallback;
+	}
+
+	vec3 AverageColourUncached(UTexture* texture, vec3 fallback, bool& known)
+	{
+		known = true;
 
 		// MipZero is the engine's cached average of the whole image, including
 		// the texels that masked art uses as its transparency key - which in
@@ -64,6 +92,7 @@ namespace
 				return SrgbToLinear(r / (255.0f * count), g / (255.0f * count), b / (255.0f * count));
 		}
 
+		known = false;
 		return fallback;
 	}
 
@@ -120,6 +149,8 @@ void LevelScene::Clear()
 	Instances.clear();
 	BrushGeometry.clear();
 	MeshGeometry.clear();
+	AverageCache.clear();
+	ActorPoseKeys.clear();
 	SpriteGeometry.clear();
 	FixedFrames.clear();
 	DecalGeometry = -1;
@@ -503,11 +534,42 @@ void LevelScene::AnimationPose(UMesh* mesh, FName sequence, FLOAT animFrame, int
 // never freed.
 int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind, const FCoords* toLocal)
 {
+	// Everything the shape depends on. Its placement is not among them: the
+	// shape is built in the actor's own space. When none of it has changed
+	// since the last frame - a character standing in a paused pose, or a
+	// decoration that has animation frames and is not playing any - the
+	// geometry is left as it is, which also spares uploading it and
+	// rebuilding its acceleration structure.
+	uint64_t key = 1469598103934665603ull;
+	auto mix = [&key](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+	auto bits = [](float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return (uint64_t)u; };
+	mix((uint64_t)(uintptr_t)mesh);
+	mix((uint64_t)frameA);
+	mix((uint64_t)frameB);
+	mix(bits(alpha));
+	mix(bits(styleKind));
+	mix((uint64_t)actor->AnimSequence.GetIndex());
+	mix(bits(actor->AnimFrame));
+	for (int i = 0; i < 4; i++)
+	{
+		mix((uint64_t)actor->BlendAnimSequence[i].GetIndex());
+		mix(bits(actor->BlendAnimFrame[i]));
+	}
+	for (int i = 0; i < 8; i++)
+		mix((uint64_t)(uintptr_t)skins[i]);
+	mix((uint64_t)(uintptr_t)actor->Texture);
+	mix(actor->bUnlit ? 1u : 0u);
+	mix(actor->bMeshEnviroMap ? 1u : 0u);
+	mix(toLocal ? 1u : 0u);
+
 	auto it = ActorGeometry.find(actor);
 	int index;
 	if (it != ActorGeometry.end())
 	{
 		index = it->second;
+		auto previous = ActorPoseKeys.find(actor);
+		if (previous != ActorPoseKeys.end() && previous->second == key && !Geometries[index].Positions.empty())
+			return index;
 	}
 	else
 	{
@@ -520,7 +582,13 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 		GeometryAdded = true;
 	}
 
-	return GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind, actor, toLocal, actor);
+	MeshBuilds++;
+	const int built = GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind, actor, toLocal, actor);
+	if (built >= 0)
+		ActorPoseKeys[actor] = key;
+	else
+		ActorPoseKeys.erase(actor);
+	return built;
 }
 
 // A sprite's shape: a unit square facing +Z, centred on the origin, with the
@@ -1263,6 +1331,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 	Instances.clear();
 	Lights.clear();
 	CurrentPoses.clear();
+	MeshBuilds = 0;
 
 	// Where the sky is seen from: the sky zone of whichever zone the viewer
 	// is in, or failing that the level's only one. The engine draws it from
