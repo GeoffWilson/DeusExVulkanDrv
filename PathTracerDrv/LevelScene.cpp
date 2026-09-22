@@ -704,6 +704,20 @@ bool LevelScene::PlaceSprite(AActor* actor, int& geometryIndex, float transform[
 	return true;
 }
 
+// The game's blob shadows: a decal it re-attaches under each character every
+// tick. The trace casts real shadows from the characters themselves, so these
+// only darken the ground a second time. Matched by class name, the class or
+// any it derives from, since the game declares it outside the engine.
+static bool IsBlobShadow(AActor* actor)
+{
+	for (UClass* c = actor ? actor->GetClass() : nullptr; c; c = c->GetSuperClass())
+	{
+		if (appStrstr(c->GetName(), TEXT("Shadow")))
+			return true;
+	}
+	return false;
+}
+
 void LevelScene::CollectDecals(ULevel* level)
 {
 	UModel* model = level ? level->Model : nullptr;
@@ -719,8 +733,20 @@ void LevelScene::CollectDecals(ULevel* level)
 		const FBspSurf& surf = model->Surfs(s);
 		for (INT d = 0; d < surf.Decals.Num(); d++)
 		{
-			signature = (signature ^ (uint64_t)(uintptr_t)surf.Decals(d).Actor) * 1099511628211ull;
+			const FDecal& decal = surf.Decals(d);
+			if (IsBlobShadow(decal.Actor))
+				continue;
+			signature = (signature ^ (uint64_t)(uintptr_t)decal.Actor) * 1099511628211ull;
 			signature = (signature ^ (uint64_t)s) * 1099511628211ull;
+			// Where it is, as well as which it is. A character's blob shadow
+			// is one decal re-attached under them every tick: same actor,
+			// usually the same floor, only its corners move. Leaving those out
+			// held the shadow in place until it crossed onto another surface,
+			// then jumped it to catch up.
+			uint32_t corners[12];
+			memcpy(corners, decal.Vertices, sizeof(corners));
+			for (uint32_t c : corners)
+				signature = (signature ^ c) * 1099511628211ull;
 			count++;
 		}
 	}
@@ -772,6 +798,8 @@ void LevelScene::CollectDecals(ULevel* level)
 				const FDecal& decal = surf.Decals(d);
 				ADecal* actor = decal.Actor;
 				if (!actor || actor->bHidden || !actor->Texture || actor->Style == STY_None)
+					continue;
+				if (IsBlobShadow(actor))
 					continue;
 
 				UTexture* texture = actor->Texture;
@@ -898,6 +926,26 @@ static UTexture* EnvironmentMapFor(AActor* actor)
 	if (actor->Level && actor->Level->EnvironmentMap)
 		return actor->Level->EnvironmentMap;
 	return nullptr;
+}
+
+// World space back into an actor's own, from the same placement its instance
+// gets, so the engine can hand back its pose in the space the instance places.
+// The columns are the rotation's axes times the draw scale, and dividing each
+// by its squared length gives the rows of the inverse.
+static FCoords ActorToLocal(AActor* actor)
+{
+	const float drawScale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
+	float placement[12];
+	MakeTransform(actor->Location, actor->Rotation, FVector(drawScale, drawScale, drawScale), actor->PrePivot, placement);
+	FCoords toLocal;
+	toLocal.Origin = FVector(placement[3], placement[7], placement[11]);
+	FVector* rows[3] = { &toLocal.XAxis, &toLocal.YAxis, &toLocal.ZAxis };
+	for (int c = 0; c < 3; c++)
+	{
+		const FVector column(placement[0 * 4 + c], placement[1 * 4 + c], placement[2 * 4 + c]);
+		*rows[c] = column / column.SizeSquared();
+	}
+	return toLocal;
 }
 
 // Translate an actor's rendering style into the surface kinds this tracer uses.
@@ -1468,21 +1516,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 			// Something that animates is rebuilt each frame at its exact pose;
 			// anything with a single frame is a shape that can be shared.
 			const float styleKind = KindFromStyle(actor->Style);
-			// The same placement the instance gets below, inverted, so the engine
-			// can hand back its pose in the instance's own space. The columns are
-			// the rotation's axes times the draw scale, and dividing each by its
-			// squared length gives the rows of the inverse.
-			const float drawScale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
-			float placement[12];
-			MakeTransform(actor->Location, actor->Rotation, FVector(drawScale, drawScale, drawScale), actor->PrePivot, placement);
-			FCoords toLocal;
-			toLocal.Origin = FVector(placement[3], placement[7], placement[11]);
-			FVector* rows[3] = { &toLocal.XAxis, &toLocal.YAxis, &toLocal.ZAxis };
-			for (int c = 0; c < 3; c++)
-			{
-				const FVector column(placement[0 * 4 + c], placement[1 * 4 + c], placement[2 * 4 + c]);
-				*rows[c] = column / column.SizeSquared();
-			}
+			const FCoords toLocal = ActorToLocal(actor);
 
 			if (actor->Mesh->AnimFrames > 1)
 				geometryIndex = AnimatedGeometryFor(actor, actor->Mesh, frameA, frameB, alpha, skins, styleKind, &toLocal);
@@ -1611,9 +1645,15 @@ void LevelScene::AddViewModel()
 	float alpha = 0.0f;
 	AnimationPose(mesh, item->AnimSequence, item->AnimFrame, frameA, frameB, alpha);
 
+	// The pose from the engine, as for characters: it blends into a new
+	// sequence rather than snapping to it, which reading the keyframes here
+	// could not do. Wherever the engine last put the weapon, the pose comes
+	// back in the weapon's own space, and the placement below puts it in
+	// front of the camera as before.
 	const float styleKind = KindFromStyle(item->Style);
+	const FCoords toLocal = ActorToLocal(item);
 	const int geometryIndex = (mesh->AnimFrames > 1)
-		? AnimatedGeometryFor(item, mesh, frameA, frameB, alpha, skins, styleKind)
+		? AnimatedGeometryFor(item, mesh, frameA, frameB, alpha, skins, styleKind, &toLocal)
 		: GeometryForMesh(mesh, frameA, frameB, 0.0f, skins, -1, styleKind, nullptr, nullptr, item);
 
 	// PlayerViewOffset is in the view's own terms: X ahead, Y to the right,

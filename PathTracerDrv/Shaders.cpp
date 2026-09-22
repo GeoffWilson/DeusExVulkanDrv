@@ -196,6 +196,11 @@ std::string Shaders::Trace()
 
 		// Is anything between two points? Terminate on the first hit rather than
 		// looking for the closest one: a shadow ray only asks whether, not what.
+		// Set when a shadow ray was blocked by something that moved this frame.
+		// The pixel's own surface has not changed, so nothing else would tell
+		// the accumulation that the light on it has.
+		bool shadowedByMover = false;
+
 		bool occluded(vec3 origin, vec3 dir, float dist)
 		{
 			rayQueryEXT rq;
@@ -218,7 +223,12 @@ std::string Shaders::Trace()
 						rayQueryConfirmIntersectionEXT(rq);
 				}
 			}
-			return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+				return false;
+			int blocker = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+			if (blocker > 0 && instanceAmbient[blocker].w > 0.5)
+				shadowedByMover = true;
+			return true;
 		}
 
 		// The engine's falloff, which is what its own lightmaps were baked with:
@@ -361,6 +371,8 @@ std::string Shaders::Trace()
 			// Set when the view ray passed through something that changed this
 			// frame - a new decal, say - on its way to what it finally hit.
 			bool primaryChanged = false;
+			// The first surface's light was cut by something that moved.
+			bool primaryMoverShadow = false;
 			bool inSky = false;
 			float primaryDistance = 100000.0;
 
@@ -567,21 +579,17 @@ std::string Shaders::Trace()
 
 				if (Params.w > 0.5)
 				{
-					// Two different questions, told apart by colour.
-					//   magenta: an instanced shape was hit and carried its
-					//            attribute offset, so everything works.
-					//   green:   an instanced shape was hit but its custom index
-					//            arrived as zero, so the shading data is being
-					//            read from the wrong place.
+					// Which instances the history is being thrown away for.
+					//   green:   an instance flagged as moved or changed shape
+					//            this frame - a door while it swings, a
+					//            character mid animation, every sprite.
+					//   magenta: an instance that is holding still.
 					//   dim:     the static world, which is instance zero.
 					int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
 					if (instanceId > 0)
 					{
-						// Green for a character, magenta for anything else, so
-						// "people are not traced" can be told from "people are
-						// traced and shaded black".
-						bool isCharacter = instanceAmbient[instanceId].w > 0.5;
-						radiance = (isCharacter ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 1.0)) * 4.0;
+						bool moved = instanceAmbient[instanceId].w > 0.5;
+						radiance = (moved ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 1.0)) * 4.0;
 						break;
 					}
 					radiance += throughput * attr.Albedo.rgb * 0.1;
@@ -607,6 +615,8 @@ std::string Shaders::Trace()
 					break;
 				}
 				radiance += throughput * directLight(position, normal, attr.Albedo.rgb, attr.Ambient.w > 0.5);
+				if (bounce == 0u)
+					primaryMoverShadow = shadowedByMover;
 
 				// The zone's ambient. Level surfaces carry their own, because a
 				// zone is a property of the surface; an instanced shape takes it
@@ -652,7 +662,19 @@ std::string Shaders::Trace()
 			vec4 stored = imageLoad(accumImage, pixel);
 			vec4 previousHit = imageLoad(historyImage, pixel);
 
-			float samples = stored.a;
+			// The alpha holds two things: the sample count below 4096, and above
+			// it how many more frames this pixel stays on a short history
+			// because a moving shadow crossed it. Kept for a while after, so
+			// the ground a shadow has just left catches up as fast as the
+			// ground it has just reached.
+			const float shadowUnit = 4096.0;
+			float recentShadow = floor(stored.a / shadowUnit);
+			float samples = stored.a - recentShadow * shadowUnit;
+			if (primaryMoverShadow)
+				recentShadow = 8.0;
+			else
+				recentShadow = max(recentShadow - 1.0, 0.0);
+
 			if (Counts.w == 0u)
 			{
 				// The device invalidated everything, typically a camera move.
@@ -686,12 +708,19 @@ std::string Shaders::Trace()
 					samples = 0.0;
 			}
 
+			// Under a moving shadow, averaged over a few frames rather than a
+			// few hundred: enough to settle the noise, short enough that the
+			// shadow keeps up with whoever is casting it instead of smearing
+			// out behind them.
+			if (recentShadow > 0.0)
+				samples = min(samples, 3.0);
+
 			vec3 result = radiance;
 			if (samples > 0.0)
 				result = mix(stored.rgb, radiance, 1.0 / (samples + 1.0));
 
-			samples = min(samples + 1.0, float(max(MaxSamples, 1u)));
-			imageStore(accumImage, pixel, vec4(result, samples));
+			samples = min(samples + 1.0, min(float(max(MaxSamples, 1u)), shadowUnit - 1.0));
+			imageStore(accumImage, pixel, vec4(result, samples + recentShadow * shadowUnit));
 			imageStore(historyImage, pixel, vec4(primaryPosition, primaryInstance));
 
 			// Tonemap and encode here rather than in a present pass: the result
