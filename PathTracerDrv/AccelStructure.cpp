@@ -459,6 +459,9 @@ void AccelStructure::WriteDynamicGeometry(const LevelScene& scene)
 	if (!haveDynamic)
 		return;
 
+	// Mapped once for the whole pass rather than once per geometry.
+	TriangleAttributes* mappedAttrs = nullptr;
+
 	const size_t count = std::min(Bottom.size(), scene.Geometries.size());
 	for (size_t i = 0; i < count; i++)
 	{
@@ -469,6 +472,10 @@ void AccelStructure::WriteDynamicGeometry(const LevelScene& scene)
 		BottomLevel& level = Bottom[i];
 		if (!level.Vertices || geometry.Positions.empty())
 			continue;
+		if (level.WrittenVersion == geometry.Version)
+			continue;
+		level.WrittenVersion = geometry.Version;
+		level.NeedsBuild = true;
 
 		// A pose that outgrows the buffer it was given: rare, and a rebuild of
 		// the structure is the honest answer rather than truncating it.
@@ -493,13 +500,16 @@ void AccelStructure::WriteDynamicGeometry(const LevelScene& scene)
 			memcpy(&AllAttributes[level.AttributeBase], geometry.Attributes.data(),
 				attributeCount * sizeof(TriangleAttributes));
 
-			auto* mappedAttrs = (TriangleAttributes*)AttributeBuffer->Map(
-				0, AttributeCapacity * sizeof(TriangleAttributes));
+			if (!mappedAttrs)
+				mappedAttrs = (TriangleAttributes*)AttributeBuffer->Map(
+					0, AttributeCapacity * sizeof(TriangleAttributes));
 			memcpy(mappedAttrs + level.AttributeBase, geometry.Attributes.data(),
 				attributeCount * sizeof(TriangleAttributes));
-			AttributeBuffer->Unmap();
 		}
 	}
+
+	if (mappedAttrs)
+		AttributeBuffer->Unmap();
 
 	unguard;
 }
@@ -523,6 +533,9 @@ void AccelStructure::RecordDynamicBuilds(const LevelScene& scene, VulkanCommandB
 		BottomLevel& level = Bottom[i];
 		if (!level.Structure || !level.Vertices || level.TriangleCount <= 0)
 			continue;
+		if (!level.NeedsBuild)
+			continue;
+		level.NeedsBuild = false;
 
 		VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 		geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;

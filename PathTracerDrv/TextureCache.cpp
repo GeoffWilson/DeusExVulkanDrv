@@ -233,20 +233,21 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 }
 
 
-CachedTexture* TextureCache::GetForScene(UTexture* texture)
+CachedTexture* TextureCache::GetForScene(UTexture* texture, bool masked)
 {
 	guard(TextureCache::GetForScene);
 
 	if (!texture)
 		return nullptr;
 
-	auto it = SceneTextures.find(texture);
+	const uint64_t key = ((uint64_t)(uintptr_t)texture << 1) | (masked ? 1u : 0u);
+	auto it = SceneTextures.find(key);
 	if (it != SceneTextures.end())
 		return it->second.get();
 
 	// Entered as null first so a texture that cannot be uploaded is not retried
 	// on every frame that references it.
-	SceneTextures[texture] = nullptr;
+	SceneTextures[key] = nullptr;
 
 	if (texture->Mips.Num() < 1)
 		return nullptr;
@@ -279,7 +280,7 @@ CachedTexture* TextureCache::GetForScene(UTexture* texture)
 	// Indexing the lazy array is what pulls it off disk if it is not resident.
 	mip.DataPtr = &mip.DataArray(0);
 
-	auto uploaded = Upload(info, (texture->PolyFlags & PF_Masked) != 0, false);
+	auto uploaded = Upload(info, masked, false);
 
 	CachedTexture* result = uploaded.get();
 	if (result)
@@ -294,9 +295,9 @@ CachedTexture* TextureCache::GetForScene(UTexture* texture)
 		result->Realtime = texture->bRealtime || texture->bParametric || texture->AnimNext != nullptr;
 		result->Width = mip.USize;
 		result->Height = mip.VSize;
-		result->Masked = (texture->PolyFlags & PF_Masked) != 0;
+		result->Masked = masked;
 	}
-	SceneTextures[texture] = std::move(uploaded);
+	SceneTextures[key] = std::move(uploaded);
 	return result;
 
 	unguard;

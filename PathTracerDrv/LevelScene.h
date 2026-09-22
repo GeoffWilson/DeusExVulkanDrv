@@ -45,6 +45,10 @@ struct SceneGeometry
 	// Rebuilt every frame, so its acceleration structure has to be refitted
 	// rather than built once.
 	bool Dynamic = false;
+	// Bumped whenever a dynamic geometry is rebuilt, so the device uploads and
+	// rebuilds only what changed. An animating character changes every frame;
+	// the decals change only when one is added or removed.
+	uint32_t Version = 1;
 	std::vector<vec3> Positions;
 	std::vector<TriangleAttributes> Attributes;
 };
@@ -106,6 +110,16 @@ private:
 	// showing it. Its size and facing come from the instance.
 	int GeometryForSprite(UTexture* texture, float kind);
 	bool PlaceSprite(AActor* actor, int& geometryIndex, float transform[12]);
+
+	// Decals - bullet holes, blood, scorch marks - which the engine attaches to
+	// level surfaces while the game runs, so a world built once at load never
+	// had them. Gathered into one geometry, rebuilt when the set changes.
+	void CollectDecals(ULevel* level);
+	int DecalGeometry = -1;
+	uint64_t DecalSignature = 0;
+	// Room reserved up front: a geometry's shading data cannot grow after it
+	// is first built.
+	static const int MaxDecals = 1024;
 	std::unordered_map<uint64_t, int> SpriteGeometry;
 
 	// Geometry index for a mover's brush, built on first sight.
@@ -114,7 +128,7 @@ private:
 	// The skins are part of the key: Deus Ex puts a character's appearance on
 	// the actor rather than the mesh, so two people sharing a mesh are only the
 	// same shape if they are also wearing the same thing.
-	int GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex = -1, float styleKind = 0.0f, AActor* owner = nullptr, const FCoords* toLocal = nullptr);
+	int GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex = -1, float styleKind = 0.0f, AActor* owner = nullptr, const FCoords* toLocal = nullptr, AActor* envSource = nullptr);
 
 	// One shot diagnostics, reset per level.
 	int MeshesLogged = 0;
@@ -131,7 +145,7 @@ private:
 	// without limit.
 	static const int MaxMeshGeometries = 2048;
 
-	std::unordered_map<UTexture*, int> TextureIndex;
+	std::unordered_map<uint64_t, int> TextureIndex;
 
 	// What each actor's placement was last frame, so that an instance which has
 	// actually moved can be told apart from one that merely looks different.
@@ -174,6 +188,10 @@ public:
 	FVector ViewRight = FVector(1, 0, 0);
 	FVector ViewDown = FVector(0, 1, 0);
 	FVector ViewForward = FVector(0, 0, 1);
+
+	// The sky zone's viewpoint, if the level has one.
+	bool HasSky = false;
+	FVector SkyOrigin = FVector(0, 0, 0);
 	void AddViewModel();
 
 	// Every texture the scene references, in the order the shader's array binds
@@ -182,13 +200,17 @@ public:
 	// rather than wrong.
 	static const int MaxTextures = 1024;
 	std::vector<UTexture*> Textures;
+	// Whether each entry is wanted with palette entry zero as a hole.
+	std::vector<bool> TextureMasked;
 	int MirroredCount() const { return MirroredSurfaces; }
 
 	// Textures that are shown as one fixed frame of their animation - a sprite
 	// that plays once picks its frame from how far through its life it is - so
 	// must not be advanced the way a looping animation is.
 	std::unordered_set<UTexture*> FixedFrames;
-	int TextureFor(UTexture* texture);
+	// Masked by the texture's own flags, or by the caller's when the polygon
+	// asks for it: the engine honours either.
+	int TextureFor(UTexture* texture, bool masked = false);
 
 private:
 };

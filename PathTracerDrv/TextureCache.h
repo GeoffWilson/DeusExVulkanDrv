@@ -44,7 +44,10 @@ public:
 	// rather than an FTextureInfo because the scene walks the level's own
 	// objects rather than being handed surfaces by the engine, and skips the
 	// per-texture descriptor set: the trace binds one array, not one set each.
-	CachedTexture* GetForScene(UTexture* texture);
+	// Masked says whether palette entry zero is a hole. The engine masks by the
+	// polygon's flags as well as the texture's, so one texture can be needed
+	// both ways.
+	CachedTexture* GetForScene(UTexture* texture, bool masked);
 
 	// A 1x1 white image, so that unused slots in the trace's texture array are
 	// still valid descriptors.
@@ -73,6 +76,6 @@ private:
 
 	// Keyed on the object itself: the scene refers to textures by pointer, and
 	// the same texture is wanted once however many surfaces use it.
-	std::unordered_map<UTexture*, std::unique_ptr<CachedTexture>> SceneTextures;
+	std::unordered_map<uint64_t, std::unique_ptr<CachedTexture>> SceneTextures;
 	std::unique_ptr<CachedTexture> WhitePixel;
 };

@@ -640,7 +640,7 @@ void UPathTracerRenderDevice::UpdateSceneTextures()
 	for (size_t i = BoundSceneTextures; i < wanted; i++)
 	{
 		UTexture* texture = Scene.Textures[i];
-		CachedTexture* cached = Textures->GetForScene(texture);
+		CachedTexture* cached = Textures->GetForScene(texture, Scene.TextureMasked[i]);
 		VulkanImageView* view = (cached && cached->View) ? cached->View.get() : white->View.get();
 
 		// Named, so a texture that comes out wrong on screen can be identified
@@ -854,6 +854,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		UpdateSceneTextures();
 		PushConstants.TextureCount = (uint32_t)BoundSceneTextures;
 		PushConstants.MaxSamples = (uint32_t)Max(MaxAccumulatedFrames, 1);
+		PushConstants.Time = (Viewport && Viewport->Actor && Viewport->Actor->Level)
+			? (float)fmod((double)Viewport->Actor->Level->TimeSeconds, 1000.0) : 0.0f;
+		PushConstants.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
 		PushConstants.Params = vec4(
 			0.2f + Exposure * (2.0f / 255.0f),
 			SkyIntensity * (2.0f / 255.0f),

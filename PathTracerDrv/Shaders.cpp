@@ -55,6 +55,9 @@ std::string Shaders::Trace()
 			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w debug mode
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
+			float Time;           // the level's clock, for panning textures
+			uint PadB;
+			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
 		// Does this point on the triangle actually exist? UE1 masked art keys
@@ -65,17 +68,37 @@ std::string Shaders::Trace()
 		// The triangle's own colour, textured where there is a texture to read.
 		// UE1 surface coordinates run well outside 0..1 - one texture tiles
 		// across a whole wall - which the sampler's repeat mode handles.
-		vec3 surfaceAlbedo(TriangleAttributes attr, vec2 bary)
+		// Where on its texture a hit lands.
+		//
+		// Normal.w marks an environment mapped surface - a camera lens, a pair
+		// of glasses - whose texture is a picture of surroundings looked up by
+		// the reflected view direction rather than painted on. The engine's own
+		// mapping: the world space reflection's X and Y, from -1..1 to 0..1.
+		vec2 surfaceUV(TriangleAttributes attr, vec2 bary, vec3 dir, vec3 worldNormal)
+		{
+			if (attr.Normal.w > 0.5)
+			{
+				vec3 r = reflect(normalize(dir), worldNormal);
+				return (r.xy + 1.0) * 0.5;
+			}
+
+			// Barycentrics from a ray query are the weights of the second and
+			// third vertices; the first takes up the remainder.
+			// Emission.xy is how fast an auto panning surface slides, in
+			// texture widths a second, and zero for everything else.
+			return attr.UV01.xy * (1.0 - bary.x - bary.y)
+			     + attr.UV01.zw * bary.x
+			     + attr.UV2Tex.xy * bary.y
+			     + attr.Emission.xy * Time;
+		}
+
+		vec3 surfaceAlbedo(TriangleAttributes attr, vec2 bary, vec3 dir, vec3 worldNormal)
 		{
 			int index = int(attr.UV2Tex.z);
 			if (index < 0 || uint(index) >= TextureCount)
 				return attr.Albedo.rgb;
 
-			// Barycentrics from a ray query are the weights of the second and
-			// third vertices; the first takes up the remainder.
-			vec2 uv = attr.UV01.xy * (1.0 - bary.x - bary.y)
-			        + attr.UV01.zw * bary.x
-			        + attr.UV2Tex.xy * bary.y;
+			vec2 uv = surfaceUV(attr, bary, dir, worldNormal);
 
 			vec4 texel = texture(sceneTextures[nonuniformEXT(index)], uv);
 
@@ -140,7 +163,7 @@ std::string Shaders::Trace()
 		// anything as the ray passes let glass behind a wall colour the pixel in
 		// front of it. Confirming shrinks the ray properly and keeps the hits in
 		// order.
-		bool confirmCandidate(int attributeBase, int primitive, vec2 bary, bool shadowRay)
+		bool confirmCandidate(int attributeBase, int primitive, vec2 bary, bool shadowRay, vec3 dir, mat3 toWorld)
 		{
 			TriangleAttributes attr = tris[attributeBase + primitive];
 
@@ -157,9 +180,7 @@ std::string Shaders::Trace()
 			int index = int(attr.UV2Tex.z);
 			bool textured = index >= 0 && uint(index) < TextureCount;
 
-			vec2 uv = attr.UV01.xy * (1.0 - bary.x - bary.y)
-			        + attr.UV01.zw * bary.x
-			        + attr.UV2Tex.xy * bary.y;
+			vec2 uv = surfaceUV(attr, bary, dir, normalize(toWorld * attr.Normal.xyz));
 
 			if (kind < 1.5)
 				return textured ? texture(sceneTextures[nonuniformEXT(index)], uv).a > 0.5 : true;
@@ -193,7 +214,7 @@ std::string Shaders::Trace()
 							rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 							rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
 							rayQueryGetIntersectionBarycentricsEXT(rq, false),
-							true))
+							true, dir, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
 						rayQueryConfirmIntersectionEXT(rq);
 				}
 			}
@@ -218,7 +239,10 @@ std::string Shaders::Trace()
 		// a dot product each, no rays. The one shadow ray is still the
 		// expensive part, and now it is nearly always aimed at a light that
 		// actually reaches the surface.
-		vec3 directLight(vec3 position, vec3 normal, vec3 albedo)
+		// specialLit is the surface's PF_SpecialLit: such a surface is lit only
+		// by lights marked bSpecialLit, and every other surface only by the
+		// rest. A special light carries its radius negated.
+		vec3 directLight(vec3 position, vec3 normal, vec3 albedo, bool specialLit)
 		{
 			uint count = Counts.y;
 			if (count == 0u)
@@ -235,9 +259,13 @@ std::string Shaders::Trace()
 			{
 				SceneLight light = lights[i];
 
+				bool lightSpecial = light.PositionRadius.w < 0.0;
+				if (lightSpecial != specialLit)
+					continue;
+
 				vec3 toLight = light.PositionRadius.xyz - position;
 				float distance = length(toLight);
-				float radius = light.PositionRadius.w;
+				float radius = abs(light.PositionRadius.w);
 				if (distance >= radius || distance <= 0.0001)
 					continue;
 
@@ -330,6 +358,10 @@ std::string Shaders::Trace()
 			// accumulated history can be checked against it.
 			vec3 primaryPosition = origin + direction * 100000.0;
 			float primaryInstance = -1.0;
+			// Set when the view ray passed through something that changed this
+			// frame - a new decal, say - on its way to what it finally hit.
+			bool primaryChanged = false;
+			bool inSky = false;
 			float primaryDistance = 100000.0;
 
 			uint bounces = max(Counts.z, 1u);
@@ -348,14 +380,19 @@ std::string Shaders::Trace()
 								rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 								rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
 								rayQueryGetIntersectionBarycentricsEXT(rq, false),
-								false))
+								false, direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
 							rayQueryConfirmIntersectionEXT(rq);
 					}
 				}
 
 				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
 				{
-					radiance += throughput * skyLight(direction);
+					// Out through the side of the skybox there is nothing: the
+					// engine shows black there. The stand-in sky is only for a
+					// level with no sky zone, and lighting the inside of the
+					// skybox with it is what washed the clouds out.
+					if (!inSky)
+						radiance += throughput * skyLight(direction);
 					break;
 				}
 
@@ -379,11 +416,6 @@ std::string Shaders::Trace()
 					if (attr.Albedo.w > 0.5)
 						primaryInstance = -2.0 - float(Counts.x);
 				}
-				vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-				attr.Albedo = vec4(surfaceAlbedo(attr, bary), attr.Albedo.w);
-
-				vec3 position = origin + direction * t;
-
 				// Normals are stored in object space, because the same mesh is
 				// instanced at whatever orientation the actor happens to have.
 				// Rotating by the instance transform is what puts it back in the
@@ -391,6 +423,11 @@ std::string Shaders::Trace()
 				// though it had never turned.
 				mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 				vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
+
+				vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+				attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal), attr.Albedo.w);
+
+				vec3 position = origin + direction * t;
 
 				// Translucent: add what this surface contributes and carry on
 				// through it in the same direction. UE1 draws these additively,
@@ -404,21 +441,79 @@ std::string Shaders::Trace()
 				bool sprite = attr.Emission.w > 1.5;
 				float glow = sprite ? instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].x : 1.0;
 
+				// A window onto the sky zone. The engine draws the skybox from
+				// the sky zone's viewpoint in the same direction as the view,
+				// so the ray does exactly that: same direction, new start.
+				// Only once per path - a second window means there is no sky
+				// zone behind this one, and the stand-in sky is all there is.
+				if (kind > 4.5)
+				{
+					if (SkyOrigin.w > 0.5 && !inSky)
+					{
+						inSky = true;
+						origin = SkyOrigin.xyz;
+						rayMin = Params.z;
+						if (passes < 8u)
+						{
+							passes++;
+							bounce--;
+						}
+						continue;
+					}
+					// Out through the side of the skybox there is nothing: the
+					// engine shows black there. The stand-in sky is only for a
+					// level with no sky zone, and lighting the inside of the
+					// skybox with it is what washed the clouds out.
+					if (!inSky)
+						radiance += throughput * skyLight(direction);
+					break;
+				}
+
 				if ((kind > 1.5 && kind < 2.5) || kind > 3.5)
 				{
+					// The pixel records the surface behind this one as what it
+					// sees, so this one appearing would otherwise go unnoticed
+					// and fade in over many frames.
+					if (bounce == 0u && instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w > 0.5)
+						primaryChanged = true;
+
 					if (kind > 3.5)
 					{
 						// Modulated: the surface multiplies what is behind it,
 						// as modulate-2x, so mid grey leaves the background
 						// alone. Treating it as additive along with translucent
 						// turned a pair of dark sunglasses bright white.
-						throughput *= clamp(attr.Albedo.rgb * 2.0, vec3(0.0), vec3(1.0));
+						//
+						// The engine modulates in gamma space, where mid grey
+						// times two is exactly one. In linear terms that is
+						// 2^2.2 times the linear colour; doubling the linear
+						// value instead darkened what should vanish, and left
+						// every decal sitting in a grey square.
+						throughput *= clamp(attr.Albedo.rgb * 4.595, vec3(0.0), vec3(4.595));
 					}
 					else
 					{
 						// Translucent: additive, so black is invisible and
-						// bright glows.
-						radiance += throughput * attr.Albedo.rgb * glow;
+						// bright glows. But additive of the surface as lit,
+						// not as it would glow: the engine multiplies it by
+						// its lighting like any other surface unless it is
+						// unlit. Adding the bare texture drew the Liberty
+						// Island sea and the skybox clouds - translucent,
+						// lit, with no light anywhere near - bright grey
+						// where the original shows them nearly black.
+						vec3 contribution;
+						if (sprite || attr.Emission.w > 0.5)
+						{
+							contribution = attr.Albedo.rgb * glow;
+						}
+						else
+						{
+							vec3 facing = dot(normal, direction) > 0.0 ? -normal : normal;
+							vec3 surroundings = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
+							contribution = directLight(position, facing, attr.Albedo.rgb, attr.Ambient.w > 0.5)
+								+ attr.Albedo.rgb * surroundings;
+						}
+						radiance += throughput * contribution;
 					}
 
 					origin = position;
@@ -501,9 +596,17 @@ std::string Shaders::Trace()
 				// Self lit surfaces emit the colour they actually are, which is
 				// only known once the texture has been sampled. Emission.w is
 				// the flag; the rgb carries nothing.
+				//
+				// That is all an unlit surface is: the engine shows its texture
+				// at full brightness and nothing reaches it, so there is no
+				// lighting to gather and nothing to bounce. Carrying on from it
+				// is what made the unlit skyline cost a full path per pixel.
 				if (attr.Emission.w > 0.5)
+				{
 					radiance += throughput * attr.Albedo.rgb;
-				radiance += throughput * directLight(position, normal, attr.Albedo.rgb);
+					break;
+				}
+				radiance += throughput * directLight(position, normal, attr.Albedo.rgb, attr.Ambient.w > 0.5);
 
 				// The zone's ambient. Level surfaces carry their own, because a
 				// zone is a property of the surface; an instanced shape takes it
@@ -512,6 +615,13 @@ std::string Shaders::Trace()
 				// not what the engine shows.
 				vec3 ambient = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
 				radiance += throughput * attr.Albedo.rgb * ambient;
+
+				// The skybox is a backdrop. The engine never lights it by
+				// anything bouncing inside it, and bouncing around a box the
+				// size of the sky for every sky pixel is what the frame rate
+				// was spent on, so the first surface there is the last.
+				if (inSky)
+					break;
 
 				throughput *= attr.Albedo.rgb;
 
@@ -546,6 +656,10 @@ std::string Shaders::Trace()
 			if (Counts.w == 0u)
 			{
 				// The device invalidated everything, typically a camera move.
+				samples = 0.0;
+			}
+			else if (primaryChanged)
+			{
 				samples = 0.0;
 			}
 			else if (previousHit.w != primaryInstance)

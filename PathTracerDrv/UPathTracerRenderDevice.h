@@ -40,7 +40,11 @@ struct TracePushConstants
 	// The ceiling on how many samples one pixel may average. Sent separately
 	// from the frame counter, which only says whether history is valid at all.
 	uint32_t MaxSamples;
-	uint32_t Pad[2];
+	// The level's clock in seconds, wrapped so it keeps its precision.
+	float Time;
+	uint32_t Pad;
+	// xyz where the sky zone is seen from; w is 1 when there is one.
+	vec4 SkyOrigin;
 };
 
 // A path traced render device for Deus Ex.

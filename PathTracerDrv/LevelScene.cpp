@@ -122,10 +122,13 @@ void LevelScene::Clear()
 	MeshGeometry.clear();
 	SpriteGeometry.clear();
 	FixedFrames.clear();
+	DecalGeometry = -1;
+	DecalSignature = 0;
 	ActorGeometry.clear();
 	PreviousPoses.clear();
 	CurrentPoses.clear();
 	Textures.clear();
+	TextureMasked.clear();
 	TextureIndex.clear();
 	GeometryAdded = false;
 	MeshesLogged = 0;
@@ -196,9 +199,17 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		// Invisible surfaces carry no light. Backdrop and portal surfaces are
 		// the sky and zone boundaries rather than geometry; leaving them in
 		// would seal the level inside a box. A mover's own brush has neither.
+		// Backdrop surfaces are kept: they are windows onto the sky zone, and
+		// a ray reaching one carries on from inside the skybox. Leaving them
+		// out let rays run on past the edge of the level into nothing, which
+		// is the black band along the horizon.
+		//
+		// So are zone portals the engine draws. A portal it hides is flagged
+		// invisible as well, and is dropped by that; one that is not is a
+		// visible sheet - the surface of the sea around Liberty Island is the
+		// water zone's portal with a water texture on it, and dropping every
+		// portal is what left the sea floor showing.
 		DWORD skip = PF_Invisible;
-		if (skipPortals)
-			skip |= PF_FakeBackdrop | PF_Portal;
 		if (surf.PolyFlags & skip)
 			continue;
 
@@ -234,7 +245,8 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		// turns out to be once sampled, so it cannot be decided here: doing so
 		// is what made unlit masked surfaces glow the key colour.
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
-		attr.Ambient = vec4(ambient.x, ambient.y, ambient.z, 0.0f);
+		// w: the surface is special lit, and only special lights reach it.
+		attr.Ambient = vec4(ambient.x, ambient.y, ambient.z, (surf.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f);
 
 		// A BSP surface has no stored texture coordinates: the engine derives
 		// them from two axis vectors and an origin point, which is what lets one
@@ -259,6 +271,21 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		{
 			attr.UV01 = vec4(0.0f, 0.0f, 0.0f, 0.0f);
 			attr.UV2Tex = vec4(0.0f, 0.0f, -1.0f, 0.0f);
+		}
+
+		// Auto panning - how the clouds in a skybox drift. The engine moves
+		// the texture 35 texels a second times its zone's pan speed; carried
+		// as texture widths per second in the emission's unused xy, and added
+		// in the shader from the level's clock. A surface that moves keeps no
+		// history, or the drift would be averaged away.
+		if (zone && uScale > 0.0f)
+		{
+			const float panU = (surf.PolyFlags & PF_AutoUPan) ? 35.0f * zone->TexUPanSpeed * uScale : 0.0f;
+			const float panV = (surf.PolyFlags & PF_AutoVPan) ? 35.0f * zone->TexVPanSpeed * vScale : 0.0f;
+			attr.Emission.x = panU;
+			attr.Emission.y = panV;
+			if (panU != 0.0f || panV != 0.0f)
+				attr.Albedo.w = 1.0f;
 		}
 
 		auto surfaceUV = [&](const FVector& point) -> vec2
@@ -307,6 +334,8 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
 				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, kind);
 			}
+			if (surf.PolyFlags & PF_FakeBackdrop)
+				attr.UV2Tex.w = 5.0f;
 
 			out.Positions.push_back(v0);
 			out.Positions.push_back(v1);
@@ -334,7 +363,10 @@ void LevelScene::AddLight(AActor* actor)
 	SceneLight light;
 	// LightRadius is stored in units of 25, which is why a radius of 8
 	// lights a whole room.
-	light.PositionRadius = vec4(actor->Location.X, actor->Location.Y, actor->Location.Z, actor->LightRadius * 25.0f);
+	// A special light only reaches special lit surfaces, and says so by
+	// carrying its radius negated.
+	const float radius = actor->LightRadius * 25.0f;
+	light.PositionRadius = vec4(actor->Location.X, actor->Location.Y, actor->Location.Z, actor->bSpecialLit ? -radius : radius);
 
 	const vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
 	light.ColorBrightness = vec4(colour.x, colour.y, colour.z, actor->LightBrightness / 255.0f * LightScale);
@@ -378,8 +410,8 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(poly.Texture) ? 1.0f : 0.0f);
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
 		// A mover is instanced into whatever room it stands in, so its ambient
-		// comes from the instance.
-		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+		// comes from the instance. w: special lit, as for the level's surfaces.
+		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, (poly.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f);
 
 		const int textureIndex = TextureFor(poly.Texture);
 		const bool masked = poly.Texture && (poly.Texture->PolyFlags & PF_Masked) != 0;
@@ -488,7 +520,7 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 		GeometryAdded = true;
 	}
 
-	return GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind, actor, toLocal);
+	return GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind, actor, toLocal, actor);
 }
 
 // A sprite's shape: a unit square facing +Z, centred on the origin, with the
@@ -604,6 +636,131 @@ bool LevelScene::PlaceSprite(AActor* actor, int& geometryIndex, float transform[
 	return true;
 }
 
+void LevelScene::CollectDecals(ULevel* level)
+{
+	UModel* model = level ? level->Model : nullptr;
+	if (!model)
+		return;
+
+	// What is attached where. Cheap enough to walk every frame: most surfaces
+	// carry nothing, and only a change costs a rebuild.
+	uint64_t signature = 1469598103934665603ull;
+	int count = 0;
+	for (INT s = 0; s < model->Surfs.Num(); s++)
+	{
+		const FBspSurf& surf = model->Surfs(s);
+		for (INT d = 0; d < surf.Decals.Num(); d++)
+		{
+			signature = (signature ^ (uint64_t)(uintptr_t)surf.Decals(d).Actor) * 1099511628211ull;
+			signature = (signature ^ (uint64_t)s) * 1099511628211ull;
+			count++;
+		}
+	}
+
+	const bool changed = signature != DecalSignature;
+	if (changed)
+	{
+		DecalSignature = signature;
+
+		const bool created = DecalGeometry < 0;
+		if (created)
+		{
+			if (count == 0)
+				return;
+			Geometries.emplace_back();
+			DecalGeometry = (int)Geometries.size() - 1;
+			Geometries[DecalGeometry].Dynamic = true;
+		}
+
+		SceneGeometry& geometry = Geometries[DecalGeometry];
+		geometry.Version++;
+		geometry.Positions.clear();
+		geometry.Attributes.clear();
+		// Never opaque: anything drawn modulated or translucent is handled
+		// when the ray is confirmed against it.
+		geometry.HasMasked = true;
+
+		int added = 0;
+		for (INT s = 0; s < model->Surfs.Num() && added < MaxDecals; s++)
+		{
+			const FBspSurf& surf = model->Surfs(s);
+			if (surf.Decals.Num() == 0)
+				continue;
+			// A mover's decals ride along with it, and this is built in the
+			// level's space.
+			if (surf.Actor && surf.Actor->IsMovingBrush())
+				continue;
+			if (surf.pBase >= model->Points.Num() || surf.vNormal >= model->Vectors.Num())
+				continue;
+
+			const FVector base = model->Points(surf.pBase);
+			const FVector surfaceNormal = model->Vectors(surf.vNormal);
+			// Lifted off the wall, so that a ray passing through a decal does
+			// not start again already beyond the wall it is painted on.
+			const FVector lift = surfaceNormal * 0.25f;
+
+			for (INT d = 0; d < surf.Decals.Num() && added < MaxDecals; d++)
+			{
+				const FDecal& decal = surf.Decals(d);
+				ADecal* actor = decal.Actor;
+				if (!actor || actor->bHidden || !actor->Texture || actor->Style == STY_None)
+					continue;
+
+				UTexture* texture = actor->Texture;
+				// The engine draws decals modulated whatever the actor's style
+				// says, unless they are translucent. Taking the style as given
+				// drew a bullet hole as a lit grey square with a hole in it.
+				const float kind = (actor->Style == STY_Translucent) ? 2.0f : 4.0f;
+
+				const int textureIndex = TextureFor(texture, kind == 1.0f);
+				const vec3 albedo = AverageColour(texture, vec3(0.5f, 0.5f, 0.5f));
+
+				vec3 corners[4];
+				for (int v = 0; v < 4; v++)
+					corners[v] = ToVec3(base + decal.Vertices[v] + lift);
+				const float uv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+				const int tris[2][3] = { { 0, 1, 2 }, { 0, 2, 3 } };
+
+				for (const auto& tri : tris)
+				{
+					TriangleAttributes attr;
+					attr.Normal = vec4(surfaceNormal.X, surfaceNormal.Y, surfaceNormal.Z, 0.0f);
+					attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(texture) ? 1.0f : 0.0f);
+					attr.Emission = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+					attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+					attr.UV01 = vec4(uv[tri[0]][0], uv[tri[0]][1], uv[tri[1]][0], uv[tri[1]][1]);
+					attr.UV2Tex = vec4(uv[tri[2]][0], uv[tri[2]][1], (float)textureIndex, kind);
+					for (int v = 0; v < 3; v++)
+						geometry.Positions.push_back(corners[tri[v]]);
+					geometry.Attributes.push_back(attr);
+				}
+				added++;
+			}
+		}
+
+		// Padded to the full reservation, so that the slot of shading data the
+		// geometry is given when first built is big enough for every decal it
+		// may ever hold.
+		TriangleAttributes unused = {};
+		unused.UV2Tex = vec4(0.0f, 0.0f, -1.0f, 0.0f);
+		geometry.Attributes.resize((size_t)MaxDecals * 2, unused);
+
+		if (created)
+			GeometryAdded = true;
+	}
+
+	if (DecalGeometry < 0 || Geometries[DecalGeometry].Positions.empty())
+		return;
+
+	SceneInstance instance;
+	instance.GeometryIndex = DecalGeometry;
+	MakeIdentity(instance.Transform);
+	// Flagged as changed on the frame a decal arrives or goes, so the pixels
+	// under it drop what they had accumulated of the bare wall.
+	instance.Ambient = vec4(0.0f, 0.0f, 0.0f, changed ? 1.0f : 0.0f);
+	Instances.push_back(instance);
+}
+
 int LevelScene::GeometryForBrush(UModel* brush)
 {
 	auto it = BrushGeometry.find(brush);
@@ -627,12 +784,14 @@ int LevelScene::GeometryForBrush(UModel* brush)
 
 // The index this texture will have in the shader's array, uploading nothing:
 // the upload happens once per frame for whatever the registry ended up holding.
-int LevelScene::TextureFor(UTexture* texture)
+int LevelScene::TextureFor(UTexture* texture, bool masked)
 {
 	if (!texture)
 		return -1;
 
-	auto it = TextureIndex.find(texture);
+	masked = masked || (texture->PolyFlags & PF_Masked) != 0;
+	const uint64_t key = ((uint64_t)(uintptr_t)texture << 1) | (masked ? 1u : 0u);
+	auto it = TextureIndex.find(key);
 	if (it != TextureIndex.end())
 		return it->second;
 
@@ -641,7 +800,8 @@ int LevelScene::TextureFor(UTexture* texture)
 
 	const int index = (int)Textures.size();
 	Textures.push_back(texture);
-	TextureIndex[texture] = index;
+	TextureMasked.push_back(masked);
+	TextureIndex[key] = index;
 	return index;
 }
 
@@ -655,6 +815,23 @@ int LevelScene::TextureFor(UTexture* texture)
 // reuseIndex rebuilds into an existing geometry rather than adding one. An
 // animated actor needs fresh vertices every frame, and adding a geometry per
 // frame per actor would grow without bound.
+// The texture the engine reflects in an actor's environment mapped polygons:
+// the actor's own Texture, else its zone's, else the level's. Not its skin -
+// a character's glasses slot shows whatever this is, which for most people is
+// a texture that masks the slot away entirely.
+static UTexture* EnvironmentMapFor(AActor* actor)
+{
+	if (!actor)
+		return nullptr;
+	if (actor->Texture)
+		return actor->Texture;
+	if (actor->Region.Zone && actor->Region.Zone->EnvironmentMap)
+		return actor->Region.Zone->EnvironmentMap;
+	if (actor->Level && actor->Level->EnvironmentMap)
+		return actor->Level->EnvironmentMap;
+	return nullptr;
+}
+
 // Translate an actor's rendering style into the surface kinds this tracer uses.
 // UE1 sets the mode per actor as well as per polygon, and reading only the
 // polygon flags left anything relying on Style - the red dot sight's reticle
@@ -670,7 +847,7 @@ static float KindFromStyle(BYTE style)
 	}
 }
 
-int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex, float styleKind, AActor* owner, const FCoords* toLocal)
+int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex, float styleKind, AActor* owner, const FCoords* toLocal, AActor* envSource)
 {
 	// The skin set is part of the identity. Hashed rather than compared, so two
 	// actors in the same outfit share one structure instead of building another.
@@ -680,6 +857,19 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		skinHash ^= (uint64_t)(uintptr_t)skins[i];
 		skinHash *= 1099511628211ull;
 	}
+
+	// What environment mapped polygons show is part of the identity too.
+	UTexture* const envMap = EnvironmentMapFor(envSource);
+	const bool enviroAll = envSource && envSource->bMeshEnviroMap;
+	skinHash ^= (uint64_t)(uintptr_t)envMap;
+	skinHash *= 1099511628211ull;
+	skinHash ^= enviroAll ? 1u : 0u;
+	skinHash *= 1099511628211ull;
+	// An actor drawn unlit - a muzzle flash, a glowing effect - is unlit in
+	// every polygon, whatever the mesh says.
+	const bool actorUnlit = envSource && envSource->bUnlit;
+	skinHash ^= actorUnlit ? 2u : 0u;
+	skinHash *= 1099511628211ull;
 
 	// Style is part of the identity: the same mesh drawn normally and drawn
 	// translucent are two different shapes as far as the tracer is concerned.
@@ -773,6 +963,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	if (reuseIndex < 0)
 		Geometries.emplace_back();
 	SceneGeometry& geometry = reuseIndex >= 0 ? Geometries[reuseIndex] : Geometries.back();
+	geometry.Version++;
 	geometry.Positions.clear();
 	geometry.Attributes.clear();
 	geometry.HasMasked = false;
@@ -947,14 +1138,21 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			skin = skins[tri.TextureIndex];
 		if (!skin && tri.TextureIndex >= 0 && tri.TextureIndex < mesh->Textures.Num())
 			skin = mesh->Textures(tri.TextureIndex);
+		// Environment mapped: the reflected picture replaces the skin, looked
+		// up by reflection direction in the shader rather than by the wedge's
+		// coordinates.
+		const bool environment = envMap && ((tri.PolyFlags & PF_Environment) || enviroAll);
+		if (environment)
+			skin = envMap;
+
 		const vec3 albedo = AverageColour(skin, vec3(0.6f, 0.6f, 0.6f));
 
-		bool unlit = false;
+		bool unlit = actorUnlit;
 		if (tri.PolyFlags & PF_Unlit)
 			unlit = true;
 
 		TriangleAttributes attr;
-		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
+		attr.Normal = vec4(normal.x, normal.y, normal.z, environment ? 1.0f : 0.0f);
 		// w says the surface keeps no history: a texture that animates, or a
 		// part being moved by a blend channel.
 		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, (blended || TextureAnimates(skin)) ? 1.0f : 0.0f);
@@ -963,8 +1161,11 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		// is what made unlit masked surfaces glow the key colour.
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
 
-		const int textureIndex = TextureFor(skin);
-		const bool masked = skin && (skin->PolyFlags & PF_Masked) != 0;
+		// Masked by the polygon as well as by the texture, as the engine does:
+		// a character with no glasses has a masked glasses slot showing a
+		// texture that is nothing but palette entry zero.
+		const bool masked = skin && ((skin->PolyFlags & PF_Masked) != 0 || (tri.PolyFlags & PF_Masked) != 0);
+		const int textureIndex = TextureFor(skin, masked);
 		const bool translucent = (tri.PolyFlags & PF_Translucent) != 0;
 		const bool modulated = (tri.PolyFlags & PF_Modulated) != 0;
 		const bool mirrored = (tri.PolyFlags & PF_Mirrored) != 0;
@@ -1062,6 +1263,29 @@ void LevelScene::CollectDynamic(ULevel* level)
 	Instances.clear();
 	Lights.clear();
 	CurrentPoses.clear();
+
+	// Where the sky is seen from: the sky zone of whichever zone the viewer
+	// is in, or failing that the level's only one. The engine draws it from
+	// that point with the view's own direction, so it never shows parallax.
+	HasSky = false;
+	{
+		AZoneInfo* zone = ViewActor ? ViewActor->Region.Zone : nullptr;
+		AActor* sky = zone ? (AActor*)zone->SkyZone : nullptr;
+		if (!sky && level)
+		{
+			for (INT i = 0; i < level->Actors.Num() && !sky; i++)
+			{
+				AActor* actor = level->Actors(i);
+				if (actor && actor->IsA(ASkyZoneInfo::StaticClass()))
+					sky = actor;
+			}
+		}
+		if (sky)
+		{
+			HasSky = true;
+			SkyOrigin = sky->Location;
+		}
+	}
 
 	if (Geometries.empty())
 		return;
@@ -1194,7 +1418,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 			if (actor->Mesh->AnimFrames > 1)
 				geometryIndex = AnimatedGeometryFor(actor, actor->Mesh, frameA, frameB, alpha, skins, styleKind, &toLocal);
 			else
-				geometryIndex = GeometryForMesh(actor->Mesh, frameA, frameB, 0.0f, skins, -1, styleKind);
+				geometryIndex = GeometryForMesh(actor->Mesh, frameA, frameB, 0.0f, skins, -1, styleKind, nullptr, nullptr, actor);
 			if (geometryIndex < 0)
 				skippedMesh++;
 			else
@@ -1253,6 +1477,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 	}
 
+	CollectDecals(level);
 	AddViewModel();
 
 
@@ -1320,7 +1545,7 @@ void LevelScene::AddViewModel()
 	const float styleKind = KindFromStyle(item->Style);
 	const int geometryIndex = (mesh->AnimFrames > 1)
 		? AnimatedGeometryFor(item, mesh, frameA, frameB, alpha, skins, styleKind)
-		: GeometryForMesh(mesh, frameA, frameB, 0.0f, skins, -1, styleKind);
+		: GeometryForMesh(mesh, frameA, frameB, 0.0f, skins, -1, styleKind, nullptr, nullptr, item);
 
 	// PlayerViewOffset is in the view's own terms: X ahead, Y to the right,
 	// Z up. The scene node's axes are X right, Y down, Z forward, so up is

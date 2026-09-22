@@ -64,6 +64,11 @@ private:
 		// and instanced. An animated character's shape genuinely changes.
 		bool Dynamic = false;
 		size_t VertexCapacity = 0;
+		// Which version of the scene's geometry was last uploaded, and whether
+		// the structure still has to be rebuilt from it. Something dynamic
+		// that did not change this frame costs nothing.
+		uint32_t WrittenVersion = 0;
+		bool NeedsBuild = false;
 	};
 
 	std::unique_ptr<VulkanBuffer> UploadBuffer(const void* data, size_t size, VkBufferUsageFlags usage, const char* debugName);
