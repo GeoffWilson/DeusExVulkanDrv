@@ -164,6 +164,14 @@ private:
 	// Staging for this frame's realtime texture uploads, released once the
 	// submission that reads them has completed.
 	std::vector<std::unique_ptr<VulkanBuffer>> RealtimeStaging;
+
+	// The last frame's submission, not yet known to be finished. Unlock does
+	// not wait for the GPU: the next frame's game logic and scene gathering
+	// run while it traces, and WaitForPreviousFrame blocks only when
+	// something is about to touch memory the GPU may still be reading.
+	std::unique_ptr<VulkanCommandBuffer> PendingCommands;
+	bool FramePending = false;
+	void WaitForPreviousFrame();
 	size_t BoundSceneTextures = 0;
 	bool SceneTexturesInitialised = false;
 	int TextureFailuresLogged = 0;

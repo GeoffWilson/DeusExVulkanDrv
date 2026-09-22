@@ -703,6 +703,26 @@ void UPathTracerRenderDevice::ExecuteImmediate(const std::function<void(VulkanCo
 	vkWaitForFences(Device->device, 1, &handle, VK_TRUE, std::numeric_limits<uint64_t>::max());
 }
 
+void UPathTracerRenderDevice::WaitForPreviousFrame()
+{
+	if (!FramePending)
+		return;
+	FramePending = false;
+
+	if (Device && RenderFinishedFence)
+	{
+		VkFence handle = RenderFinishedFence->fence;
+		const double waitStart = NowMs();
+		vkWaitForFences(Device->device, 1, &handle, VK_TRUE, std::numeric_limits<uint64_t>::max());
+		Timings.Wait += NowMs() - waitStart;
+		vkResetFences(Device->device, 1, &handle);
+	}
+
+	// The submission is done with them now.
+	PendingCommands.reset();
+	RealtimeStaging.clear();
+}
+
 void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 {
 	if (!level || !level->Model)
@@ -715,6 +735,9 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	if (Scene.SourceLevel != level || Scene.SourceNodeCount != level->Model->Nodes.Num())
 	{
 		debugf(TEXT("PathTracer: building the scene"));
+
+		// Everything the last frame used is about to be destroyed.
+		WaitForPreviousFrame();
 
 		Accel->Reset();
 		if (!Scene.BuildStatic(level))
@@ -732,8 +755,12 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	// a bottom level structure the first time they are seen.
 	const size_t geometriesBefore = Scene.Geometries.size();
 	Scene.LightScale = Max(LightScale, 1) / 100.0f;
+	// Gathering is CPU only, so it runs while the GPU is still tracing the
+	// last frame. Uploading is not: the buffers it writes are the ones that
+	// trace is reading.
 	const double collectStart = NowMs();
 	Scene.CollectDynamic(level);
+	WaitForPreviousFrame();
 	const double syncStart = NowMs();
 	Accel->SyncGeometry(Scene);
 	Timings.Collect += syncStart - collectStart;
@@ -840,6 +867,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	// left an acquired swap chain image unpresented, which the compositor shows
 	// as black. Whether the world can be traced and whether the frame must be
 	// presented are different questions.
+	// A frame that drew no world never reached the wait in SetSceneNode.
+	WaitForPreviousFrame();
+
 	if (!Blit || !Accel || !AccumImage)
 		return;
 
@@ -981,11 +1011,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 
 		SwapChain->QueuePresent(imageIndex, RenderFinishedSemaphore.get());
 
-		VkFence handle = RenderFinishedFence->fence;
-		const double waitStart = NowMs();
-		vkWaitForFences(Device->device, 1, &handle, VK_TRUE, std::numeric_limits<uint64_t>::max());
-		Timings.Wait += NowMs() - waitStart;
-		vkResetFences(Device->device, 1, &handle);
+		// Not waited for here. The command buffer and the staging copies have
+		// to outlive the submission, so they are kept until the wait.
+		PendingCommands = std::move(commands);
+		FramePending = true;
 
 		// The scene gathering happens earlier, in SetSceneNode, so it is
 		// added to the frame's total rather than measured inside it.
@@ -1005,9 +1034,6 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			Timings = FrameTimings();
 			Timings.Logged = logged;
 		}
-
-		// The submission is done with them now.
-		RealtimeStaging.clear();
 
 		if (AccumulatedFrames < (uint32_t)Max(MaxAccumulatedFrames, 1))
 			AccumulatedFrames++;
@@ -1074,6 +1100,9 @@ void UPathTracerRenderDevice::Exit()
 	guard(UPathTracerRenderDevice::Exit);
 
 	if (Device) vkDeviceWaitIdle(Device->device);
+	FramePending = false;
+	PendingCommands.reset();
+	RealtimeStaging.clear();
 
 	Accel.reset();
 	Scene.Clear();
