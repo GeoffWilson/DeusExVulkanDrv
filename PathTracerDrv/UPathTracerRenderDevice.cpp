@@ -885,7 +885,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// trace reads them, recorded into this frame's command buffer rather
 		// than submitted one at a time.
 		if (Textures && Viewport && Viewport->Actor && Viewport->Actor->Level)
-			Textures->RefreshRealtime(Viewport->Actor->Level->TimeSeconds, commands.get(), RealtimeStaging);
+			Textures->RefreshRealtime(Viewport->Actor->Level->TimeSeconds, commands.get(), RealtimeStaging, Scene.FixedFrames);
 
 		// The top level structure is rebuilt every frame, because the movers and
 		// the actors have all moved since the last one.

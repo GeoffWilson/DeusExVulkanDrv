@@ -325,7 +325,7 @@ CachedTexture* TextureCache::White()
 }
 
 
-void TextureCache::RefreshRealtime(double time, VulkanCommandBuffer* commands, std::vector<std::unique_ptr<VulkanBuffer>>& keepAlive)
+void TextureCache::RefreshRealtime(double time, VulkanCommandBuffer* commands, std::vector<std::unique_ptr<VulkanBuffer>>& keepAlive, const std::unordered_set<UTexture*>& fixedFrames)
 {
 	guard(TextureCache::RefreshRealtime);
 
@@ -339,11 +339,13 @@ void TextureCache::RefreshRealtime(double time, VulkanCommandBuffer* commands, s
 
 		UTexture* texture = cached->Source;
 
-		// Asked afresh every frame rather than remembered from the upload. A
-		// face's texture is an ordinary still until its owner starts talking,
-		// at which point the conversation gives it a chain of mouth shapes to
-		// cycle through - and a flag recorded at first sighting says no for
-		// ever, which is why faces never moved.
+		// One frame of an animation shown on its own - a sprite that plays once
+		// chooses it - stays that frame. Advancing it would loop the animation.
+		if (fixedFrames.count(texture))
+			continue;
+
+		// Asked afresh every frame rather than remembered from the upload, since
+		// a script can give a texture an animation chain after it was first seen.
 		const bool animates = texture->bRealtime || texture->bParametric || texture->AnimNext != nullptr;
 		if (!animates)
 			continue;

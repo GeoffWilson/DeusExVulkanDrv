@@ -120,6 +120,8 @@ void LevelScene::Clear()
 	Instances.clear();
 	BrushGeometry.clear();
 	MeshGeometry.clear();
+	SpriteGeometry.clear();
+	FixedFrames.clear();
 	ActorGeometry.clear();
 	PreviousPoses.clear();
 	CurrentPoses.clear();
@@ -487,6 +489,119 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 	}
 
 	return GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind, actor, toLocal);
+}
+
+// A sprite's shape: a unit square facing +Z, centred on the origin, with the
+// texture's top left at its top left. Shared by every sprite with the same
+// texture and style; each one's size and facing are its instance transform.
+static float KindFromStyle(BYTE style);
+
+int LevelScene::GeometryForSprite(UTexture* texture, float kind)
+{
+	const uint64_t key = ((uint64_t)(uintptr_t)texture << 4) ^ (uint64_t)(int)kind;
+	auto it = SpriteGeometry.find(key);
+	if (it != SpriteGeometry.end())
+		return it->second;
+
+	if ((int)SpriteGeometry.size() >= MaxMeshGeometries)
+		return -1;
+
+	Geometries.emplace_back();
+	SceneGeometry& geometry = Geometries.back();
+	// Never opaque, even for a sprite drawn solid: every hit on one has to be
+	// seen by the shader so that it can be kept out of shadow rays. The engine
+	// draws sprites flat onto the screen, and they cast no shadows there.
+	geometry.HasMasked = true;
+
+	const int textureIndex = TextureFor(texture);
+	const vec3 albedo = AverageColour(texture, vec3(1.0f, 1.0f, 1.0f));
+
+	const vec3 corners[4] = {
+		vec3(-0.5f,  0.5f, 0.0f),   // top left
+		vec3( 0.5f,  0.5f, 0.0f),   // top right
+		vec3( 0.5f, -0.5f, 0.0f),   // bottom right
+		vec3(-0.5f, -0.5f, 0.0f),   // bottom left
+	};
+	const float uv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+	const int tris[2][3] = { { 0, 3, 2 }, { 0, 2, 1 } };
+
+	for (const auto& tri : tris)
+	{
+		TriangleAttributes attr;
+		attr.Normal = vec4(0.0f, 0.0f, 1.0f, 0.0f);
+		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(texture) ? 1.0f : 0.0f);
+		// Two marks a sprite: lit by nothing, casting nothing, and as bright
+		// as the instance's glow says.
+		attr.Emission = vec4(0.0f, 0.0f, 0.0f, 2.0f);
+		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+		attr.UV01 = vec4(uv[tri[0]][0], uv[tri[0]][1], uv[tri[1]][0], uv[tri[1]][1]);
+		attr.UV2Tex = vec4(uv[tri[2]][0], uv[tri[2]][1], (float)textureIndex, kind);
+
+		for (int v = 0; v < 3; v++)
+			geometry.Positions.push_back(corners[tri[v]]);
+		geometry.Attributes.push_back(attr);
+	}
+
+	const int index = (int)Geometries.size() - 1;
+	SpriteGeometry[key] = index;
+	GeometryAdded = true;
+	return index;
+}
+
+// Where and how a sprite is drawn, the way the engine's DrawActorSprite does
+// it: the actor's texture, DrawScale texels to the world unit, always square on
+// to the view and centred on the actor. A sprite that plays once shows the
+// frame of its animation matching how much of its life has gone.
+bool LevelScene::PlaceSprite(AActor* actor, int& geometryIndex, float transform[12])
+{
+	UTexture* texture = actor->Texture;
+	if (!texture || actor->Style == STY_None)
+		return false;
+
+	if (actor->DrawType == DT_SpriteAnimOnce)
+	{
+		INT count = 1;
+		for (UTexture* t = texture->AnimNext; t && t != texture && count < 256; t = t->AnimNext)
+			count++;
+		INT frame = Clamp(appFloor(actor->LifeFraction() * count), 0, count - 1);
+		while (frame-- > 0 && texture->AnimNext)
+			texture = texture->AnimNext;
+		if (count > 1)
+			FixedFrames.insert(texture);
+	}
+
+	// The texture's own flags say whether it has holes in it; the style can
+	// make the whole thing additive or multiplying instead.
+	float kind = KindFromStyle(actor->Style);
+	if (kind == 0.0f && (texture->PolyFlags & PF_Translucent))
+		kind = 2.0f;
+	else if (kind == 0.0f && (texture->PolyFlags & PF_Modulated))
+		kind = 4.0f;
+	else if (kind == 0.0f && (texture->PolyFlags & PF_Masked))
+		kind = 1.0f;
+
+	geometryIndex = GeometryForSprite(texture, kind);
+	if (geometryIndex < 0)
+		return false;
+
+	const float scale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
+	const float width = scale * texture->USize;
+	const float height = scale * texture->VSize;
+
+	// Quad X along the view's right, Y up the screen, Z back at the viewer.
+	const FVector up = -ViewDown;
+	const FVector columns[3] = { ViewRight * width, up * height, -ViewForward };
+	for (int col = 0; col < 3; col++)
+	{
+		transform[0 * 4 + col] = columns[col].X;
+		transform[1 * 4 + col] = columns[col].Y;
+		transform[2 * 4 + col] = columns[col].Z;
+	}
+	const FVector centre = actor->Location + actor->PrePivot;
+	transform[0 * 4 + 3] = centre.X;
+	transform[1 * 4 + 3] = centre.Y;
+	transform[2 * 4 + 3] = centre.Z;
+	return true;
 }
 
 int LevelScene::GeometryForBrush(UModel* brush)
@@ -1094,6 +1209,11 @@ void LevelScene::CollectDynamic(ULevel* level)
 			scale = FVector(s, s, s);
 		}
 
+		float spriteTransform[12];
+		const bool isSprite = actor->DrawType == DT_Sprite || actor->DrawType == DT_SpriteAnimOnce;
+		if (isSprite && !PlaceSprite(actor, geometryIndex, spriteTransform))
+			continue;
+
 		if (geometryIndex < 0)
 			continue;
 
@@ -1106,8 +1226,15 @@ void LevelScene::CollectDynamic(ULevel* level)
 		// sit correctly and the doors ride up, with the other the reverse.
 		const bool isBrush = (actor->DrawType == DT_Brush && actor->Brush);
 		const FVector prePivot = isBrush ? -actor->PrePivot : actor->PrePivot;
-		MakeTransform(actor->Location, actor->Rotation, scale, prePivot, instance.Transform);
-		const vec3 ambient = ZoneAmbient(actor->Region.Zone);
+		if (isSprite)
+			memcpy(instance.Transform, spriteTransform, sizeof(instance.Transform));
+		else
+			MakeTransform(actor->Location, actor->Rotation, scale, prePivot, instance.Transform);
+		// A sprite is lit by nothing, so its instance carries its glow where
+		// anything else carries the zone's ambient. The engine draws it at
+		// ScaleGlow brightness, which is how effects fade out.
+		const float glow = Clamp((float)actor->ScaleGlow, 0.0f, 4.0f);
+		const vec3 ambient = isSprite ? vec3(glow, glow, glow) : ZoneAmbient(actor->Region.Zone);
 
 		// Did this actor actually move or change shape since the last frame?
 		// The trace uses it to throw away the accumulated history of the pixels
@@ -1121,7 +1248,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 		const bool moved = (previous == PreviousPoses.end()) || previous->second != pose;
 		CurrentPoses[actor] = pose;
 
-		instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, moved ? 1.0f : 0.0f);
+		instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, (moved || isSprite) ? 1.0f : 0.0f);
 		Instances.push_back(instance);
 
 	}

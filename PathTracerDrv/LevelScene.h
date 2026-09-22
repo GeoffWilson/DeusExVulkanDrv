@@ -3,6 +3,7 @@
 #include "vec.h"
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 class UPathTracerRenderDevice;
 
@@ -101,6 +102,12 @@ private:
 	void AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals);
 	void AddLight(AActor* actor);
 
+	// A unit quad carrying one texture in one style, shared by every sprite
+	// showing it. Its size and facing come from the instance.
+	int GeometryForSprite(UTexture* texture, float kind);
+	bool PlaceSprite(AActor* actor, int& geometryIndex, float transform[12]);
+	std::unordered_map<uint64_t, int> SpriteGeometry;
+
 	// Geometry index for a mover's brush, built on first sight.
 	int GeometryForBrush(UModel* brush);
 	// Geometry index for a mesh at a particular animation frame and skin set.
@@ -176,6 +183,11 @@ public:
 	static const int MaxTextures = 1024;
 	std::vector<UTexture*> Textures;
 	int MirroredCount() const { return MirroredSurfaces; }
+
+	// Textures that are shown as one fixed frame of their animation - a sprite
+	// that plays once picks its frame from how far through its life it is - so
+	// must not be advanced the way a looping animation is.
+	std::unordered_set<UTexture*> FixedFrames;
 	int TextureFor(UTexture* texture);
 
 private:

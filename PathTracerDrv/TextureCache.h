@@ -3,6 +3,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <unordered_set>
 
 class UPathTracerRenderDevice;
 
@@ -56,7 +57,7 @@ public:
 	// texture at a time: a submit-and-wait each is a stall each, and a room of
 	// screens cost most of the frame rate. The staging buffers must outlive the
 	// submission, so they are handed back to be released once it completes.
-	void RefreshRealtime(double time, VulkanCommandBuffer* commands, std::vector<std::unique_ptr<VulkanBuffer>>& keepAlive);
+	void RefreshRealtime(double time, VulkanCommandBuffer* commands, std::vector<std::unique_ptr<VulkanBuffer>>& keepAlive, const std::unordered_set<UTexture*>& fixedFrames);
 
 	void Clear();
 

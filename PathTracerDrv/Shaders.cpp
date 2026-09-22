@@ -143,6 +143,13 @@ std::string Shaders::Trace()
 		bool confirmCandidate(int attributeBase, int primitive, vec2 bary, bool shadowRay)
 		{
 			TriangleAttributes attr = tris[attributeBase + primitive];
+
+			// Sprites cast no shadows: the engine draws them flat onto the
+			// screen, after the world, and a quad turned to face the camera
+			// would throw a shadow that swings as the view turns.
+			if (shadowRay && attr.Emission.w > 1.5)
+				return false;
+
 			float kind = attr.UV2Tex.w;
 			if (kind < 0.5)
 				return true;
@@ -391,6 +398,12 @@ std::string Shaders::Trace()
 				// until it is lit and why a red dot sight glows rather than
 				// showing as a dark blob.
 				float kind = attr.UV2Tex.w;
+
+				// A sprite is as bright as its actor's ScaleGlow, which the
+				// instance carries in place of an ambient it has no use for.
+				bool sprite = attr.Emission.w > 1.5;
+				float glow = sprite ? instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].x : 1.0;
+
 				if ((kind > 1.5 && kind < 2.5) || kind > 3.5)
 				{
 					if (kind > 3.5)
@@ -405,7 +418,7 @@ std::string Shaders::Trace()
 					{
 						// Translucent: additive, so black is invisible and
 						// bright glows.
-						radiance += throughput * attr.Albedo.rgb;
+						radiance += throughput * attr.Albedo.rgb * glow;
 					}
 
 					origin = position;
@@ -416,6 +429,14 @@ std::string Shaders::Trace()
 						bounce--;
 					}
 					continue;
+				}
+
+				// A solid or masked sprite is just its picture: nothing lights it
+				// and nothing bounces off it.
+				if (sprite && Params.w < 1.5)
+				{
+					radiance += throughput * attr.Albedo.rgb * glow;
+					break;
 				}
 
 				// A reflective surface - the polished floor of the UNATCO lobby
