@@ -41,6 +41,9 @@ struct SceneGeometry
 	// counts. Geometry without it can be marked opaque, which lets traversal
 	// accept a hit without ever calling back into the shader.
 	bool HasMasked = false;
+	// Rebuilt every frame, so its acceleration structure has to be refitted
+	// rather than built once.
+	bool Dynamic = false;
 	std::vector<vec3> Positions;
 	std::vector<TriangleAttributes> Attributes;
 };
@@ -92,9 +95,11 @@ public:
 	int SourceNodeCount = 0;
 
 private:
+	static void AnimationPose(UMesh* mesh, FName sequence, FLOAT animFrame, int& frameA, int& frameB, float& alpha);
+	int AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind = 0.0f);
 	void AddBrushPolys(UModel* brush, SceneGeometry& out);
 	void AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals);
-	void AddLights(ULevel* level);
+	void AddLight(AActor* actor);
 
 	// Geometry index for a mover's brush, built on first sight.
 	int GeometryForBrush(UModel* brush);
@@ -102,7 +107,7 @@ private:
 	// The skins are part of the key: Deus Ex puts a character's appearance on
 	// the actor rather than the mesh, so two people sharing a mesh are only the
 	// same shape if they are also wearing the same thing.
-	int GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]);
+	int GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex = -1, float styleKind = 0.0f);
 
 	// One shot diagnostics, reset per level.
 	int MeshesLogged = 0;
@@ -110,6 +115,9 @@ private:
 
 	std::unordered_map<void*, int> BrushGeometry;
 	std::unordered_map<uint64_t, int> MeshGeometry;
+
+	// One geometry per animated actor, rebuilt each frame at its exact pose.
+	std::unordered_map<AActor*, int> ActorGeometry;
 
 	// A ceiling on how many poses are kept. Each one is a bottom level
 	// structure, and a level with many characters could otherwise build them
@@ -144,12 +152,22 @@ public:
 	// of structures at this many per mesh, at the cost of steppier movement.
 	// One means a character is built once, exactly like a prop - which is the
 	// only structural difference between the two, and props render.
-	int PoseBuckets = 12;
+	float LightScale = 1.0f;
 
 	// Diagnostic: give characters a prop's geometry instead of their own.
 	// Whose eyes this is being traced from. Set each frame from the scene node's
 	// viewport, and used to apply the engine's owner visibility rules.
 	AActor* ViewActor = nullptr;
+
+	// The view's own basis, as world space directions: X right, Y down,
+	// Z forward, which is how the engine orients a scene node. Needed to place
+	// the first person weapon, which lives in view space rather than in the
+	// level.
+	FVector ViewOrigin = FVector(0, 0, 0);
+	FVector ViewRight = FVector(1, 0, 0);
+	FVector ViewDown = FVector(0, 1, 0);
+	FVector ViewForward = FVector(0, 0, 1);
+	void AddViewModel();
 
 	// Every texture the scene references, in the order the shader's array binds
 	// them. An index rather than a pointer travels into the attribute buffer.

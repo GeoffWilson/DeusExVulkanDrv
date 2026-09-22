@@ -103,7 +103,9 @@ public:
 	// lighting at all - which separates "not there" from "there but unlit".
 	INT DebugMode;
 	// Animation poses per mesh. 1 builds each character once, like a prop.
-	INT PoseBuckets;
+	// Percentage applied to every light's brightness. The engine's own
+	// brightnesses are faithful but conservative once traced rather than baked.
+	INT LightScale;
 	BITFIELD UseVSync;
 
 private:

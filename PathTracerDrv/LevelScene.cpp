@@ -120,6 +120,7 @@ void LevelScene::Clear()
 	Instances.clear();
 	BrushGeometry.clear();
 	MeshGeometry.clear();
+	ActorGeometry.clear();
 	PreviousPoses.clear();
 	CurrentPoses.clear();
 	Textures.clear();
@@ -142,7 +143,10 @@ bool LevelScene::BuildStatic(ULevel* level)
 
 	Geometries.emplace_back();
 	AddBspSurfaces(level->Model, Geometries.back(), true);
-	AddLights(level);
+	// Lights are gathered per frame in CollectDynamic rather than here. The
+	// light augmentation turns the player into a light, a thrown flare is a
+	// light that moves, and a lamp that is shot out stops being one - none of
+	// which a list built once at level load can express.
 
 	SourceLevel = level;
 	SourceNodeCount = level->Model->Nodes.Num();
@@ -278,12 +282,13 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 				const vec2 uv1 = surfaceUV(p1);
 				const vec2 uv2 = surfaceUV(p2);
 				const bool masked = (surf.Texture->PolyFlags & PF_Masked) != 0;
-				const bool translucent = (surf.PolyFlags & (PF_Translucent | PF_Modulated)) != 0;
+				const bool translucent = (surf.PolyFlags & PF_Translucent) != 0;
+				const bool modulated = (surf.PolyFlags & PF_Modulated) != 0;
 				const bool mirrored = (surf.PolyFlags & PF_Mirrored) != 0;
 				if (mirrored)
 					MirroredSurfaces++;
-				const float kind = mirrored ? 3.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f));
-				if (kind == 1.0f || kind == 2.0f)
+				const float kind = mirrored ? 3.0f : (modulated ? 4.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f)));
+				if (kind != 0.0f && kind != 3.0f)
 					out.HasMasked = true;
 				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
 				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, kind);
@@ -299,36 +304,30 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 	unguard;
 }
 
-void LevelScene::AddLights(ULevel* level)
+void LevelScene::AddLight(AActor* actor)
 {
-	guard(LevelScene::AddLights);
+	guardSlow(LevelScene::AddLight);
 
-	const INT actorCount = level->Actors.Num();
-	for (INT i = 0; i < actorCount; i++)
-	{
-		AActor* actor = level->Actors(i);
-		if (!actor)
-			continue;
-		if (actor->LightType == LT_None || actor->LightBrightness == 0)
-			continue;
+	if (actor->LightType == LT_None || actor->LightBrightness == 0)
+		return;
 
-		// FGetHSV is the engine's own conversion, so a light comes out the
-		// colour its author saw. Note the engine's saturation runs the other way
-		// round to the usual convention: 255 is white, 0 fully saturated.
-		FPlane c = FGetHSV(actor->LightHue, actor->LightSaturation, 255);
 
-		SceneLight light;
-		// LightRadius is stored in units of 25, which is why a radius of 8
-		// lights a whole room.
-		light.PositionRadius = vec4(actor->Location.X, actor->Location.Y, actor->Location.Z, actor->LightRadius * 25.0f);
+	// FGetHSV is the engine's own conversion, so a light comes out the
+	// colour its author saw. Note the engine's saturation runs the other way
+	// round to the usual convention: 255 is white, 0 fully saturated.
+	FPlane c = FGetHSV(actor->LightHue, actor->LightSaturation, 255);
 
-		const vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
-		light.ColorBrightness = vec4(colour.x, colour.y, colour.z, actor->LightBrightness / 255.0f);
+	SceneLight light;
+	// LightRadius is stored in units of 25, which is why a radius of 8
+	// lights a whole room.
+	light.PositionRadius = vec4(actor->Location.X, actor->Location.Y, actor->Location.Z, actor->LightRadius * 25.0f);
 
-		Lights.push_back(light);
-	}
+	const vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
+	light.ColorBrightness = vec4(colour.x, colour.y, colour.z, actor->LightBrightness / 255.0f * LightScale);
 
-	unguard;
+	Lights.push_back(light);
+
+	unguardSlow;
 }
 
 // A brush's own polygons, which is what the engine treats as its geometry.
@@ -370,10 +369,11 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 
 		const int textureIndex = TextureFor(poly.Texture);
 		const bool masked = poly.Texture && (poly.Texture->PolyFlags & PF_Masked) != 0;
-		const bool translucent = (poly.PolyFlags & (PF_Translucent | PF_Modulated)) != 0;
+		const bool translucent = (poly.PolyFlags & PF_Translucent) != 0;
+		const bool modulated = (poly.PolyFlags & PF_Modulated) != 0;
 		const bool mirrored = (poly.PolyFlags & PF_Mirrored) != 0;
-		const float kind = mirrored ? 3.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f));
-		if (kind == 1.0f || kind == 2.0f)
+		const float kind = mirrored ? 3.0f : (modulated ? 4.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f)));
+		if (kind != 0.0f && kind != 3.0f)
 			out.HasMasked = true;
 
 		const bool textured = textureIndex >= 0 && poly.Texture->USize > 0 && poly.Texture->VSize > 0;
@@ -426,6 +426,57 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 	unguard;
 }
 
+// Which two keyframes an actor is between, and how far.
+//
+// AnimFrame is a fraction of the actor's current sequence, so it lands between
+// two of that sequence's frames rather than on one. Taking only the nearer of
+// the two is what made every character move in steps.
+void LevelScene::AnimationPose(UMesh* mesh, FName sequence, FLOAT animFrame, int& frameA, int& frameB, float& alpha)
+{
+	const FMeshAnimSeq* seq = (sequence != NAME_None) ? mesh->GetAnimSeq(sequence) : nullptr;
+	const int start = seq ? seq->StartFrame : 0;
+	const int count = (seq && seq->NumFrames > 0) ? seq->NumFrames : Max(mesh->AnimFrames, 1);
+
+	const float position = Clamp((float)animFrame, 0.0f, 0.99999f) * count;
+	int a = (int)position;
+	alpha = position - (float)a;
+	a = Clamp(a, 0, count - 1);
+	// Held at the last frame rather than wrapping: the engine resets AnimFrame
+	// when a sequence loops, and blending the end back to the start would pass
+	// through a pose the animation never takes.
+	const int b = Min(a + 1, count - 1);
+
+	frameA = start + a;
+	frameB = start + b;
+}
+
+// An animated actor gets a geometry of its own, rebuilt every frame.
+//
+// Sharing one per quantised pose meant a character could only ever hold the
+// poses that had been built, and every new one leaked a structure that was
+// never freed.
+int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind)
+{
+	auto it = ActorGeometry.find(actor);
+	int index;
+	if (it != ActorGeometry.end())
+	{
+		index = it->second;
+	}
+	else
+	{
+		if ((int)ActorGeometry.size() >= MaxMeshGeometries)
+			return -1;
+		Geometries.emplace_back();
+		index = (int)Geometries.size() - 1;
+		Geometries[index].Dynamic = true;
+		ActorGeometry[actor] = index;
+		GeometryAdded = true;
+	}
+
+	return GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind);
+}
+
 int LevelScene::GeometryForBrush(UModel* brush)
 {
 	auto it = BrushGeometry.find(brush);
@@ -467,7 +518,32 @@ int LevelScene::TextureFor(UTexture* texture)
 	return index;
 }
 
-int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8])
+// Build a mesh's triangles for a pose.
+//
+// frameA and frameB are two keyframes and alpha blends between them, which is
+// how the engine animates: UE1 meshes store whole vertex positions per frame and
+// the pose between two of them is a straight interpolation. Passing the same
+// frame twice gives a single keyframe unchanged.
+//
+// reuseIndex rebuilds into an existing geometry rather than adding one. An
+// animated actor needs fresh vertices every frame, and adding a geometry per
+// frame per actor would grow without bound.
+// Translate an actor's rendering style into the surface kinds this tracer uses.
+// UE1 sets the mode per actor as well as per polygon, and reading only the
+// polygon flags left anything relying on Style - the red dot sight's reticle
+// among them - drawn as an opaque slab of whatever its texture averaged to.
+static float KindFromStyle(BYTE style)
+{
+	switch (style)
+	{
+	case STY_Masked:      return 1.0f;
+	case STY_Translucent: return 2.0f;
+	case STY_Modulated:   return 4.0f;
+	default:              return 0.0f;
+	}
+}
+
+int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex, float styleKind)
 {
 	// The skin set is part of the identity. Hashed rather than compared, so two
 	// actors in the same outfit share one structure instead of building another.
@@ -478,19 +554,26 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 		skinHash *= 1099511628211ull;
 	}
 
-	const uint64_t key = ((uint64_t)(uintptr_t)mesh << 20) ^ ((uint64_t)(frame & 0xfff) << 8) ^ (skinHash >> 16);
+	// Style is part of the identity: the same mesh drawn normally and drawn
+	// translucent are two different shapes as far as the tracer is concerned.
+	const uint64_t key = ((uint64_t)(uintptr_t)mesh << 20) ^ ((uint64_t)(frameA & 0xfff) << 8)
+		^ (skinHash >> 16) ^ ((uint64_t)(int)styleKind << 60);
 
-	auto it = MeshGeometry.find(key);
-	if (it != MeshGeometry.end())
-		return it->second;
+	if (reuseIndex < 0)
+	{
+		auto it = MeshGeometry.find(key);
+		if (it != MeshGeometry.end())
+			return it->second;
 
-	if ((int)MeshGeometry.size() >= MaxMeshGeometries)
-		return -1;
+		if ((int)MeshGeometry.size() >= MaxMeshGeometries)
+			return -1;
+	}
 
 	if (mesh->AnimFrames <= 0)
 		return -1;
 
-	frame = Clamp(frame, 0, mesh->AnimFrames - 1);
+	frameA = Clamp(frameA, 0, mesh->AnimFrames - 1);
+	frameB = Clamp(frameB, 0, mesh->AnimFrames - 1);
 
 	// Deus Ex's characters are ULodMesh, which keeps its geometry in Faces and
 	// Wedges rather than in the Tris it inherits - for those meshes Tris is
@@ -514,12 +597,19 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 	// one of those covering the camera is a black screen under lighting. Animals
 	// and props have no special vertices, which is why only people were affected.
 	const INT specialVerts = (useLod && !remap) ? lod->SpecialVerts : 0;
-	const INT base = frame * frameVerts + specialVerts;
+	const INT base = frameA * frameVerts + specialVerts;
+	const INT baseB = frameB * frameVerts + specialVerts;
 	if (base + (frameVerts - specialVerts) > mesh->Verts.Num())
 		return -1;
+	if (baseB + (frameVerts - specialVerts) > mesh->Verts.Num())
+		return -1;
 
-	Geometries.emplace_back();
-	SceneGeometry& geometry = Geometries.back();
+	if (reuseIndex < 0)
+		Geometries.emplace_back();
+	SceneGeometry& geometry = reuseIndex >= 0 ? Geometries[reuseIndex] : Geometries.back();
+	geometry.Positions.clear();
+	geometry.Attributes.clear();
+	geometry.HasMasked = false;
 
 	struct SourceTriangle
 	{
@@ -613,7 +703,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 		for (int v = 0; v < 3; v++)
 		{
 			const INT index = base + tri.iVertex[v];
+			const INT indexB = baseB + tri.iVertex[v];
 			if (index < 0 || index >= mesh->Verts.Num()) { ok = false; break; }
+			if (indexB < 0 || indexB >= mesh->Verts.Num()) { ok = false; break; }
 			// The mesh's own scale and origin are part of its definition rather
 			// than of the actor placing it. Origin is documented as being "in
 			// original coordinate system" - it is in raw vertex units, so it
@@ -621,7 +713,17 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 			// instead put every Deus Ex human 12200 units into the sky, because
 			// GM_Trench and its relatives carry Origin.Z = 12200 while animals
 			// and props carry zero - which is why the animals looked fine.
-			p[v] = (mesh->Verts(index).Vector() - mesh->Origin) * mesh->Scale;
+			// Interpolated between the two keyframes before anything else is
+			// applied. Both transforms below are linear, so blending the raw
+			// vertices and blending the finished positions come to the same
+			// thing.
+			FVector raw = mesh->Verts(index).Vector();
+			if (alpha > 0.0f)
+			{
+				const FVector rawB = mesh->Verts(indexB).Vector();
+				raw = raw + (rawB - raw) * alpha;
+			}
+			p[v] = (raw - mesh->Origin) * mesh->Scale;
 			if (rotateMesh)
 				p[v] = meshCoords.XAxis * p[v].X + meshCoords.YAxis * p[v].Y + meshCoords.ZAxis * p[v].Z;
 		}
@@ -664,10 +766,22 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 
 		const int textureIndex = TextureFor(skin);
 		const bool masked = skin && (skin->PolyFlags & PF_Masked) != 0;
-		const bool translucent = (tri.PolyFlags & (PF_Translucent | PF_Modulated)) != 0;
+		const bool translucent = (tri.PolyFlags & PF_Translucent) != 0;
+		const bool modulated = (tri.PolyFlags & PF_Modulated) != 0;
 		const bool mirrored = (tri.PolyFlags & PF_Mirrored) != 0;
-		const float kind = mirrored ? 3.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f));
-		if (kind == 1.0f || kind == 2.0f)
+		float kind = mirrored ? 3.0f : (modulated ? 4.0f : (translucent ? 2.0f : (masked ? 1.0f : 0.0f)));
+
+		// An actor drawn translucent or modulated is drawn that way whatever its
+		// polygons say - the style governs the whole mesh rather than filling in
+		// for polygons that carry no flags. The laser sight's dot is the case
+		// that shows it: its material is flagged masked, its texture has no hole
+		// to mask against, so treating the style as a fallback left an opaque
+		// quad shaded like a wall panel with the dot in the middle of it.
+		if (!mirrored && (styleKind == 2.0f || styleKind == 4.0f))
+			kind = styleKind;
+		else if (kind == 0.0f)
+			kind = styleKind;
+		if (kind != 0.0f && kind != 3.0f)
 			geometry.HasMasked = true;
 		attr.UV01 = vec4(tri.Tex[0].U / 255.0f, tri.Tex[0].V / 255.0f,
 		                 tri.Tex[1].U / 255.0f, tri.Tex[1].V / 255.0f);
@@ -683,6 +797,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 		geometry.Positions.push_back(v2);
 		geometry.Attributes.push_back(attr);
 	}
+
+	if (reuseIndex >= 0)
+		return geometry.Positions.empty() ? -1 : reuseIndex;
 
 	if (geometry.Positions.empty())
 	{
@@ -725,7 +842,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frame, UTexture* const skins[8]
 			mesh->GetName(),
 			useLod ? TEXT("lod") : TEXT("tris"),
 			(int)(geometry.Positions.size() / 3),
-			frame, mesh->AnimFrames,
+			frameA, mesh->AnimFrames,
 			hi.x - lo.x, hi.y - lo.y, hi.z - lo.z);
 	}
 
@@ -744,6 +861,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 	GeometryAdded = false;
 	Instances.clear();
+	Lights.clear();
 	CurrentPoses.clear();
 
 	if (Geometries.empty())
@@ -770,6 +888,11 @@ void LevelScene::CollectDynamic(ULevel* level)
 		AActor* actor = level->Actors(i);
 		if (!actor)
 			continue;
+
+		// Before the visibility rules: a light still lights the room when the
+		// actor carrying it is not drawn, which is exactly what the player's
+		// light augmentation is.
+		AddLight(actor);
 
 		if (actor->bHidden)
 		{
@@ -816,13 +939,9 @@ void LevelScene::CollectDynamic(ULevel* level)
 			// mesh's whole frame list. Spreading it over every frame the mesh
 			// owns picks a pose out of whatever animation happens to live at that
 			// offset, which is why characters cycled through unrelated motions.
-			const FMeshAnimSeq* seq =
-				actor->AnimSequence != NAME_None ? actor->Mesh->GetAnimSeq(actor->AnimSequence) : nullptr;
-			const int startFrame = seq ? seq->StartFrame : 0;
-			const int seqFrames = (seq && seq->NumFrames > 0) ? seq->NumFrames : Max(actor->Mesh->AnimFrames, 1);
-			const int buckets = Max(PoseBuckets, 1);
-			const int bucket = Clamp((int)(actor->AnimFrame * buckets), 0, buckets - 1);
-			const int frame = startFrame + (bucket * seqFrames) / buckets;
+			int frameA = 0, frameB = 0;
+			float alpha = 0.0f;
+			AnimationPose(actor->Mesh, actor->AnimSequence, actor->AnimFrame, frameA, frameB, alpha);
 
 			// MultiSkins is where a character's appearance lives. Deliberately
 			// NOT actor->Texture: on a pawn that is the editor's sprite icon -
@@ -849,7 +968,13 @@ void LevelScene::CollectDynamic(ULevel* level)
 					skins[i] = actor->Mesh->Textures(i);
 			}
 
-			geometryIndex = GeometryForMesh(actor->Mesh, frame, skins);
+			// Something that animates is rebuilt each frame at its exact pose;
+			// anything with a single frame is a shape that can be shared.
+			const float styleKind = KindFromStyle(actor->Style);
+			if (actor->Mesh->AnimFrames > 1)
+				geometryIndex = AnimatedGeometryFor(actor, actor->Mesh, frameA, frameB, alpha, skins, styleKind);
+			else
+				geometryIndex = GeometryForMesh(actor->Mesh, frameA, frameB, 0.0f, skins, -1, styleKind);
 			if (geometryIndex < 0)
 				skippedMesh++;
 			else
@@ -896,6 +1021,9 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 	}
 
+	AddViewModel();
+
+
 	// This frame's placements become next frame's comparison. Swapped rather
 	// than copied, and the old contents are cleared at the start of the next
 	// pass, so an actor that has gone away stops being tracked.
@@ -912,3 +1040,86 @@ void LevelScene::CollectDynamic(ULevel* level)
 }
 
 
+
+
+// The weapon or tool in the player's hands.
+//
+// The engine draws this as a separate view space pass with its own field of
+// view, which this device never sees: it builds the scene from the level rather
+// than from what it is handed. So it is placed here instead, at the view's own
+// origin and oriented along the view's axes.
+void LevelScene::AddViewModel()
+{
+	guard(LevelScene::AddViewModel);
+
+	APawn* pawn = Cast<APawn>(ViewActor);
+	if (!pawn || !pawn->Weapon)
+		return;
+
+	AInventory* item = pawn->Weapon;
+
+	// Deus Ex puts the first person model on the inventory actor's own Mesh and
+	// hides the actor, rather than filling in PlayerViewMesh - which is why the
+	// earlier log showed NanoKeyRingPOV on a hidden actor.
+	UMesh* mesh = item->PlayerViewMesh ? item->PlayerViewMesh : item->Mesh;
+
+	if (!mesh || mesh->AnimFrames <= 0)
+		return;
+
+	UTexture* skins[8] = {};
+	for (int i = 0; i < 8; i++)
+	{
+		if (item->MultiSkins[i])
+			skins[i] = item->MultiSkins[i];
+		else if (i != 0 && i < mesh->Textures.Num() && mesh->Textures(i))
+			skins[i] = mesh->Textures(i);
+		else if (item->Skin)
+			skins[i] = item->Skin;
+		else if (i < mesh->Textures.Num())
+			skins[i] = mesh->Textures(i);
+	}
+
+	int frameA = 0, frameB = 0;
+	float alpha = 0.0f;
+	AnimationPose(mesh, item->AnimSequence, item->AnimFrame, frameA, frameB, alpha);
+
+	const float styleKind = KindFromStyle(item->Style);
+	const int geometryIndex = (mesh->AnimFrames > 1)
+		? AnimatedGeometryFor(item, mesh, frameA, frameB, alpha, skins, styleKind)
+		: GeometryForMesh(mesh, frameA, frameB, 0.0f, skins, -1, styleKind);
+
+	// PlayerViewOffset is in the view's own terms: X ahead, Y to the right,
+	// Z up. The scene node's axes are X right, Y down, Z forward, so up is
+	// minus the down axis.
+	const FVector up = -ViewDown;
+	// Deus Ex stores this scaled by a hundred: the pistol reads 2200, 1000,
+	// -1400, which taken literally puts the weapon 2200 units in front of the
+	// camera and well outside the level.
+	const FVector offset = item->PlayerViewOffset * 0.01f;
+	const FVector position =
+		ViewOrigin + ViewForward * offset.X + ViewRight * offset.Y + up * offset.Z;
+
+	// A mesh faces along its own X, so that axis points down the view.
+	const FVector axes[3] = { ViewForward, ViewRight, up };
+	const float scale = item->PlayerViewScale != 0.0f ? item->PlayerViewScale : 1.0f;
+
+	SceneInstance instance;
+	instance.GeometryIndex = geometryIndex;
+	for (int col = 0; col < 3; col++)
+	{
+		instance.Transform[0 * 4 + col] = axes[col].X * scale;
+		instance.Transform[1 * 4 + col] = axes[col].Y * scale;
+		instance.Transform[2 * 4 + col] = axes[col].Z * scale;
+	}
+	instance.Transform[0 * 4 + 3] = position.X;
+	instance.Transform[1 * 4 + 3] = position.Y;
+	instance.Transform[2 * 4 + 3] = position.Z;
+
+	const vec3 ambient = ZoneAmbient(ViewActor->Region.Zone);
+	// Always counted as having moved: it rides the camera, and it bobs even
+	// when the camera does not.
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, 1.0f);
+	Instances.push_back(instance);
+
+	unguard;
+}

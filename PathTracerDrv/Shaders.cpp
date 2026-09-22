@@ -130,16 +130,17 @@ std::string Shaders::Trace()
 		//   masked      only where the texture's alpha says the texel is there.
 		//               UE1 keys transparency to palette index zero, and drawing
 		//               those texels put the key colour across every grate.
-		//   translucent with a probability equal to its opacity, so most rays
-		//               carry on through a window and some stop on the glass.
+		//   translucent always for a view ray, which then adds the surface's
+		//               colour and carries on through it; never for a shadow
+		//               ray, since glass does not stop light.
 		//
-		// Accepting stochastically rather than tinting as the ray passes. A ray
-		// query reports candidates in whatever order traversal reaches them,
-		// including ones beyond what turns out to be the closest opaque hit, so
-		// tinting during traversal let glass behind a wall colour the pixel in
-		// front of it. Deciding here shrinks the ray properly, and averaging
-		// over frames is what makes the glass look partly transparent.
-		bool confirmCandidate(int attributeBase, int primitive, vec2 bary)
+		// Confirming rather than tinting during traversal. A ray query reports
+		// candidates in whatever order traversal reaches them, including ones
+		// beyond what turns out to be the closest opaque hit, so accumulating
+		// anything as the ray passes let glass behind a wall colour the pixel in
+		// front of it. Confirming shrinks the ray properly and keeps the hits in
+		// order.
+		bool confirmCandidate(int attributeBase, int primitive, vec2 bary, bool shadowRay)
 		{
 			TriangleAttributes attr = tris[attributeBase + primitive];
 			float kind = attr.UV2Tex.w;
@@ -160,7 +161,9 @@ std::string Shaders::Trace()
 			if (kind > 2.5)
 				return true;
 
-			return randomFloat() < 0.25;
+			// Translucent adds and modulated multiplies; both are handled at the
+			// hit and neither stops light.
+			return !shadowRay;
 		}
 
 		// Is anything between two points? Terminate on the first hit rather than
@@ -182,7 +185,8 @@ std::string Shaders::Trace()
 					if (confirmCandidate(
 							rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 							rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
-							rayQueryGetIntersectionBarycentricsEXT(rq, false)))
+							rayQueryGetIntersectionBarycentricsEXT(rq, false),
+							true))
 						rayQueryConfirmIntersectionEXT(rq);
 				}
 			}
@@ -235,11 +239,14 @@ std::string Shaders::Trace()
 				if (cosTheta <= 0.0)
 					continue;
 
-				// The engine's own falloff, linear to zero at the radius, which
-				// is what its lightmaps were baked with. Keeping it means a
-				// level lights the way its author saw it.
+				// Linear to zero at the radius. The comment here used to say
+				// linear and then square it, which is the curve the baked
+				// lightmaps used rather than the one the engine applies to
+				// dynamic lighting. Squaring it costs most of a light's useful
+				// range: the player's light augmentation has a radius of only
+				// 100 units, so at one metre it had already fallen to a quarter
+				// and at two metres to nothing.
 				float falloff = 1.0 - distance / radius;
-				falloff = falloff * falloff;
 
 				vec3 value = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * cosTheta);
 				float weight = dot(value, vec3(0.2126, 0.7152, 0.0722));
@@ -300,6 +307,10 @@ std::string Shaders::Trace()
 
 			vec3 radiance = vec3(0.0);
 			vec3 throughput = vec3(1.0);
+			// Passing through a translucent surface is not a bounce: a window
+			// with a pane and a frame would otherwise use up the ray's budget
+			// before it reached anything solid.
+			uint passes = 0u;
 
 			// What this pixel is looking at, recorded on the first bounce so the
 			// accumulated history can be checked against it.
@@ -322,7 +333,8 @@ std::string Shaders::Trace()
 						if (confirmCandidate(
 								rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 								rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
-								rayQueryGetIntersectionBarycentricsEXT(rq, false)))
+								rayQueryGetIntersectionBarycentricsEXT(rq, false),
+								false))
 							rayQueryConfirmIntersectionEXT(rq);
 					}
 				}
@@ -359,6 +371,38 @@ std::string Shaders::Trace()
 				// though it had never turned.
 				mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 				vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
+
+				// Translucent: add what this surface contributes and carry on
+				// through it in the same direction. UE1 draws these additively,
+				// which is why the muzzle flash quad on a weapon is invisible
+				// until it is lit and why a red dot sight glows rather than
+				// showing as a dark blob.
+				float kind = attr.UV2Tex.w;
+				if ((kind > 1.5 && kind < 2.5) || kind > 3.5)
+				{
+					if (kind > 3.5)
+					{
+						// Modulated: the surface multiplies what is behind it,
+						// as modulate-2x, so mid grey leaves the background
+						// alone. Treating it as additive along with translucent
+						// turned a pair of dark sunglasses bright white.
+						throughput *= clamp(attr.Albedo.rgb * 2.0, vec3(0.0), vec3(1.0));
+					}
+					else
+					{
+						// Translucent: additive, so black is invisible and
+						// bright glows.
+						radiance += throughput * attr.Albedo.rgb;
+					}
+
+					origin = position + direction * (Params.z * 2.0);
+					if (passes < 8u)
+					{
+						passes++;
+						bounce--;
+					}
+					continue;
+				}
 
 				// A reflective surface - the polished floor of the UNATCO lobby
 				// is the one that shows. Half the rays carry on in the mirrored

@@ -64,6 +64,7 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 			const uint32_t alpha = (masked && index == 0) ? 0u : 255u;
 			pixels[i] = (alpha << 24) | ((uint32_t)c.B << 16) | ((uint32_t)c.G << 8) | (uint32_t)c.R;
 		}
+
 		break;
 	}
 	case TEXF_RGBA8:
@@ -128,6 +129,34 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 	}
 
 	auto cached = std::make_unique<CachedTexture>();
+
+	// Masked art that is not paletted has no index zero to key against. UE1's
+	// convention there is a black colour key, and without it a masked texture in
+	// one of these formats comes out fully opaque - the scope crosshair as a
+	// black square with the cross inside it.
+	//
+	// Only when nothing in the image is already transparent, so a texture that
+	// carries a real alpha channel keeps it.
+	if (masked && info.Format != TEXF_P8)
+	{
+		bool anyTransparent = false;
+		for (uint32_t px : pixels)
+		{
+			if ((px >> 24) != 255u)
+			{
+				anyTransparent = true;
+				break;
+			}
+		}
+		if (!anyTransparent)
+		{
+			for (uint32_t& px : pixels)
+			{
+				if ((px & 0x00ffffffu) == 0u)
+					px = 0u;
+			}
+		}
+	}
 
 	cached->Image = ImageBuilder()
 		.Format(VK_FORMAT_R8G8B8A8_UNORM)

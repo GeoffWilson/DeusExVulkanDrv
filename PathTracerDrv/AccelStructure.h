@@ -57,12 +57,21 @@ private:
 		std::unique_ptr<VulkanBuffer> Vertices;
 		std::unique_ptr<VulkanBuffer> Buffer;
 		std::unique_ptr<VulkanAccelerationStructure> Structure;
+		std::unique_ptr<VulkanBuffer> Scratch;
 		uint32_t AttributeBase = 0;
 		int TriangleCount = 0;
+		// Rebuilt every frame from host-written vertices, rather than built once
+		// and instanced. An animated character's shape genuinely changes.
+		bool Dynamic = false;
+		size_t VertexCapacity = 0;
 	};
 
 	std::unique_ptr<VulkanBuffer> UploadBuffer(const void* data, size_t size, VkBufferUsageFlags usage, const char* debugName);
 	void BuildBottomLevel(const SceneGeometry& geometry, BottomLevel& out);
+	void CreateDynamicBottomLevel(const SceneGeometry& geometry, BottomLevel& out);
+	void WriteDynamicGeometry(const LevelScene& scene);
+	void RecordDynamicBuilds(const LevelScene& scene, VulkanCommandBuffer* commands);
+	void EnsureAttributeCapacity(size_t count);
 	void EnsureTopLevelCapacity(size_t instanceCount);
 
 	UPathTracerRenderDevice* renderer = nullptr;
@@ -80,6 +89,9 @@ private:
 
 	size_t TopCapacity = 0;
 	int Lights = 0;
+	size_t LightCapacity = 0;
+	size_t AttributeCapacity = 0;
+	bool haveDynamic = false;
 	bool attributesChanged = false;
 	bool LoggedInstances = false;
 };

@@ -38,7 +38,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	VkDeviceIndex = 0;
 	VkDebug = 0;
 	DebugMode = 0;
-	PoseBuckets = 12;
+	LightScale = 100;
 	UseVSync = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
@@ -48,7 +48,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("VkDeviceIndex"), RF_Public) UIntProperty(CPP_PROPERTY(VkDeviceIndex), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDebug"), RF_Public) UBoolProperty(CPP_PROPERTY(VkDebug), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DebugMode"), RF_Public) UIntProperty(CPP_PROPERTY(DebugMode), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("PoseBuckets"), RF_Public) UIntProperty(CPP_PROPERTY(PoseBuckets), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("LightScale"), RF_Public) UIntProperty(CPP_PROPERTY(LightScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
 
 	unguard;
@@ -718,6 +718,7 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	// Every frame: where the movers and the mesh actors are now. New shapes get
 	// a bottom level structure the first time they are seen.
 	const size_t geometriesBefore = Scene.Geometries.size();
+	Scene.LightScale = Max(LightScale, 1) / 100.0f;
 	Scene.CollectDynamic(level);
 	Accel->SyncGeometry(Scene);
 
@@ -749,6 +750,12 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// Whose view this is, so the actor collection can skip the player's own body
 	// and honour the owner-only visibility flags.
 	Scene.ViewActor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
+
+	// The view's basis, kept for placing the first person weapon.
+	Scene.ViewOrigin = Frame->Coords.Origin;
+	Scene.ViewRight = Frame->Coords.XAxis;
+	Scene.ViewDown = Frame->Coords.YAxis;
+	Scene.ViewForward = Frame->Coords.ZAxis;
 
 	EnsureSceneBuilt(Frame->Level);
 
@@ -1094,6 +1101,11 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	else if (flags & PF_Modulated)
 		blendMode = 2;
 
+	// What each piece of 2D art actually asks for. The crosshair of a scope
+	// arrives as a black square, which means it is not asking for the additive
+	// blend its artwork assumes.
+	// Only once a level is up: the menu has enough art to use the whole budget
+	// before anything in the game is drawn, which it has done twice now.
 	// The engine gives tile positions in viewport pixels including the frame's
 	// own offset, and texture coordinates in texels.
 	const float x0 = (X + Frame->XB);
