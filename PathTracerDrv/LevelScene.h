@@ -96,7 +96,7 @@ public:
 
 private:
 	static void AnimationPose(UMesh* mesh, FName sequence, FLOAT animFrame, int& frameA, int& frameB, float& alpha);
-	int AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind = 0.0f);
+	int AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind = 0.0f, const FCoords* toLocal = nullptr);
 	void AddBrushPolys(UModel* brush, SceneGeometry& out);
 	void AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals);
 	void AddLight(AActor* actor);
@@ -107,7 +107,7 @@ private:
 	// The skins are part of the key: Deus Ex puts a character's appearance on
 	// the actor rather than the mesh, so two people sharing a mesh are only the
 	// same shape if they are also wearing the same thing.
-	int GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex = -1, float styleKind = 0.0f);
+	int GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex = -1, float styleKind = 0.0f, AActor* owner = nullptr, const FCoords* toLocal = nullptr);
 
 	// One shot diagnostics, reset per level.
 	int MeshesLogged = 0;

@@ -124,6 +124,11 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 
 		CreateTracePipeline();
 		CreateTilePipeline();
+
+		// Says the shaders compiled and the pipelines exist. Without it a
+		// failure and a successful start that simply never rendered a level
+		// look the same in the log: device named, then nothing.
+		debugf(TEXT("PathTracer ready"));
 	}
 	catch (const std::exception& e)
 	{
@@ -876,6 +881,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		auto commands = CommandPool->createBuffer();
 		commands->begin();
 
+		// Textures that generate themselves get a chance to advance before the
+		// trace reads them, recorded into this frame's command buffer rather
+		// than submitted one at a time.
+		if (Textures && Viewport && Viewport->Actor && Viewport->Actor->Level)
+			Textures->RefreshRealtime(Viewport->Actor->Level->TimeSeconds, commands.get(), RealtimeStaging);
+
 		// The top level structure is rebuilt every frame, because the movers and
 		// the actors have all moved since the last one.
 		bool traceThisFrame = HaveCamera;
@@ -952,6 +963,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		VkFence handle = RenderFinishedFence->fence;
 		vkWaitForFences(Device->device, 1, &handle, VK_TRUE, std::numeric_limits<uint64_t>::max());
 		vkResetFences(Device->device, 1, &handle);
+
+		// The submission is done with them now.
+		RealtimeStaging.clear();
 
 		if (AccumulatedFrames < (uint32_t)Max(MaxAccumulatedFrames, 1))
 			AccumulatedFrames++;

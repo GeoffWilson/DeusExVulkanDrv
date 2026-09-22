@@ -33,27 +33,32 @@ CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
 	return result;
 }
 
-std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet)
+// Expand a texture's top mip into RGBA8.
+//
+// Separated from the upload so that a texture which regenerates itself - fire,
+// water, a computer screen - can be converted again into the image it already
+// has, rather than being cached once at whatever frame it was first seen on.
+bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height)
 {
-	guard(TextureCache::Upload);
+	guard(TextureCache::ConvertPixels);
 
 	if (info.NumMips < 1 || !info.Mips[0] || !info.Mips[0]->DataPtr)
-		return nullptr;
+		return false;
 
 	const FMipmapBase* mip = info.Mips[0];
-	const int width = mip->USize;
-	const int height = mip->VSize;
+	width = mip->USize;
+	height = mip->VSize;
 	if (width <= 0 || height <= 0)
-		return nullptr;
+		return false;
 
-	std::vector<uint32_t> pixels((size_t)width * height, 0xffffffffu);
+	pixels.assign((size_t)width * height, 0xffffffffu);
 
 	switch (info.Format)
 	{
 	case TEXF_P8:
 	{
 		if (!info.Palette)
-			return nullptr;
+			return false;
 		const BYTE* src = mip->DataPtr;
 		for (size_t i = 0; i < pixels.size(); i++)
 		{
@@ -158,6 +163,22 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 		}
 	}
 
+	return true;
+
+	unguard;
+}
+
+std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet)
+{
+	guard(TextureCache::Upload);
+
+	std::vector<uint32_t> pixels;
+	int width = 0, height = 0;
+	if (!ConvertPixels(info, masked, pixels, width, height))
+		return nullptr;
+
+	auto cached = std::make_unique<CachedTexture>();
+
 	cached->Image = ImageBuilder()
 		.Format(VK_FORMAT_R8G8B8A8_UNORM)
 		.Size(width, height)
@@ -261,6 +282,20 @@ CachedTexture* TextureCache::GetForScene(UTexture* texture)
 	auto uploaded = Upload(info, (texture->PolyFlags & PF_Masked) != 0, false);
 
 	CachedTexture* result = uploaded.get();
+	if (result)
+	{
+		result->Source = texture;
+		// bParametric textures are generated rather than stored, and bRealtime
+		// ones change as they are drawn. Either way the copy taken at the first
+		// sighting is only ever right for that one frame.
+		// AnimNext means a chain of textures cycled through in turn - how the
+		// engine animates a screen or a television - so the pixels live on a
+		// different object each frame rather than being regenerated in place.
+		result->Realtime = texture->bRealtime || texture->bParametric || texture->AnimNext != nullptr;
+		result->Width = mip.USize;
+		result->Height = mip.VSize;
+		result->Masked = (texture->PolyFlags & PF_Masked) != 0;
+	}
 	SceneTextures[texture] = std::move(uploaded);
 	return result;
 
@@ -287,4 +322,106 @@ CachedTexture* TextureCache::White()
 
 	WhitePixel = Upload(info, false, false);
 	return WhitePixel.get();
+}
+
+
+void TextureCache::RefreshRealtime(double time, VulkanCommandBuffer* commands, std::vector<std::unique_ptr<VulkanBuffer>>& keepAlive)
+{
+	guard(TextureCache::RefreshRealtime);
+
+	std::vector<uint32_t> pixels;
+
+	for (auto& entry : SceneTextures)
+	{
+		CachedTexture* cached = entry.second.get();
+		if (!cached || !cached->Source || !cached->Image)
+			continue;
+
+		UTexture* texture = cached->Source;
+
+		// Asked afresh every frame rather than remembered from the upload. A
+		// face's texture is an ordinary still until its owner starts talking,
+		// at which point the conversation gives it a chain of mouth shapes to
+		// cycle through - and a flag recorded at first sighting says no for
+		// ever, which is why faces never moved.
+		const bool animates = texture->bRealtime || texture->bParametric || texture->AnimNext != nullptr;
+		if (!animates)
+			continue;
+		cached->Realtime = true;
+
+		// Get advances the texture and hands back the frame to read. For one
+		// that regenerates itself that is the texture again; for an animation
+		// chain it is whichever link is current, which is why following only the
+		// base object left every screen and television on its first frame.
+		//
+		// The engine does this from inside Lock, which this device bypasses, so
+		// nothing was asking them to advance at all.
+		UTexture* frame = texture->Get(time);
+		if (!frame || frame->Mips.Num() < 1)
+			continue;
+
+		// An animation chain only needs uploading when it has actually moved on,
+		// which for a screen running at a few frames a second is rarely. One
+		// that regenerates in place has no such tell and is always re-read.
+		const bool regenerates = texture->bRealtime || texture->bParametric;
+		if (!regenerates && frame == cached->LastFrame)
+			continue;
+		cached->LastFrame = frame;
+		FMipmap& mip = frame->Mips(0);
+		if (mip.USize != cached->Width || mip.VSize != cached->Height || mip.DataArray.Num() <= 0)
+			continue;
+		if (frame->Format == TEXF_P8 && mip.DataArray.Num() < mip.USize * mip.VSize)
+			continue;
+
+		FTextureInfo info = {};
+		info.Texture = frame;
+		info.NumMips = 1;
+		info.Mips[0] = &mip;
+		info.Format = (ETextureFormat)frame->Format;
+		info.USize = mip.USize;
+		info.VSize = mip.VSize;
+		info.Palette = (frame->Palette && frame->Palette->Colors.Num() > 0)
+			? &frame->Palette->Colors(0) : nullptr;
+		mip.DataPtr = &mip.DataArray(0);
+
+		int width = 0, height = 0;
+		if (!ConvertPixels(info, cached->Masked, pixels, width, height))
+			continue;
+
+		const size_t byteSize = pixels.size() * sizeof(uint32_t);
+		auto staging = BufferBuilder()
+			.Size(byteSize)
+			.Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY)
+			.DebugName("PathTracerRealtimeStaging")
+			.Create(renderer->GetDevice());
+
+		void* mapped = staging->Map(0, byteSize);
+		memcpy(mapped, pixels.data(), byteSize);
+		staging->Unmap();
+
+		// Copied into the image that already exists rather than making a new
+		// one, so the texture array's descriptors stay valid.
+		VulkanImage* image = cached->Image.get();
+		VulkanBuffer* src = staging.get();
+		{
+			VulkanCommandBuffer* cmd = commands;
+			PipelineBarrier()
+				.AddImage(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+				.Execute(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+			VkBufferImageCopy region = {};
+			region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			region.imageSubresource.layerCount = 1;
+			region.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
+			cmd->copyBufferToImage(src->buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+			PipelineBarrier()
+				.AddImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+				.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		}
+
+		keepAlive.push_back(std::move(staging));
+	}
+
+	unguard;
 }

@@ -161,6 +161,18 @@ bool LevelScene::BuildStatic(ULevel* level)
 //
 // A node carries a fan of vertices in its own plane, so the normal is the
 // plane's and the fan triangulates without any smoothing to reconstruct.
+// Does this texture change by itself? Either it regenerates in place, or it is
+// a link in an animation chain. A surface wearing one cannot reuse what was
+// accumulated for it on earlier frames.
+static bool TextureAnimates(UTexture* texture)
+{
+	// Judged when the geometry is built. A texture that only gains its
+	// animation later - a face, once its owner starts speaking - will not be
+	// caught here, but an animated actor's geometry is rebuilt every frame
+	// anyway, so its flag is re-evaluated along with it.
+	return texture && (texture->bRealtime || texture->bParametric || texture->AnimNext != nullptr);
+}
+
 void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals)
 {
 	guard(LevelScene::AddBspSurfaces);
@@ -215,7 +227,7 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 
 		TriangleAttributes attr;
 		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
-		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, 0.0f);
+		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(surf.Texture) ? 1.0f : 0.0f);
 		// w marks the surface as self lit. The colour it emits is whatever it
 		// turns out to be once sampled, so it cannot be decided here: doing so
 		// is what made unlit masked surfaces glow the key colour.
@@ -361,7 +373,7 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 
 		TriangleAttributes attr;
 		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
-		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, 0.0f);
+		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(poly.Texture) ? 1.0f : 0.0f);
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
 		// A mover is instanced into whatever room it stands in, so its ambient
 		// comes from the instance.
@@ -455,7 +467,7 @@ void LevelScene::AnimationPose(UMesh* mesh, FName sequence, FLOAT animFrame, int
 // Sharing one per quantised pose meant a character could only ever hold the
 // poses that had been built, and every new one leaked a structure that was
 // never freed.
-int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind)
+int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind, const FCoords* toLocal)
 {
 	auto it = ActorGeometry.find(actor);
 	int index;
@@ -474,7 +486,7 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 		GeometryAdded = true;
 	}
 
-	return GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind);
+	return GeometryForMesh(mesh, frameA, frameB, alpha, skins, index, styleKind, actor, toLocal);
 }
 
 int LevelScene::GeometryForBrush(UModel* brush)
@@ -543,7 +555,7 @@ static float KindFromStyle(BYTE style)
 	}
 }
 
-int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex, float styleKind)
+int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex, float styleKind, AActor* owner, const FCoords* toLocal)
 {
 	// The skin set is part of the identity. Hashed rather than compared, so two
 	// actors in the same outfit share one structure instead of building another.
@@ -599,10 +611,49 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	const INT specialVerts = (useLod && !remap) ? lod->SpecialVerts : 0;
 	const INT base = frameA * frameVerts + specialVerts;
 	const INT baseB = frameB * frameVerts + specialVerts;
-	if (base + (frameVerts - specialVerts) > mesh->Verts.Num())
+
+	// With an owner, the pose comes from the engine rather than from reading
+	// keyframes here. Deus Ex animates on more than one channel at once: the
+	// body plays AnimSequence while up to four blend channels play on top of
+	// it, and lip sync is one of those - a talking character's mouth shapes
+	// are a blend sequence, not a texture, which is why faces stayed still
+	// while every skin and texture measured unchanged. ULodMesh::GetFrame is
+	// what the stock renderer calls and it folds all of the channels in, along
+	// with the tween between sequences that negative AnimFrame asks for.
+	//
+	// It returns the attachment vertices first and then the visible ones in
+	// the order the wedges index, already remapped. The coordinates handed to
+	// it take world space back into the instance's own, so the points land in
+	// the same space the keyframe path produces and the instance transform is
+	// untouched.
+	std::vector<FVector> enginePoints;
+	const bool enginePose = owner && toLocal && useLod && lod->ModelVerts > 0;
+	if (enginePose)
+	{
+		INT request = lod->ModelVerts;
+		enginePoints.resize(lod->SpecialVerts + Max(lod->ModelVerts, lod->FrameVerts) + 1);
+		lod->GetFrame(&enginePoints[0], sizeof(FVector), *toLocal, owner, request);
+	}
+	const bool keyframesValid =
+		base + (frameVerts - specialVerts) <= mesh->Verts.Num() &&
+		baseB + (frameVerts - specialVerts) <= mesh->Verts.Num();
+	if (!enginePose && !keyframesValid)
 		return -1;
-	if (baseB + (frameVerts - specialVerts) > mesh->Verts.Num())
-		return -1;
+
+	// While a blend channel is playing, the parts it moves - a talking mouth -
+	// change shape without the actor moving, so the actor's placement says
+	// nothing changed and the trace kept averaging the face against earlier
+	// mouth shapes into a smear. Those parts are found by comparing the
+	// engine's pose against the body's own keyframes: whatever differs is
+	// being moved by something other than the body's sequence. Only those
+	// triangles lose their history; the rest of the character keeps its own.
+	bool blendActive = false;
+	if (enginePose && keyframesValid)
+	{
+		for (int i = 0; i < 4; i++)
+			if (owner->BlendAnimSequence[i] != NAME_None)
+				blendActive = true;
+	}
 
 	if (reuseIndex < 0)
 		Geometries.emplace_back();
@@ -614,6 +665,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	struct SourceTriangle
 	{
 		INT iVertex[3];
+		// The same corners as indices into the stored keyframes, which for a
+		// remapped mesh are not the ones the engine's pose is ordered by.
+		INT keyVertex[3];
 		// UE1 stores mesh texture coordinates as a byte per axis spanning the
 		// whole texture, so they divide out to 0..1 rather than needing the
 		// texture's size the way a BSP surface does.
@@ -647,12 +701,14 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 				if (iWedge >= lod->Wedges.Num()) { ok = false; break; }
 				tri.Tex[v] = lod->Wedges(iWedge).TexUV;
 				INT iVertex = lod->Wedges(iWedge).iVertex;
+				INT keyVertex = iVertex;
 				if (remap)
 				{
 					if (iVertex >= lod->RemapAnimVerts.Num()) { ok = false; break; }
-					iVertex = lod->RemapAnimVerts(iVertex);
+					keyVertex = lod->RemapAnimVerts(iVertex);
 				}
-				tri.iVertex[v] = iVertex;
+				tri.iVertex[v] = enginePose ? iVertex : keyVertex;
+				tri.keyVertex[v] = keyVertex;
 			}
 			if (ok)
 				triangles.push_back(tri);
@@ -668,6 +724,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			tri.iVertex[0] = src.iVertex[0];
 			tri.iVertex[1] = src.iVertex[1];
 			tri.iVertex[2] = src.iVertex[2];
+			tri.keyVertex[0] = src.iVertex[0];
+			tri.keyVertex[1] = src.iVertex[1];
+			tri.keyVertex[2] = src.iVertex[2];
 			tri.Tex[0] = src.Tex[0];
 			tri.Tex[1] = src.Tex[1];
 			tri.Tex[2] = src.Tex[2];
@@ -700,10 +759,24 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 
 		FVector p[3];
 		bool ok = true;
+		bool blended = false;
 		for (int v = 0; v < 3; v++)
 		{
-			const INT index = base + tri.iVertex[v];
-			const INT indexB = baseB + tri.iVertex[v];
+			FVector posed;
+			if (enginePose)
+			{
+				const size_t index = (size_t)lod->SpecialVerts + (size_t)tri.iVertex[v];
+				if (index >= enginePoints.size()) { ok = false; break; }
+				posed = enginePoints[index];
+				if (!blendActive)
+				{
+					p[v] = posed;
+					continue;
+				}
+			}
+
+			const INT index = base + tri.keyVertex[v];
+			const INT indexB = baseB + tri.keyVertex[v];
 			if (index < 0 || index >= mesh->Verts.Num()) { ok = false; break; }
 			if (indexB < 0 || indexB >= mesh->Verts.Num()) { ok = false; break; }
 			// The mesh's own scale and origin are part of its definition rather
@@ -726,6 +799,15 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			p[v] = (raw - mesh->Origin) * mesh->Scale;
 			if (rotateMesh)
 				p[v] = meshCoords.XAxis * p[v].X + meshCoords.YAxis * p[v].Y + meshCoords.ZAxis * p[v].Z;
+
+			if (enginePose)
+			{
+				// A small tolerance: the two poses are built by different code
+				// and need not agree to the last bit where nothing moved them.
+				if ((posed - p[v]).SizeSquared() > 0.05f * 0.05f)
+					blended = true;
+				p[v] = posed;
+			}
 		}
 		if (!ok)
 			continue;
@@ -758,7 +840,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 
 		TriangleAttributes attr;
 		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
-		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, 0.0f);
+		// w says the surface keeps no history: a texture that animates, or a
+		// part being moved by a blend channel.
+		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, (blended || TextureAnimates(skin)) ? 1.0f : 0.0f);
 		// w marks the surface as self lit. The colour it emits is whatever it
 		// turns out to be once sampled, so it cannot be decided here: doing so
 		// is what made unlit masked surfaces glow the key colour.
@@ -958,7 +1042,12 @@ void LevelScene::CollectDynamic(ULevel* level)
 			UTexture* skins[8] = {};
 			for (int i = 0; i < 8; i++)
 			{
-				if (actor->MultiSkins[i])
+				// GetSkin first, which is what UMesh::GetTexture does and what
+				// reading MultiSkins directly skips. It is virtual, so a class
+				// may answer differently from what the array holds.
+				if (actor->GetSkin(i))
+					skins[i] = actor->GetSkin(i);
+				else if (actor->MultiSkins[i])
 					skins[i] = actor->MultiSkins[i];
 				else if (i != 0 && i < actor->Mesh->Textures.Num() && actor->Mesh->Textures(i))
 					skins[i] = actor->Mesh->Textures(i);
@@ -971,8 +1060,24 @@ void LevelScene::CollectDynamic(ULevel* level)
 			// Something that animates is rebuilt each frame at its exact pose;
 			// anything with a single frame is a shape that can be shared.
 			const float styleKind = KindFromStyle(actor->Style);
+			// The same placement the instance gets below, inverted, so the engine
+			// can hand back its pose in the instance's own space. The columns are
+			// the rotation's axes times the draw scale, and dividing each by its
+			// squared length gives the rows of the inverse.
+			const float drawScale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
+			float placement[12];
+			MakeTransform(actor->Location, actor->Rotation, FVector(drawScale, drawScale, drawScale), actor->PrePivot, placement);
+			FCoords toLocal;
+			toLocal.Origin = FVector(placement[3], placement[7], placement[11]);
+			FVector* rows[3] = { &toLocal.XAxis, &toLocal.YAxis, &toLocal.ZAxis };
+			for (int c = 0; c < 3; c++)
+			{
+				const FVector column(placement[0 * 4 + c], placement[1 * 4 + c], placement[2 * 4 + c]);
+				*rows[c] = column / column.SizeSquared();
+			}
+
 			if (actor->Mesh->AnimFrames > 1)
-				geometryIndex = AnimatedGeometryFor(actor, actor->Mesh, frameA, frameB, alpha, skins, styleKind);
+				geometryIndex = AnimatedGeometryFor(actor, actor->Mesh, frameA, frameB, alpha, skins, styleKind, &toLocal);
 			else
 				geometryIndex = GeometryForMesh(actor->Mesh, frameA, frameB, 0.0f, skins, -1, styleKind);
 			if (geometryIndex < 0)
@@ -1069,7 +1174,9 @@ void LevelScene::AddViewModel()
 	UTexture* skins[8] = {};
 	for (int i = 0; i < 8; i++)
 	{
-		if (item->MultiSkins[i])
+		if (item->GetSkin(i))
+			skins[i] = item->GetSkin(i);
+		else if (item->MultiSkins[i])
 			skins[i] = item->MultiSkins[i];
 		else if (i != 0 && i < mesh->Textures.Num() && mesh->Textures(i))
 			skins[i] = mesh->Textures(i);

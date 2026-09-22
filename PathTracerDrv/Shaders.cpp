@@ -355,17 +355,23 @@ std::string Shaders::Trace()
 				float t = rayQueryGetIntersectionTEXT(rq, true);
 				int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
 
+				// Each instance carries the offset of its geometry's shading
+				// data as its custom index, so one buffer serves every shape.
+				int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+				TriangleAttributes attr = tris[attributeBase + primitive];
+
 				if (bounce == 0u)
 				{
 					primaryDistance = t;
 					primaryPosition = origin + direction * t;
 					primaryInstance = float(rayQueryGetIntersectionInstanceIdEXT(rq, true));
+					// A surface whose texture animates has nothing worth reusing
+					// from earlier frames: averaging a screen against what it
+					// showed a second ago is what made them look frozen while
+					// standing still.
+					if (attr.Albedo.w > 0.5)
+						primaryInstance = -2.0 - float(Counts.x);
 				}
-
-				// Each instance carries the offset of its geometry's shading
-				// data as its custom index, so one buffer serves every shape.
-				int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-				TriangleAttributes attr = tris[attributeBase + primitive];
 				vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
 				attr.Albedo = vec4(surfaceAlbedo(attr, bary), attr.Albedo.w);
 

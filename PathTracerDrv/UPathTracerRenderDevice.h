@@ -155,6 +155,9 @@ private:
 	// array binding is written as it grows; slots past what the scene uses hold
 	// a 1x1 white image so every descriptor is valid whether or not it is read.
 	std::unique_ptr<VulkanSampler> SceneSampler;
+	// Staging for this frame's realtime texture uploads, released once the
+	// submission that reads them has completed.
+	std::vector<std::unique_ptr<VulkanBuffer>> RealtimeStaging;
 	size_t BoundSceneTextures = 0;
 	bool SceneTexturesInitialised = false;
 	int TextureFailuresLogged = 0;

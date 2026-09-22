@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 class UPathTracerRenderDevice;
 
@@ -9,6 +10,14 @@ class UPathTracerRenderDevice;
 // once with the image because a tile draw binds nothing else.
 struct CachedTexture
 {
+	// The object this came from, kept only for textures that regenerate.
+	UTexture* Source = nullptr;
+	bool Realtime = false;
+	int Width = 0;
+	int Height = 0;
+	bool Masked = false;
+	// Which link of an animation chain is currently in the image.
+	UTexture* LastFrame = nullptr;
 	std::unique_ptr<VulkanImage> Image;
 	std::unique_ptr<VulkanImageView> View;
 	std::unique_ptr<VulkanDescriptorSet> Set;
@@ -40,10 +49,20 @@ public:
 	// still valid descriptors.
 	CachedTexture* White();
 
+	// Regenerate the textures that change by themselves - fire, water, a
+	// computer screen, the laser sight's dot - and copy them into the images
+	// they already have, so nothing that points at those images has to change.
+	// Recorded into the frame's own command buffer rather than submitted one
+	// texture at a time: a submit-and-wait each is a stall each, and a room of
+	// screens cost most of the frame rate. The staging buffers must outlive the
+	// submission, so they are handed back to be released once it completes.
+	void RefreshRealtime(double time, VulkanCommandBuffer* commands, std::vector<std::unique_ptr<VulkanBuffer>>& keepAlive);
+
 	void Clear();
 
 private:
 	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet = true);
+	static bool ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height);
 
 	UPathTracerRenderDevice* renderer = nullptr;
 
