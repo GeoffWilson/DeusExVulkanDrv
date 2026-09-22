@@ -221,6 +221,73 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.Create(Device.get());
 }
 
+// Everything about how an actor is drawn, for when one draws wrongly: its
+// flags, glow and skins, then each of its mesh's materials with the texture,
+// what is in it, and what the texture cache holds for it. PT WEAPON and PT LOOK.
+static void DescribeActor(AActor* actor, UMesh* mesh, TextureCache* textures)
+{
+	auto nameOf = [](UObject* o) { return o ? o->GetName() : TEXT("none"); };
+	auto classOf = [](UObject* o) { return o ? o->GetClass()->GetName() : TEXT("-"); };
+	debugf(TEXT("PT: %s (%s) mesh %s drawtype %d style %d unlit %d specialLit %d glow %.2f ambientglow %d fatness %d envmap %d light %d/%d brightness %d"),
+		actor->GetName(), classOf(actor), nameOf(mesh), (int)actor->DrawType, (int)actor->Style, (int)actor->bUnlit, (int)actor->bSpecialLit,
+		(float)actor->ScaleGlow, (int)actor->AmbientGlow, (int)actor->Fatness, (int)actor->bMeshEnviroMap,
+		(int)actor->LightType, (int)actor->LightEffect, (int)actor->LightBrightness);
+	debugf(TEXT("  skin %s texture %s zone %s ambient %d/%d/%d"), nameOf(actor->Skin), nameOf(actor->Texture),
+		nameOf(actor->Region.Zone), actor->Region.Zone ? (int)actor->Region.Zone->AmbientBrightness : -1,
+		actor->Region.Zone ? (int)actor->Region.Zone->AmbientHue : -1, actor->Region.Zone ? (int)actor->Region.Zone->AmbientSaturation : -1);
+	for (int i = 0; i < 8; i++)
+		debugf(TEXT("  multiskin %d: %s (%s)  getskin %s  mesh texture %s"), i, nameOf(actor->MultiSkins[i]), classOf(actor->MultiSkins[i]),
+			nameOf(actor->GetSkin(i)), (mesh && i < mesh->Textures.Num()) ? nameOf(mesh->Textures(i)) : TEXT("-"));
+
+	auto describe = [&](UTexture* t, const TCHAR* label)
+	{
+		if (!t)
+			return;
+		int nonZero = 0, total = 0;
+		if (t->Mips.Num() > 0)
+		{
+			FMipmap& mip = t->Mips(0);
+			total = mip.DataArray.Num();
+			for (int b = 0; b < total; b++)
+				nonZero += mip.DataArray(b) != 0;
+		}
+		debugf(TEXT("    %s %s: %dx%d format %d mips %d realtime %d parametric %d palette %d colours, mip 0 %d of %d bytes non-zero"),
+			label, t->GetName(), (int)t->USize, (int)t->VSize, (int)t->Format, t->Mips.Num(),
+			(int)t->bRealtime, (int)t->bParametric, t->Palette ? t->Palette->Colors.Num() : -1, nonZero, total);
+	};
+
+	ULodMesh* lod = Cast<ULodMesh>(mesh);
+	if (!lod)
+		return;
+	std::vector<int> faces(lod->Materials.Num(), 0);
+	for (INT f = 0; f < lod->Faces.Num(); f++)
+		if (lod->Faces(f).MaterialIndex < faces.size())
+			faces[lod->Faces(f).MaterialIndex]++;
+	for (INT m = 0; m < lod->Materials.Num(); m++)
+	{
+		const FMeshMaterial& material = lod->Materials(m);
+		UTexture* texture = (material.TextureIndex < mesh->Textures.Num()) ? mesh->Textures(material.TextureIndex) : nullptr;
+		debugf(TEXT("  material %d: flags %08x texture index %d (%s, %s, texture flags %08x) %d faces"),
+			m, (DWORD)material.PolyFlags, (int)material.TextureIndex, nameOf(texture), classOf(texture),
+			texture ? (DWORD)texture->PolyFlags : 0u, faces[m]);
+		describe(texture, TEXT("texture"));
+		if (!texture)
+			continue;
+		for (TFieldIterator<UObjectProperty> it(texture->GetClass()); it; ++it)
+			if (!appStricmp(it->GetName(), TEXT("SourceTexture")))
+				describe(*(UTexture**)((BYTE*)texture + it->Offset), TEXT("source"));
+		for (int masked = 0; masked < 2; masked++)
+		{
+			CachedTexture* cached = textures ? textures->FindForScene(texture, masked != 0) : nullptr;
+			if (cached)
+				debugf(TEXT("    cached (masked %d): %dx%d realtime %d source %s last frame %s"),
+					masked, cached->Width, cached->Height, (int)cached->Realtime,
+					cached->Source ? cached->Source->GetName() : TEXT("none"),
+					cached->LastFrame ? cached->LastFrame->GetName() : TEXT("none"));
+		}
+	}
+}
+
 // Made the first time it is wanted, so a game that never denoises neither
 // builds NRD's pipelines nor risks them failing. A failure switches denoising
 // off rather than taking the device down with it.
@@ -1335,6 +1402,34 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		// The nearest lights that are not plain steady ones, relative to where
 		// the player is looking, so they can be walked to without knowing
 		// which way the level's axes run.
+		// What the held weapon is drawn from: its mesh, style and skins, and
+		// each material's flags and texture, for when one draws wrongly.
+		if (ParseCommand(&Cmd, TEXT("WEAPON")))
+		{
+			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
+			AInventory* item = player ? player->Weapon : nullptr;
+			if (item)
+				DescribeActor(item, item->PlayerViewMesh ? item->PlayerViewMesh : item->Mesh, Textures.get());
+			Ar.Logf(TEXT("PT: weapon details written to the log"));
+			return 1;
+		}
+
+		// The same for whatever is under the crosshair.
+		if (ParseCommand(&Cmd, TEXT("LOOK")))
+		{
+			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
+			if (!player || !player->XLevel)
+				return 1;
+			const FVector start = player->Location + FVector(0.0f, 0.0f, player->EyeHeight);
+			const FVector end = start + player->ViewRotation.Vector() * 8000.0f;
+			FCheckResult hit;
+			player->XLevel->SingleLineCheck(hit, player, end, start, TRACE_AllColliding);
+			if (hit.Actor && hit.Actor != player->Level)
+				DescribeActor(hit.Actor, hit.Actor->Mesh, Textures.get());
+			Ar.Logf(TEXT("PT: %s written to the log"), (hit.Actor && hit.Actor != player->Level) ? hit.Actor->GetName() : TEXT("nothing but the level"));
+			return 1;
+		}
+
 		if (ParseCommand(&Cmd, TEXT("LIGHTS")))
 		{
 			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
@@ -1429,7 +1524,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		Ar.Logf(TEXT("PT: lights %s, shadows %s, sky %s, per-triangle checks %s, bounces %d%s"),
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
-			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | OPAQUE | DENOISE | VIEW name | GUIDES | BOUNCES n | RESET)"));
+			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | OPAQUE | DENOISE | VIEW name | GUIDES | BOUNCES n | RESET)"));
 		return 1;
 	}
 

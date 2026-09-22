@@ -775,6 +775,16 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 // texture and style; each one's size and facing are its instance transform.
 static float KindFromStyle(BYTE style);
 
+// How bright the engine draws an unlit mesh: half its ScaleGlow plus its
+// AmbientGlow out of 256, no more than full brightness - read out of
+// Render.dll's DrawLodMesh. Deus Ex's trees are unlit at a ScaleGlow of 0.35,
+// so they are drawn at under a fifth of their texture's brightness; at full
+// brightness they glowed across the park at night.
+static float UnlitMeshGlow(AActor* actor)
+{
+	return Clamp(0.5f * (float)actor->ScaleGlow + actor->AmbientGlow / 256.0f, 0.0f, 1.0f);
+}
+
 int LevelScene::GeometryForSprite(UTexture* texture, float kind)
 {
 	const uint64_t key = ((uint64_t)(uintptr_t)texture << 4) ^ (uint64_t)(int)kind;
@@ -1454,7 +1464,10 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		// w marks the surface as self lit. The colour it emits is whatever it
 		// turns out to be once sampled, so it cannot be decided here: doing so
 		// is what made unlit masked surfaces glow the key colour.
-		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
+		// An unlit actor's whole mesh is drawn at its ScaleGlow, which its
+		// instance carries: 1.25 says so. A polygon flagged unlit on a lit
+		// actor, like the Dragon's Tooth blade, is drawn at full brightness.
+		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? (actorUnlit ? 1.25f : 1.0f) : 0.0f);
 
 		// Masked by the polygon as well as by the texture, as the engine does:
 		// a character with no glasses has a masked glasses slot showing a
@@ -1747,9 +1760,10 @@ void LevelScene::CollectDynamic(ULevel* level)
 			MakeTransform(actor->Location, actor->Rotation, scale, prePivot, instance.Transform);
 		// A sprite is lit by nothing, so its instance carries its glow where
 		// anything else carries the zone's ambient. The engine draws it at
-		// ScaleGlow brightness, which is how effects fade out.
-		const float glow = Clamp((float)actor->ScaleGlow, 0.0f, 4.0f);
-		const vec3 ambient = isSprite ? vec3(glow, glow, glow) : ZoneAmbient(actor->Region.Zone);
+		// ScaleGlow brightness, which is how effects fade out. An unlit mesh
+		// carries its own brightness the same way: see UnlitMeshGlow.
+		const float glow = isSprite ? Clamp((float)actor->ScaleGlow, 0.0f, 4.0f) : UnlitMeshGlow(actor);
+		const vec3 ambient = (isSprite || actor->bUnlit) ? vec3(glow, glow, glow) : ZoneAmbient(actor->Region.Zone);
 
 		// Did this actor actually move or change shape since the last frame?
 		// The trace uses it to throw away the accumulated history of the pixels
@@ -1881,7 +1895,8 @@ void LevelScene::AddViewModel()
 	instance.Transform[1 * 4 + 3] = position.Y;
 	instance.Transform[2 * 4 + 3] = position.Z;
 
-	const vec3 ambient = ZoneAmbient(ViewActor->Region.Zone);
+	const float glow = UnlitMeshGlow(item);
+	const vec3 ambient = item->bUnlit ? vec3(glow, glow, glow) : ZoneAmbient(ViewActor->Region.Zone);
 	// Always counted as having moved: it rides the camera, and it bobs even
 	// when the camera does not.
 	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, 1.0f);

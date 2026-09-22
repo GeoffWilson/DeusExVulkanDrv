@@ -48,6 +48,8 @@ public:
 	// polygon's flags as well as the texture's, so one texture can be needed
 	// both ways.
 	CachedTexture* GetForScene(UTexture* texture, bool masked);
+	// The scene's entry for a texture if it has one, without making one.
+	CachedTexture* FindForScene(UTexture* texture, bool masked);
 
 	// A 1x1 white image, so that unused slots in the trace's texture array are
 	// still valid descriptors.

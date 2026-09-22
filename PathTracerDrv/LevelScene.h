@@ -15,6 +15,9 @@ struct TriangleAttributes
 {
 	vec4 Normal;
 	vec4 Albedo;
+	// xy how fast the texture pans; w how the surface is drawn without
+	// lighting: 0 lit, 1 unlit, 1.25 unlit at its instance's ScaleGlow, 2 a
+	// sprite.
 	vec4 Emission;
 	// The zone's ambient light. A property of the surface for level geometry,
 	// which is why it lives here rather than only per instance: one room can be

@@ -233,6 +233,13 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 }
 
 
+CachedTexture* TextureCache::FindForScene(UTexture* texture, bool masked)
+{
+	const uint64_t key = ((uint64_t)(uintptr_t)texture << 1) | (masked ? 1u : 0u);
+	auto it = SceneTextures.find(key);
+	return it != SceneTextures.end() ? it->second.get() : nullptr;
+}
+
 CachedTexture* TextureCache::GetForScene(UTexture* texture, bool masked)
 {
 	guard(TextureCache::GetForScene);
@@ -359,6 +366,19 @@ void TextureCache::RefreshRealtime(double time, VulkanCommandBuffer* commands, s
 		//
 		// The engine does this from inside Lock, which this device bypasses, so
 		// nothing was asking them to advance at all.
+		//
+		// A texture that regenerates itself is locked first, as the engine's own
+		// renderer locks it before drawing. That is where a WetTexture locks
+		// the texture it ripples, which is what makes that texture's pixels
+		// readable; advancing it with Get alone left it rippling nothing, and
+		// the Dragon's Tooth blade drew without its core. The Fire package locks
+		// with no render device itself, so none is needed here either.
+		if (texture->bRealtime || texture->bParametric)
+		{
+			FTextureInfo locked = {};
+			texture->Lock(locked, time, 0, nullptr);
+			texture->Unlock(locked);
+		}
 		UTexture* frame = texture->Get(time);
 		if (!frame || frame->Mips.Num() < 1)
 			continue;

@@ -581,10 +581,11 @@ std::string Shaders::Trace()
 			uint passes = 0u;
 			// How far along the ray to start looking. Generous for a bounce off
 			// a surface, because these levels are big and a surface acne
-			// artefact is worse than a lost millimetre - but tiny when carrying
-			// on through a surface, since the thing behind it may be flush
-			// against it. A laser dot sits on a wall, and stepping a whole unit
-			// past it skipped the wall entirely and put a hole in the level.
+			// artefact is worse than a lost millimetre - but none at all when
+			// carrying on through a surface, since the thing behind it may be
+			// flush against it. A laser dot sits on a wall, and stepping a whole
+			// unit past it skipped the wall entirely and put a hole in the level.
+			// The layer just passed is refused by name instead: see passedLayers.
 			float rayMin = Params.z;
 
 			// What this pixel is looking at, recorded on the first bounce so the
@@ -653,8 +654,21 @@ std::string Shaders::Trace()
 					firstBounce = 1u;
 				}
 
+				// The translucent layers already passed through on the way to the
+				// next solid thing. Layers can lie exactly on top of one another -
+				// the Dragon's Tooth blade is a core, a glow and an edge in one
+				// plane - so rather than skip a little way past each one, which
+				// skipped the others too, the ray carries on from where it hit
+				// and refuses only the triangles it has already been through.
+				ivec2 passedLayers[8];
+				uint passedCount = 0u;
+				bool passingThrough = false;
+
 				for (uint bounce = firstBounce; bounce < bounces; bounce++)
 				{
+					if (!passingThrough)
+						passedCount = 0u;
+					passingThrough = false;
 					rayQueryEXT rq;
 					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, 0xFF, origin, rayMin, direction, 100000.0);
 					while (rayQueryProceedEXT(rq))
@@ -664,9 +678,13 @@ std::string Shaders::Trace()
 						// nothing else.
 						if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 						{
-							if (confirmCandidate(
+							ivec2 candidate = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, false), rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+							bool passed = false;
+							for (uint p = 0u; p < passedCount; p++)
+								passed = passed || passedLayers[p] == candidate;
+							if (!passed && confirmCandidate(
 									rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
-									rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
+									candidate.y,
 									rayQueryGetIntersectionBarycentricsEXT(rq, false),
 									false, direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
 								rayQueryConfirmIntersectionEXT(rq);
@@ -736,7 +754,13 @@ std::string Shaders::Trace()
 					// A sprite is as bright as its actor's ScaleGlow, which the
 					// instance carries in place of an ambient it has no use for.
 					bool sprite = attr.Emission.w > 1.5;
-					float glow = sprite ? instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].x : 1.0;
+					// So is an unlit actor's mesh (Emission.w 1.25), whose instance
+					// carries its ScaleGlow in the same place.
+					// The engine scales the colour as displayed, and textures here
+					// are made linear, so the same dimming is the glow to the power
+					// 2.2: scaling linear light by 0.175 put an unlit tree on screen
+					// at over twice the brightness the engine draws it.
+					float glow = attr.Emission.w > 1.1 ? pow(max(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].x, 0.0), 2.2) : 1.0;
 
 					// A window onto the sky zone. The engine draws the skybox from
 					// the sky zone's viewpoint in the same direction as the view,
@@ -814,7 +838,10 @@ std::string Shaders::Trace()
 						}
 
 						origin = position;
-						rayMin = 0.01;
+						rayMin = 0.0;
+						if (passedCount < 8u)
+							passedLayers[passedCount++] = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, true), primitive);
+						passingThrough = true;
 						if (passes < 8u)
 						{
 							passes++;
@@ -881,7 +908,7 @@ std::string Shaders::Trace()
 						// lighting for the denoiser.
 						if (unlitSurface)
 						{
-							emission += diffuseAlbedo;
+							emission += diffuseAlbedo * glow;
 							diffuseAlbedo = vec3(0.0);
 						}
 						specularAlbedo = mirror ? surfaceThroughput * mirrorTint * 0.5 : vec3(0.0);
@@ -963,7 +990,7 @@ std::string Shaders::Trace()
 						// Already counted, as emission, when it is the
 						// denoiser's surface.
 						if (!firstSurface)
-							radiance += throughput * attr.Albedo.rgb;
+							radiance += throughput * attr.Albedo.rgb * glow;
 						break;
 					}
 					// Shaded as white on the denoiser's surface: its colour goes back
