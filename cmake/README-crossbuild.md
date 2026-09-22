@@ -33,6 +33,22 @@ The result is `build-deusex/VulkanDrv.dll`, `D3D11Drv.dll` and `D3D12Drv.dll`,
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 
+### The path tracer's denoiser
+
+`PathTracerDrv` denoises with NVIDIA's NRD when it is there to link. Build it
+once, before configuring:
+
+```sh
+cmake/build-nrd.sh          # into ../.nrd, beside .xwin
+```
+
+The script fetches a pinned NRD release (its licence keeps its source out of
+this repository), compiles NRD's HLSL shaders to SPIR-V with a DXC it downloads
+into `../.nrd`, and cross-builds a 32 bit `NRD.lib` with the same xwin CRT.
+Configure afterwards and CMake reports `denoising with NRD`; without it the
+path tracer builds as before and `PT DENOISE` says the denoiser is missing.
+`Denoise=False` in the device's ini section turns it off at startup.
+
 ## Installing
 
 ```sh

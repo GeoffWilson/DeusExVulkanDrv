@@ -3,6 +3,7 @@
 #include "vec.h"
 #include "mat.h"
 #include "LevelScene.h"
+#include "Denoiser.h"
 #include "AccelStructure.h"
 #include "TextureCache.h"
 #include <functional>
@@ -114,6 +115,9 @@ public:
 	BITFIELD UseVSync;
 	// Log where each frame's time goes, averaged every few hundred frames.
 	BITFIELD LogTimings;
+	// Denoise with NRD from the start ("Denoise" in the ini). PT DENOISE
+	// switches it for the session.
+	BITFIELD UseDenoiser;
 
 private:
 	void CreateSwapChainResources();
@@ -149,6 +153,42 @@ private:
 	std::unique_ptr<VulkanImageView> HistoryView;
 	std::unique_ptr<VulkanImage> OutputImage;
 	std::unique_ptr<VulkanImageView> OutputView;
+
+	// A denoiser's inputs, written by the trace at bindings 9 to 15 when asked
+	// for, the fog at 17, and what mirrors show at 18 and 19: see the trace
+	// shader.
+	static const int GuideImageCount = 10;
+	static int GuideBinding(int i) { return i < 7 ? 9 + i : 10 + i; }
+	static bool GuideIsDepth(int i) { return i == 1 || i == 9; }
+	std::unique_ptr<VulkanImage> GuideImages[GuideImageCount];
+	std::unique_ptr<VulkanImageView> GuideViews[GuideImageCount];
+	// The depth and motion images again, their motion moved to where NRD
+	// reads it: the surfaces seen, and those seen in mirrors.
+	std::unique_ptr<VulkanImageView> MotionView;
+	std::unique_ptr<VulkanImageView> ReflectionMotionView;
+
+	// NRD, and the pass that puts the picture back together from what it
+	// returns. PT DENOISE switches it on.
+	std::unique_ptr<Denoiser> Denoise;
+	bool DenoiseEnabled = false;
+	bool DenoiseRestart = true;
+	void EnsureDenoiser();
+	std::unique_ptr<VulkanDescriptorSetLayout> CompositeLayout;
+	std::unique_ptr<VulkanDescriptorPool> CompositePool;
+	std::unique_ptr<VulkanDescriptorSet> CompositeSet;
+	std::unique_ptr<VulkanPipelineLayout> CompositePipelineLayout;
+	std::unique_ptr<VulkanShader> CompositeShader;
+	std::unique_ptr<VulkanPipeline> CompositePipeline;
+	void CreateCompositePipeline();
+	void WriteCompositeDescriptors();
+	// Last frame's camera and each instance's last placement, for motion
+	// vectors. Rewritten every frame.
+	std::unique_ptr<VulkanBuffer> MotionBuffer;
+	size_t MotionCapacity = 0;
+	void WriteMotion(const TracePushConstants& previousCamera);
+	// Which part of the picture PT VIEW shows in its place, as the trace
+	// shader numbers them; 0 for the picture itself.
+	int ViewMode = 0;
 	int TraceWidth = 0;
 	int TraceHeight = 0;
 

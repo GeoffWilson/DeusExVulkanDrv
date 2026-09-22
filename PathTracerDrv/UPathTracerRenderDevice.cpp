@@ -47,6 +47,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	LightScale = 100;
 	UseVSync = 1;
 	LogTimings = 0;
+	UseDenoiser = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -58,6 +59,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("LightScale"), RF_Public) UIntProperty(CPP_PROPERTY(LightScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LogTimings"), RF_Public) UBoolProperty(CPP_PROPERTY(LogTimings), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("Denoise"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDenoiser), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -67,6 +69,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	guard(UPathTracerRenderDevice::Init);
 
 	Viewport = InViewport;
+	DenoiseEnabled = UseDenoiser != 0;
 
 	try
 	{
@@ -132,6 +135,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 
 		CreateTracePipeline();
 		CreateTilePipeline();
+		CreateCompositePipeline();
 
 		// Says the shaders compiled and the pipelines exist. Without it a
 		// failure and a successful start that simply never rendered a level
@@ -167,13 +171,24 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.AddBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device.get());
 
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 + GuideImageCount)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures)
 		.MaxSets(1)
 		.DebugName("PathTracerDescriptorPool")
@@ -204,6 +219,81 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.ComputeShader(TraceShader.get())
 		.DebugName("PathTracerTracePipeline")
 		.Create(Device.get());
+}
+
+// Made the first time it is wanted, so a game that never denoises neither
+// builds NRD's pipelines nor risks them failing. A failure switches denoising
+// off rather than taking the device down with it.
+void UPathTracerRenderDevice::EnsureDenoiser()
+{
+	if (!DenoiseEnabled || Denoise || !Device || !TraceWidth)
+		return;
+
+	try
+	{
+		Denoise.reset(new Denoiser(Device.get()));
+		Denoise->Resize(TraceWidth, TraceHeight);
+	}
+	catch (const std::exception& e)
+	{
+		debugf(TEXT("PathTracer denoiser failed: %s"), ANSI_TO_TCHAR(e.what()));
+		Denoise.reset();
+		DenoiseEnabled = false;
+	}
+	DescriptorsDirty = true;
+	if (Denoise)
+		debugf(TEXT("PathTracer denoiser: %s"), ANSI_TO_TCHAR(Denoise->Problem()));
+}
+
+// The pass after the denoiser: the trace's emission and surface colours, NRD's
+// lighting and the fog, into the output image.
+void UPathTracerRenderDevice::CreateCompositePipeline()
+{
+	DescriptorSetLayoutBuilder layout;
+	for (int i = 0; i < 7; i++)
+		layout.AddBinding(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	CompositeLayout = layout.DebugName("PathTracerCompositeSetLayout").Create(Device.get());
+
+	CompositePool = DescriptorPoolBuilder()
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7)
+		.MaxSets(1)
+		.DebugName("PathTracerCompositePool")
+		.Create(Device.get());
+	CompositeSet = CompositePool->allocate(CompositeLayout.get());
+
+	CompositePipelineLayout = PipelineLayoutBuilder()
+		.AddSetLayout(CompositeLayout.get())
+		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vec4) * 2)
+		.DebugName("PathTracerCompositePipelineLayout")
+		.Create(Device.get());
+
+	CompositeShader = ShaderBuilder()
+		.Type(ShaderType::Compute)
+		.AddSource("shaders/Composite.comp", Shaders::Composite())
+		.DebugName("PathTracerComposite")
+		.Create("PathTracerComposite", Device.get());
+
+	CompositePipeline = ComputePipelineBuilder()
+		.Layout(CompositePipelineLayout.get())
+		.ComputeShader(CompositeShader.get())
+		.DebugName("PathTracerCompositePipeline")
+		.Create(Device.get());
+}
+
+void UPathTracerRenderDevice::WriteCompositeDescriptors()
+{
+	if (!CompositeSet || !OutputView || !Denoise || !Denoise->Available() || !Denoise->Output(0))
+		return;
+
+	WriteDescriptors()
+		.AddStorageImage(CompositeSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(CompositeSet.get(), 1, GuideViews[4].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(CompositeSet.get(), 2, GuideViews[5].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(CompositeSet.get(), 3, GuideViews[6].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(CompositeSet.get(), 4, Denoise->Output(0), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(CompositeSet.get(), 5, Denoise->Output(1), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(CompositeSet.get(), 6, GuideViews[7].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.Execute(Device.get());
 }
 
 std::unique_ptr<VulkanDescriptorSet> UPathTracerRenderDevice::AllocateTileDescriptorSet(VulkanImageView* view)
@@ -547,6 +637,13 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	HistoryImage.reset();
 	OutputView.reset();
 	OutputImage.reset();
+	MotionView.reset();
+	ReflectionMotionView.reset();
+	for (int i = 0; i < GuideImageCount; i++)
+	{
+		GuideViews[i].reset();
+		GuideImages[i].reset();
+	}
 
 	AccumImage = ImageBuilder()
 		.Format(VK_FORMAT_R32G32B32A32_SFLOAT)
@@ -575,6 +672,53 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 		.Create(Device.get());
 	OutputView = ImageViewBuilder().Image(OutputImage.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName("PathTracerOutputView").Create(Device.get());
 
+	// In the trace shader's binding order. Depth and motion want the full
+	// precision; the rest are colours and normals.
+	for (int i = 0; i < GuideImageCount; i++)
+	{
+		const VkFormat format = GuideIsDepth(i) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+		GuideImages[i] = ImageBuilder()
+			.Format(format)
+			.Size(width, height)
+			.Usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+			.DebugName("PathTracerGuide")
+			.Create(Device.get());
+		GuideViews[i] = ImageViewBuilder().Image(GuideImages[i].get(), format).DebugName("PathTracerGuideView").Create(Device.get());
+	}
+
+	// NRD reads motion from x and y, where the trace keeps the depth; a view
+	// of the same image with its channels moved along says it without
+	// another image or another pass.
+	auto motionView = [&](VulkanImage* image)
+	{
+		VkImageViewCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+		info.image = image->image;
+		info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+		info.components = { VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE };
+		info.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		VkImageView view = VK_NULL_HANDLE;
+		vkCreateImageView(Device->device, &info, nullptr, &view);
+		return std::unique_ptr<VulkanImageView>(new VulkanImageView(Device.get(), view));
+	};
+	MotionView = motionView(GuideImages[1].get());
+	ReflectionMotionView = motionView(GuideImages[9].get());
+
+	if (Denoise)
+	{
+		try
+		{
+			Denoise->Resize(width, height);
+		}
+		catch (const std::exception& e)
+		{
+			debugf(TEXT("PathTracer denoiser failed: %s"), ANSI_TO_TCHAR(e.what()));
+			Denoise.reset();
+			DenoiseEnabled = false;
+		}
+	}
+	DenoiseRestart = true;
+
 	// The tile pass draws into the traced image, so its framebuffer follows the
 	// image rather than the window.
 	if (TileRenderPass)
@@ -595,11 +739,14 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	// Both images start undefined and the trace shader writes them as GENERAL.
 	ExecuteImmediate([this](VulkanCommandBuffer* cmd)
 	{
-		PipelineBarrier()
+		PipelineBarrier barrier;
+		barrier
 			.AddImage(AccumImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
 			.AddImage(HistoryImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
-			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
-			.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+		for (int i = 0; i < GuideImageCount; i++)
+			barrier.AddImage(GuideImages[i].get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+		barrier.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	});
 
 	debugf(TEXT("PathTracer buffers: %dx%d"), width, height);
@@ -672,10 +819,14 @@ void UPathTracerRenderDevice::UpdateSceneTextures()
 
 void UPathTracerRenderDevice::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer())
+	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !MotionBuffer)
 		return;
 
-	WriteDescriptors()
+	WriteDescriptors writes;
+	for (int i = 0; i < GuideImageCount; i++)
+		writes.AddStorageImage(DescriptorSet, GuideBinding(i), GuideViews[i].get(), VK_IMAGE_LAYOUT_GENERAL);
+	writes.AddBuffer(DescriptorSet, 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MotionBuffer.get());
+	writes
 		.AddAccelerationStructure(DescriptorSet, 0, Accel->GetTopLevel())
 		.AddStorageImage(DescriptorSet, 1, AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(DescriptorSet, 2, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
@@ -685,8 +836,44 @@ void UPathTracerRenderDevice::UpdateDescriptors()
 		.AddBuffer(DescriptorSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
 		.AddBuffer(DescriptorSet, 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightGridBuffer())
 		.Execute(Device.get());
+	WriteCompositeDescriptors();
 
 	DescriptorsDirty = false;
+}
+
+// Last frame's camera, then each instance's last placement as three rows, in
+// the order the top level structure numbers them. An instance with no last
+// placement - new this frame, or one that never moves - is given its current
+// one, which reads as not having moved.
+void UPathTracerRenderDevice::WriteMotion(const TracePushConstants& previousCamera)
+{
+	const size_t count = Scene.Instances.size();
+	const size_t wanted = 4 + std::max<size_t>(count, 1) * 3;
+	if (!MotionBuffer || wanted > MotionCapacity)
+	{
+		MotionCapacity = std::max<size_t>(wanted * 2, 4 + 256 * 3);
+		MotionBuffer = BufferBuilder()
+			.Size(MotionCapacity * sizeof(vec4))
+			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+			.MinAlignment(256)
+			.DebugName("PathTracerMotion")
+			.Create(Device.get());
+		DescriptorsDirty = true;
+	}
+
+	auto* mapped = (vec4*)MotionBuffer->Map(0, wanted * sizeof(vec4));
+	mapped[0] = previousCamera.CameraOrigin;
+	mapped[1] = previousCamera.CameraRight;
+	mapped[2] = previousCamera.CameraUp;
+	mapped[3] = previousCamera.CameraForward;
+	for (size_t i = 0; i < count; i++)
+	{
+		const SceneInstance& instance = Scene.Instances[i];
+		const float* m = instance.HasPrevious ? instance.PreviousTransform : instance.Transform;
+		for (int r = 0; r < 3; r++)
+			mapped[4 + i * 3 + r] = vec4(m[r * 4 + 0], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
+	}
+	MotionBuffer->Unmap();
 }
 
 void UPathTracerRenderDevice::ExecuteImmediate(const std::function<void(VulkanCommandBuffer*)>& fn)
@@ -742,6 +929,7 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 		WaitForPreviousFrame();
 
 		Accel->Reset();
+		DenoiseRestart = true;
 		if (!Scene.BuildStatic(level))
 		{
 			debugf(TEXT("PathTracer: nothing to build from"));
@@ -900,6 +1088,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		LastInstanceCount = Scene.Instances.size();
 		if (cameraMoved || sceneChanged)
 			AccumulatedFrames = 0;
+		// Where the camera was, for the motion vectors: last frame's, or this
+		// one's on the first frame there is.
+		const bool haveLastCamera = LastCamera.CameraForward.x != 0.0f || LastCamera.CameraForward.y != 0.0f || LastCamera.CameraForward.z != 0.0f;
+		const TracePushConstants previousCamera = haveLastCamera ? LastCamera : PushConstants;
 		LastCamera = PushConstants;
 
 		// The screen flash, as the other devices blend it: the picture times
@@ -910,7 +1102,11 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		PushConstants.CameraUp.w = FlashFog.Y;
 		PushConstants.CameraForward.w = FlashFog.Z;
 
-		PushConstants.Disable = DisableBits;
+		// A view of the denoiser's inputs needs them written, and so does the
+		// denoiser.
+		EnsureDenoiser();
+		const bool denoising = DenoiseEnabled && Denoise && Denoise->Available() && ViewMode == 0;
+		PushConstants.Disable = DisableBits | ((ViewMode || denoising) ? 64u : 0u);
 		PushConstants.Counts[0] = FrameIndex++;
 		PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
 		PushConstants.Counts[2] = (uint32_t)Max(Bounces, 1);
@@ -925,7 +1121,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			0.2f + Exposure * (2.0f / 255.0f),
 			SkyIntensity * (2.0f / 255.0f),
 			0.5f,     // ray epsilon, in world units: these levels are big
-			(float)DebugMode);
+			(float)(ViewMode ? ViewMode : DebugMode));
 
 		int windowWidth = 0, windowHeight = 0;
 		RECT box = {};
@@ -975,12 +1171,52 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// what the engine expects behind a menu or a conversation.
 		if (traceThisFrame)
 		{
+			WriteMotion(previousCamera);
 			UpdateDescriptors();
 
 			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
 			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet);
 			commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
 			commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+
+			// Denoised: NRD over the trace's split lighting, then the picture
+			// rebuilt from it over the one the trace wrote.
+			if (denoising)
+			{
+				VkMemoryBarrier memory = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+				memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+
+				auto cameraOf = [](const TracePushConstants& p)
+				{
+					Denoiser::Camera c;
+					c.Origin = vec3(p.CameraOrigin.x, p.CameraOrigin.y, p.CameraOrigin.z);
+					c.Right = vec3(p.CameraRight.x, p.CameraRight.y, p.CameraRight.z);
+					c.Up = vec3(p.CameraUp.x, p.CameraUp.y, p.CameraUp.z);
+					c.Forward = vec3(p.CameraForward.x, p.CameraForward.y, p.CameraForward.z);
+					return c;
+				};
+				Denoiser::Inputs inputs[Denoiser::SignalCount];
+				inputs[0].NormalRoughness = GuideViews[0].get();
+				inputs[0].ViewZ = GuideViews[1].get();
+				inputs[0].Motion = MotionView.get();
+				inputs[0].Diffuse = GuideViews[2].get();
+				inputs[1].NormalRoughness = GuideViews[8].get();
+				inputs[1].ViewZ = GuideViews[9].get();
+				inputs[1].Motion = ReflectionMotionView.get();
+				inputs[1].Diffuse = GuideViews[3].get();
+				Denoise->Denoise(commands.get(), inputs, cameraOf(PushConstants), cameraOf(previousCamera), DenoiseRestart);
+				DenoiseRestart = false;
+
+				struct { vec4 Flash; vec4 Exposure; } finish;
+				finish.Flash = vec4(PushConstants.CameraOrigin.w, PushConstants.CameraRight.w, PushConstants.CameraUp.w, PushConstants.CameraForward.w);
+				finish.Exposure = vec4(PushConstants.Params.x, 0.0f, 0.0f, 0.0f);
+				commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
+				commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, CompositeSet.get());
+				commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
+				commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+			}
 		}
 
 		// HUD, menus and console on top of the traced world.
@@ -1142,7 +1378,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 
 		struct Switch { const TCHAR* Name; uint32_t Bit; };
 		static const Switch switches[] = {
-			{ TEXT("NOLIGHTS"), 1u }, { TEXT("NOSHADOWS"), 2u }, { TEXT("NOSKY"), 4u }, { TEXT("OPAQUE"), 8u }, { TEXT("HIGHLIGHT"), 16u }, { TEXT("NOFOG"), 32u },
+			{ TEXT("NOLIGHTS"), 1u }, { TEXT("NOSHADOWS"), 2u }, { TEXT("NOSKY"), 4u }, { TEXT("OPAQUE"), 8u }, { TEXT("HIGHLIGHT"), 16u }, { TEXT("NOFOG"), 32u }, { TEXT("GUIDES"), 64u },
 		};
 		bool handled = false;
 		for (const Switch& s : switches)
@@ -1161,13 +1397,39 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		if (ParseCommand(&Cmd, TEXT("RESET")))
 		{
 			DisableBits = 0;
+			ViewMode = 0;
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("DENOISE")))
+		{
+			DenoiseEnabled = !DenoiseEnabled;
+			DenoiseRestart = true;
+			EnsureDenoiser();
+			Ar.Logf(TEXT("PT: denoiser %s (%s)"), DenoiseEnabled ? TEXT("on") : TEXT("off"),
+				Denoise ? ANSI_TO_TCHAR(Denoise->Problem()) : TEXT("no device"));
+			handled = true;
+		}
+		// One of the denoiser's inputs in place of the picture. Numbered as
+		// the trace shader numbers them.
+		if (ParseCommand(&Cmd, TEXT("VIEW")))
+		{
+			static const struct { const TCHAR* Name; int Mode; } views[] = {
+				{ TEXT("NORMALS"), 3 }, { TEXT("DEPTH"), 4 }, { TEXT("MOTION"), 5 }, { TEXT("DIFFUSE"), 6 },
+				{ TEXT("SPECULAR"), 7 }, { TEXT("EMISSION"), 8 }, { TEXT("ALBEDO"), 9 }, { TEXT("HITDIST"), 10 }, { TEXT("HISTORY"), 11 },
+			};
+			ViewMode = 0;
+			for (const auto& v : views)
+				if (ParseCommand(&Cmd, v.Name))
+					ViewMode = v.Mode;
+			Ar.Logf(TEXT("PT: view %s  (PT VIEW NORMALS | DEPTH | MOTION | DIFFUSE | SPECULAR | EMISSION | ALBEDO | HITDIST | HISTORY, or PT VIEW for the picture)"),
+				ViewMode ? TEXT("set") : TEXT("off"));
 			handled = true;
 		}
 		AccumulatedFrames = 0;
 		Ar.Logf(TEXT("PT: lights %s, shadows %s, sky %s, per-triangle checks %s, bounces %d%s"),
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
-			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | OPAQUE | BOUNCES n | RESET)"));
+			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | OPAQUE | DENOISE | VIEW name | GUIDES | BOUNCES n | RESET)"));
 		return 1;
 	}
 
@@ -1206,6 +1468,23 @@ void UPathTracerRenderDevice::Exit()
 
 	Accel.reset();
 	Scene.Clear();
+
+	CompositePipeline.reset();
+	CompositeShader.reset();
+	CompositePipelineLayout.reset();
+	CompositeSet.reset();
+	CompositePool.reset();
+	CompositeLayout.reset();
+	Denoise.reset();
+	MotionView.reset();
+	ReflectionMotionView.reset();
+	for (int i = 0; i < GuideImageCount; i++)
+	{
+		GuideViews[i].reset();
+		GuideImages[i].reset();
+	}
+	MotionBuffer.reset();
+	MotionCapacity = 0;
 
 	OutputView.reset();
 	OutputImage.reset();

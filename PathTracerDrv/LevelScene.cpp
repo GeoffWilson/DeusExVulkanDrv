@@ -159,6 +159,7 @@ void LevelScene::Clear()
 	DecalSignature = 0;
 	ActorGeometry.clear();
 	PreviousPoses.clear();
+	HaveViewModelTransform = false;
 	CurrentPoses.clear();
 	Textures.clear();
 	TextureMasked.clear();
@@ -1762,13 +1763,23 @@ void LevelScene::CollectDynamic(ULevel* level)
 		const bool moved = (previous == PreviousPoses.end()) || previous->second != pose;
 		CurrentPoses[actor] = pose;
 
+		if (previous != PreviousPoses.end())
+		{
+			instance.HasPrevious = true;
+			memcpy(instance.PreviousTransform, previous->second.Transform, sizeof(instance.PreviousTransform));
+		}
+
 		instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, (moved || isSprite) ? 1.0f : 0.0f);
 		Instances.push_back(instance);
 
 	}
 
 	CollectDecals(level);
+	const size_t beforeViewModel = Instances.size();
 	AddViewModel();
+	// No weapon this frame: the next one drawn has no previous placement.
+	if (Instances.size() == beforeViewModel)
+		HaveViewModelTransform = false;
 
 
 	// This frame's placements become next frame's comparison. Swapped rather
@@ -1874,6 +1885,13 @@ void LevelScene::AddViewModel()
 	// Always counted as having moved: it rides the camera, and it bobs even
 	// when the camera does not.
 	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, 1.0f);
+	if (HaveViewModelTransform)
+	{
+		instance.HasPrevious = true;
+		memcpy(instance.PreviousTransform, ViewModelTransform, sizeof(instance.PreviousTransform));
+	}
+	memcpy(ViewModelTransform, instance.Transform, sizeof(ViewModelTransform));
+	HaveViewModelTransform = true;
 	Instances.push_back(instance);
 
 	unguard;

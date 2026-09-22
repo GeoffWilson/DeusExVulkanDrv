@@ -44,6 +44,29 @@ std::string Shaders::Trace()
 		layout(binding = 5, std430) readonly buffer InstanceData { vec4 instanceAmbient[]; };
 		// Which lights reach which cell of the level: see WriteLightGrid.
 		layout(binding = 8, std430) readonly buffer LightGrid { uint lightGrid[]; };
+
+		// What a denoiser needs, written each frame when asked for (Disable bit
+		// 64): the first solid surface's normal and roughness, its depth and
+		// motion, the lighting on it split from its colour, what the path
+		// picked up before reaching it, and the colours that put the lighting
+		// back together:
+		//   picture = emission + diffuseAlbedo * diffuse + specularAlbedo * specular
+		layout(binding = 9, rgba16f) uniform writeonly image2D guideNormalImage;       // normal and roughness, packed as NRD packs them
+		layout(binding = 10, rgba32f) uniform writeonly image2D guideDepthMotionImage; // view z (huge where there is no surface), motion in uv, surface found
+		layout(binding = 11, rgba16f) uniform writeonly image2D diffuseImage;          // demodulated, hit distance
+		layout(binding = 12, rgba16f) uniform writeonly image2D specularImage;         // what a mirror shows: demodulated, hit distance
+		layout(binding = 13, rgba16f) uniform writeonly image2D emissionImage;
+		layout(binding = 14, rgba16f) uniform writeonly image2D diffuseAlbedoImage;
+		layout(binding = 15, rgba16f) uniform writeonly image2D specularAlbedoImage;
+		// The volumetric fog over this pixel, blended on after the denoiser.
+		layout(binding = 17, rgba16f) uniform writeonly image2D fogImage;
+		// What a mirror shows, described to the denoiser as a surface of its
+		// own, where it appears to be behind the glass.
+		layout(binding = 18, rgba16f) uniform writeonly image2D reflectionNormalImage;
+		layout(binding = 19, rgba32f) uniform writeonly image2D reflectionDepthMotionImage;
+		// Last frame's camera, as the push constants carry it, then each
+		// instance's last placement as three rows.
+		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 previousRows[]; };
 		// Sized to match the layout rather than left open: an unsized array needs
 		// the runtime descriptor array capability, and a device without it would
 		// fail to create the pipeline at all rather than simply not texture.
@@ -60,7 +83,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog; 64 write the denoiser's inputs
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -261,7 +284,11 @@ std::string Shaders::Trace()
 		// specialLit is the surface's PF_SpecialLit: such a surface is lit only
 		// by lights marked bSpecialLit, and every other surface only by the
 		// rest. A special light carries its radius negated.
-		vec3 directLight(vec3 position, vec3 normal, vec3 albedo, bool specialLit)
+		// With every light rather than one chosen at random, and no shadow ray
+		// when "everyLight" is set: the same answer each frame. For glass and
+		// water, whose own lighting is added over what lies behind them and
+		// never passes through the denoiser.
+		vec3 directLight(vec3 position, vec3 normal, vec3 albedo, bool specialLit, bool everyLight)
 		{
 			if ((Disable & 1u) != 0u)
 				return vec3(0.0);
@@ -270,6 +297,8 @@ std::string Shaders::Trace()
 				return vec3(0.0);
 
 			float weightSum = 0.0;
+			vec3 total = vec3(0.0);
+			bool anyChanging = false;
 			int chosen = -1;
 			float chosenWeight = 0.0;
 			vec3 chosenDir = vec3(0.0);
@@ -395,6 +424,8 @@ std::string Shaders::Trace()
 					continue;
 
 				weightSum += weight;
+				total += value;
+				anyChanging = anyChanging || light.Flags.z > 0.5;
 				// Reservoir sampling: each candidate replaces the held one with
 				// probability equal to its share of the weight seen so far, so
 				// one pass leaves a sample drawn in proportion to weight.
@@ -406,6 +437,13 @@ std::string Shaders::Trace()
 					chosenDistance = distance;
 					chosenValue = value;
 				}
+			}
+
+			if (everyLight)
+			{
+				if (anyChanging)
+					litByChangingLight = true;
+				return albedo * total;
 			}
 
 			if (chosen < 0 || chosenWeight <= 0.0)
@@ -420,6 +458,11 @@ std::string Shaders::Trace()
 			// Divide by the probability it was chosen with, which is its share
 			// of the total weight.
 			return albedo * chosenValue * (weightSum / chosenWeight);
+		}
+
+		vec3 directLight(vec3 position, vec3 normal, vec3 albedo, bool specialLit)
+		{
+			return directLight(position, normal, albedo, specialLit, false);
 		}
 
 		vec3 skyLight(vec3 dir)
@@ -440,6 +483,39 @@ std::string Shaders::Trace()
 		// of the ray inside the light's sphere, scaled by the light's
 		// strength, clamped to one, then doubled. Each light blends over the
 		// ones before it, as the engine accumulates them.
+		// NRD's normal and roughness packing, its R10G10B10A2 variant: an
+		// octahedral normal in xy, and roughness in z with the sign of the
+		// normal's z folded into it. Written to a float image, which reads back
+		// the same.
+		// Where a point that was at "then" last frame and is at "now" this frame
+		// moved on screen, from here to there in screen widths and heights.
+		vec2 screenMotion(vec3 nowPosition, vec3 thenPosition)
+		{
+			vec3 now = nowPosition - CameraOrigin.xyz;
+			vec3 then = thenPosition - previousCamera[0].xyz;
+			float nowZ = dot(now, CameraForward.xyz);
+			float thenZ = dot(then, previousCamera[3].xyz);
+			if (nowZ <= 0.0 || thenZ <= 0.0)
+				return vec2(0.0);
+			vec2 nowUv = vec2(dot(now, CameraRight.xyz) / dot(CameraRight.xyz, CameraRight.xyz),
+				dot(now, CameraUp.xyz) / dot(CameraUp.xyz, CameraUp.xyz)) / nowZ;
+			vec2 thenUv = vec2(dot(then, previousCamera[1].xyz) / dot(previousCamera[1].xyz, previousCamera[1].xyz),
+				dot(then, previousCamera[2].xyz) / dot(previousCamera[2].xyz, previousCamera[2].xyz)) / thenZ;
+			return (thenUv - nowUv) * 0.5;
+		}
+
+		vec4 packNormalRoughness(vec3 n, float roughness)
+		{
+			n /= abs(n.x) + abs(n.y) + abs(n.z);
+			vec3 r;
+			r.y = n.y * 0.5 + 0.5;
+			r.x = n.x * 0.5 + r.y;
+			r.y -= n.x * 0.5;
+			roughness = max(roughness, 1.5 / 512.0);
+			r.z = (n.z < 0.0 ? -roughness : roughness) * 0.5 + 0.5;
+			return vec4(r, 0.0);
+		}
+
 		vec4 volumetricFog(vec3 origin, vec3 dir, float len)
 		{
 			vec4 fog = vec4(0.0);
@@ -523,95 +599,222 @@ std::string Shaders::Trace()
 			bool inSky = false;
 			float primaryDistance = 100000.0;
 
+			// The first solid surface the eye meets, through any glass, decals
+			// and the like in front of it: what a denoiser works on. Its
+			// lighting is gathered as though it were white, and its colour -
+			// and whatever the glass in front did to it - is kept apart.
+			bool surfaceFound = false;
+			bool pendingSpecular = false;    // part mirror: its reflection is traced next
+			// The first lit surface seen in a mirror, captured the same way as
+			// the surface itself, for the denoiser's second pass.
+			bool reflectionFound = false;
+			vec3 reflectionThroughput = vec3(1.0);
+			vec3 reflectionEmission = vec3(0.0);
+			vec3 reflectionAlbedo = vec3(0.0);
+			vec3 reflectionNormal = vec3(0.0);
+			float reflectionDistance = 0.0;   // from the mirror to it
+			vec3 specularOrigin = vec3(0.0);
+			vec3 specularDirection = vec3(0.0);
+			vec3 surfaceThroughput = vec3(1.0);
+			vec3 emission = vec3(0.0);
+			vec3 diffuseAlbedo = vec3(0.0);
+			vec3 specularAlbedo = vec3(0.0);
+			vec3 surfaceNormal = vec3(0.0);
+			float surfaceRoughness = 1.0;
+			vec3 surfacePosition = origin + direction * 100000.0;
+			vec3 surfaceObject = surfacePosition;   // the same point in its instance's own space
+			int surfaceInstance = -1;
+			bool wantHitDistance = false;
+			float hitDistance = 0.0;
+
 			uint bounces = max(Counts.z, 1u);
-			for (uint bounce = 0u; bounce < bounces; bounce++)
+			// Two passes on a surface that is part mirror, so that a denoiser
+			// has both its halves every frame: the path off the surface as
+			// usual, then the reflection on its own, from the surface on.
+			uint firstBounce = 0u;
+			vec3 diffuseRadiance = vec3(0.0);
+			float diffuseHitDistance = 0.0;
+			for (int lobePass = 0; lobePass < 2; lobePass++)
 			{
-				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, 0xFF, origin, rayMin, direction, 100000.0);
-				while (rayQueryProceedEXT(rq))
+				if (lobePass == 1)
 				{
-					// Only geometry holding masked or translucent art is
-					// non-opaque, so this runs for grates, windows and glass and
-					// nothing else.
-					if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+					if (!pendingSpecular)
+						break;
+					diffuseRadiance = radiance;
+					diffuseHitDistance = hitDistance;
+					radiance = vec3(0.0);
+					throughput = vec3(1.0);
+					origin = specularOrigin;
+					direction = specularDirection;
+					rayMin = Params.z;
+					passes = 0u;
+					hitDistance = 0.0;
+					wantHitDistance = true;
+					firstBounce = 1u;
+				}
+
+				for (uint bounce = firstBounce; bounce < bounces; bounce++)
+				{
+					rayQueryEXT rq;
+					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, 0xFF, origin, rayMin, direction, 100000.0);
+					while (rayQueryProceedEXT(rq))
 					{
-						if (confirmCandidate(
-								rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
-								rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
-								rayQueryGetIntersectionBarycentricsEXT(rq, false),
-								false, direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
-							rayQueryConfirmIntersectionEXT(rq);
+						// Only geometry holding masked or translucent art is
+						// non-opaque, so this runs for grates, windows and glass and
+						// nothing else.
+						if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+						{
+							if (confirmCandidate(
+									rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+									rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
+									rayQueryGetIntersectionBarycentricsEXT(rq, false),
+									false, direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
+								rayQueryConfirmIntersectionEXT(rq);
+						}
 					}
-				}
 
-				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
-				{
-					// Out through the side of the skybox there is nothing: the
-					// engine shows black there. The stand-in sky is only for a
-					// level with no sky zone, and lighting the inside of the
-					// skybox with it is what washed the clouds out.
-					if (!inSky)
-						radiance += throughput * skyLight(direction);
-					break;
-				}
-
-				float t = rayQueryGetIntersectionTEXT(rq, true);
-				int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-
-				// Each instance carries the offset of its geometry's shading
-				// data as its custom index, so one buffer serves every shape.
-				int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-				TriangleAttributes attr = tris[attributeBase + primitive];
-
-				if (bounce == 0u)
-				{
-					primaryDistance = t;
-					primaryPosition = origin + direction * t;
-					primaryInstance = float(rayQueryGetIntersectionInstanceIdEXT(rq, true));
-					// A surface whose texture animates has nothing worth reusing
-					// from earlier frames: averaging a screen against what it
-					// showed a second ago is what made them look frozen while
-					// standing still.
-					if (attr.Albedo.w > 0.5)
-						primaryInstance = -2.0 - float(Counts.x);
-				}
-				// Normals are stored in object space, because the same mesh is
-				// instanced at whatever orientation the actor happens to have.
-				// Rotating by the instance transform is what puts it back in the
-				// world - without it every mover and character would be lit as
-				// though it had never turned.
-				mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-				vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
-
-				vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-				attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal), attr.Albedo.w);
-
-				vec3 position = origin + direction * t;
-
-				// Translucent: add what this surface contributes and carry on
-				// through it in the same direction. UE1 draws these additively,
-				// which is why the muzzle flash quad on a weapon is invisible
-				// until it is lit and why a red dot sight glows rather than
-				// showing as a dark blob.
-				float kind = attr.UV2Tex.w;
-
-				// A sprite is as bright as its actor's ScaleGlow, which the
-				// instance carries in place of an ambient it has no use for.
-				bool sprite = attr.Emission.w > 1.5;
-				float glow = sprite ? instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].x : 1.0;
-
-				// A window onto the sky zone. The engine draws the skybox from
-				// the sky zone's viewpoint in the same direction as the view,
-				// so the ray does exactly that: same direction, new start.
-				// Only once per path - a second window means there is no sky
-				// zone behind this one, and the stand-in sky is all there is.
-				if (kind > 4.5)
-				{
-					if (SkyOrigin.w > 0.5 && !inSky && (Disable & 4u) == 0u)
+					if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
 					{
-						inSky = true;
-						origin = SkyOrigin.xyz;
-						rayMin = Params.z;
+						if (wantHitDistance)
+							hitDistance = 100000.0;
+						// Out through the side of the skybox there is nothing: the
+						// engine shows black there. The stand-in sky is only for a
+						// level with no sky zone, and lighting the inside of the
+						// skybox with it is what washed the clouds out.
+						if (!inSky)
+							radiance += throughput * skyLight(direction);
+						break;
+					}
+
+					float t = rayQueryGetIntersectionTEXT(rq, true);
+					// How far the first ray off the surface went, which a denoiser
+					// uses to judge how widely that light can be blurred.
+					if (wantHitDistance)
+					{
+						hitDistance = t;
+						wantHitDistance = false;
+					}
+					int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+
+					// Each instance carries the offset of its geometry's shading
+					// data as its custom index, so one buffer serves every shape.
+					int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+					TriangleAttributes attr = tris[attributeBase + primitive];
+
+					if (bounce == 0u)
+					{
+						primaryDistance = t;
+						primaryPosition = origin + direction * t;
+						primaryInstance = float(rayQueryGetIntersectionInstanceIdEXT(rq, true));
+						// A surface whose texture animates has nothing worth reusing
+						// from earlier frames: averaging a screen against what it
+						// showed a second ago is what made them look frozen while
+						// standing still.
+						if (attr.Albedo.w > 0.5)
+							primaryInstance = -2.0 - float(Counts.x);
+					}
+					// Normals are stored in object space, because the same mesh is
+					// instanced at whatever orientation the actor happens to have.
+					// Rotating by the instance transform is what puts it back in the
+					// world - without it every mover and character would be lit as
+					// though it had never turned.
+					mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+					vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
+
+					vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+					attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal), attr.Albedo.w);
+
+					vec3 position = origin + direction * t;
+
+					// Translucent: add what this surface contributes and carry on
+					// through it in the same direction. UE1 draws these additively,
+					// which is why the muzzle flash quad on a weapon is invisible
+					// until it is lit and why a red dot sight glows rather than
+					// showing as a dark blob.
+					float kind = attr.UV2Tex.w;
+
+					// A sprite is as bright as its actor's ScaleGlow, which the
+					// instance carries in place of an ambient it has no use for.
+					bool sprite = attr.Emission.w > 1.5;
+					float glow = sprite ? instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].x : 1.0;
+
+					// A window onto the sky zone. The engine draws the skybox from
+					// the sky zone's viewpoint in the same direction as the view,
+					// so the ray does exactly that: same direction, new start.
+					// Only once per path - a second window means there is no sky
+					// zone behind this one, and the stand-in sky is all there is.
+					if (kind > 4.5)
+					{
+						if (SkyOrigin.w > 0.5 && !inSky && (Disable & 4u) == 0u)
+						{
+							inSky = true;
+							origin = SkyOrigin.xyz;
+							rayMin = Params.z;
+							if (passes < 8u)
+							{
+								passes++;
+								bounce--;
+							}
+							continue;
+						}
+						// Out through the side of the skybox there is nothing: the
+						// engine shows black there. The stand-in sky is only for a
+						// level with no sky zone, and lighting the inside of the
+						// skybox with it is what washed the clouds out.
+						if (!inSky)
+							radiance += throughput * skyLight(direction);
+						break;
+					}
+
+					if ((kind > 1.5 && kind < 2.5) || kind > 3.5)
+					{
+						// The pixel records the surface behind this one as what it
+						// sees, so this one appearing would otherwise go unnoticed
+						// and fade in over many frames.
+						if (bounce == 0u && instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w > 0.5)
+							primaryChanged = true;
+
+						if (kind > 3.5)
+						{
+							// Modulated: the surface multiplies what is behind it,
+							// as modulate-2x, so mid grey leaves the background
+							// alone. Treating it as additive along with translucent
+							// turned a pair of dark sunglasses bright white.
+							//
+							// The engine modulates in gamma space, where mid grey
+							// times two is exactly one. In linear terms that is
+							// 2^2.2 times the linear colour; doubling the linear
+							// value instead darkened what should vanish, and left
+							// every decal sitting in a grey square.
+							throughput *= clamp(attr.Albedo.rgb * 4.595, vec3(0.0), vec3(4.595));
+						}
+						else
+						{
+							// Translucent: additive, so black is invisible and
+							// bright glows. But additive of the surface as lit,
+							// not as it would glow: the engine multiplies it by
+							// its lighting like any other surface unless it is
+							// unlit. Adding the bare texture drew the Liberty
+							// Island sea and the skybox clouds - translucent,
+							// lit, with no light anywhere near - bright grey
+							// where the original shows them nearly black.
+							vec3 contribution;
+							if (sprite || attr.Emission.w > 0.5)
+							{
+								contribution = attr.Albedo.rgb * glow;
+							}
+							else
+							{
+								vec3 facing = dot(normal, direction) > 0.0 ? -normal : normal;
+								vec3 surroundings = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
+								contribution = directLight(position, facing, attr.Albedo.rgb, attr.Ambient.w > 0.5, true)
+									+ attr.Albedo.rgb * surroundings;
+							}
+							radiance += throughput * contribution;
+						}
+
+						origin = position;
+						rayMin = 0.01;
 						if (passes < 8u)
 						{
 							passes++;
@@ -619,182 +822,307 @@ std::string Shaders::Trace()
 						}
 						continue;
 					}
-					// Out through the side of the skybox there is nothing: the
-					// engine shows black there. The stand-in sky is only for a
-					// level with no sky zone, and lighting the inside of the
-					// skybox with it is what washed the clouds out.
-					if (!inSky)
-						radiance += throughput * skyLight(direction);
-					break;
-				}
 
-				if ((kind > 1.5 && kind < 2.5) || kind > 3.5)
-				{
-					// The pixel records the surface behind this one as what it
-					// sees, so this one appearing would otherwise go unnoticed
-					// and fade in over many frames.
-					if (bounce == 0u && instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w > 0.5)
-						primaryChanged = true;
-
-					if (kind > 3.5)
+					// A solid or masked sprite is just its picture: nothing lights it
+					// and nothing bounces off it.
+					if (sprite && (Params.w < 1.5 || Params.w > 2.5))
 					{
-						// Modulated: the surface multiplies what is behind it,
-						// as modulate-2x, so mid grey leaves the background
-						// alone. Treating it as additive along with translucent
-						// turned a pair of dark sunglasses bright white.
-						//
-						// The engine modulates in gamma space, where mid grey
-						// times two is exactly one. In linear terms that is
-						// 2^2.2 times the linear colour; doubling the linear
-						// value instead darkened what should vanish, and left
-						// every decal sitting in a grey square.
-						throughput *= clamp(attr.Albedo.rgb * 4.595, vec3(0.0), vec3(4.595));
+						radiance += throughput * attr.Albedo.rgb * glow;
+						break;
 					}
-					else
+
+					// A reflective surface - the polished floor of the UNATCO lobby
+					// is the one that shows. Half the rays carry on in the mirrored
+					// direction and half shade the surface itself, which averages
+					// out to a floor that is both marble and a reflection. Without
+					// this the flag meant nothing and the floor was a flat slab of
+					// whatever colour its texture averaged to.
+					// The denoiser's surface, when this is the first solid thing seen
+					// and it is lit. Both halves of a part-mirror surface are
+					// described, whichever one this sample takes. An unlit surface
+					// is left out - it is its own colour, with nothing to denoise -
+					// unless it is also part mirror, like the one-way glass in the
+					// clubs: its reflection needs the denoiser as much as any.
+					bool unlitSurface = attr.Emission.w > 0.5;
+					bool firstSurface = bounce == 0u && !surfaceFound && !inSky && (!unlitSurface || attr.UV2Tex.w > 2.5) &&
+						(Params.w < 0.5 || Params.w > 2.5);
+					// Likewise the first lit surface seen in a mirror. A mirror
+					// seen in a mirror gives only its own half here: its
+					// reflection would need a third pass.
+					bool reflectedSurface = lobePass == 1 && bounce == 1u && !reflectionFound && !inSky && attr.Emission.w < 0.5 &&
+						(Params.w < 0.5 || Params.w > 2.5);
+					bool captured = firstSurface || reflectedSurface;
+					vec3 mirrorTint = 0.55 + 0.45 * clamp(attr.Albedo.rgb * 2.5, vec3(0.0), vec3(1.0));
+					if (reflectedSurface)
 					{
-						// Translucent: additive, so black is invisible and
-						// bright glows. But additive of the surface as lit,
-						// not as it would glow: the engine multiplies it by
-						// its lighting like any other surface unless it is
-						// unlit. Adding the bare texture drew the Liberty
-						// Island sea and the skybox clouds - translucent,
-						// lit, with no light anywhere near - bright grey
-						// where the original shows them nearly black.
-						vec3 contribution;
-						if (sprite || attr.Emission.w > 0.5)
+						reflectionFound = true;
+						reflectionThroughput = throughput;
+						reflectionEmission = radiance;
+						radiance = vec3(0.0);
+						throughput = vec3(1.0);
+						reflectionAlbedo = attr.Albedo.rgb * (attr.UV2Tex.w > 2.5 ? 0.5 : 1.0);
+						reflectionNormal = dot(normal, direction) > 0.0 ? -normal : normal;
+						reflectionDistance = distance(position, specularOrigin);
+						hitDistance = 0.0;
+						wantHitDistance = true;
+					}
+					if (firstSurface)
+					{
+						surfaceFound = true;
+						surfaceThroughput = throughput;
+						emission = radiance;
+						radiance = vec3(0.0);
+						throughput = vec3(1.0);
+						// A part-mirror surface is half each, as the two halves
+						// were taken half the time each before.
+						bool mirror = attr.UV2Tex.w > 2.5;
+						diffuseAlbedo = surfaceThroughput * attr.Albedo.rgb * (mirror ? 0.5 : 1.0);
+						// Unlit, its half is exactly its texture: emission, with no
+						// lighting for the denoiser.
+						if (unlitSurface)
 						{
-							contribution = attr.Albedo.rgb * glow;
+							emission += diffuseAlbedo;
+							diffuseAlbedo = vec3(0.0);
 						}
-						else
+						specularAlbedo = mirror ? surfaceThroughput * mirrorTint * 0.5 : vec3(0.0);
+						surfaceNormal = dot(normal, direction) > 0.0 ? -normal : normal;
+						if (mirror)
 						{
-							vec3 facing = dot(normal, direction) > 0.0 ? -normal : normal;
-							vec3 surroundings = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
-							contribution = directLight(position, facing, attr.Albedo.rgb, attr.Ambient.w > 0.5)
-								+ attr.Albedo.rgb * surroundings;
+							pendingSpecular = true;
+							specularOrigin = position + surfaceNormal * Params.z;
+							specularDirection = reflect(direction, surfaceNormal);
 						}
-						radiance += throughput * contribution;
+						surfaceRoughness = mirror ? 0.0 : 1.0;
+						surfacePosition = position;
+						surfaceObject = rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(position, 1.0);
+						surfaceInstance = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+						wantHitDistance = true;
 					}
 
-					origin = position;
-					rayMin = 0.01;
-					if (passes < 8u)
+					// The denoiser's surface takes its reflection in a pass of its
+					// own, so here it always takes the other half.
+					if (attr.UV2Tex.w > 2.5 && !captured && randomFloat() < 0.5)
 					{
-						passes++;
-						bounce--;
+						// Tinted by the floor but not dimmed to nothing by it: dark
+						// marble has an albedo near 0.1, and multiplying the
+						// reflection by that made it invisible.
+						throughput *= mirrorTint;
+						origin = position + normal * Params.z;
+						rayMin = Params.z;
+						direction = reflect(direction, normal);
+						continue;
 					}
-					continue;
-				}
 
-				// A solid or masked sprite is just its picture: nothing lights it
-				// and nothing bounces off it.
-				if (sprite && Params.w < 1.5)
-				{
-					radiance += throughput * attr.Albedo.rgb * glow;
-					break;
-				}
+					// Debug: light every instance that is not the static world, so
+					// that "the actors are not being drawn" can be told apart from
+					// "the actors are drawn and too dark to see". The static world
+					// is the only geometry whose attributes start at zero.
+					// Albedo only: no lights, no ambient, no bounces. If something is
+					// invisible in the finished image but plain here, it is lit
+					// wrongly rather than missing.
+					if (Params.w > 1.5 && Params.w < 2.5)
+					{
+						radiance = attr.Albedo.rgb;
+						break;
+					}
 
-				// A reflective surface - the polished floor of the UNATCO lobby
-				// is the one that shows. Half the rays carry on in the mirrored
-				// direction and half shade the surface itself, which averages
-				// out to a floor that is both marble and a reflection. Without
-				// this the flag meant nothing and the floor was a flat slab of
-				// whatever colour its texture averaged to.
-				if (attr.UV2Tex.w > 2.5 && randomFloat() < 0.5)
-				{
-					// Tinted by the floor but not dimmed to nothing by it: dark
-					// marble has an albedo near 0.1, and multiplying the
-					// reflection by that made it invisible.
-					throughput *= 0.55 + 0.45 * clamp(attr.Albedo.rgb * 2.5, vec3(0.0), vec3(1.0));
+					if (Params.w > 0.5 && Params.w < 1.5)
+					{
+						// Which instances the history is being thrown away for.
+						//   green:   an instance flagged as moved or changed shape
+						//            this frame - a door while it swings, a
+						//            character mid animation, every sprite.
+						//   magenta: an instance that is holding still.
+						//   dim:     the static world, which is instance zero.
+						int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+						if (instanceId > 0)
+						{
+							bool moved = instanceAmbient[instanceId].w > 0.5;
+							radiance = (moved ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 1.0)) * 4.0;
+							break;
+						}
+						radiance += throughput * attr.Albedo.rgb * 0.1;
+						break;
+					}
+
+					// These surfaces are single sided in the engine but solid from
+					// either direction here, so face the normal back at the ray.
+					if (dot(normal, direction) > 0.0)
+						normal = -normal;
+
+					// Self lit surfaces emit the colour they actually are, which is
+					// only known once the texture has been sampled. Emission.w is
+					// the flag; the rgb carries nothing.
+					//
+					// That is all an unlit surface is: the engine shows its texture
+					// at full brightness and nothing reaches it, so there is no
+					// lighting to gather and nothing to bounce. Carrying on from it
+					// is what made the unlit skyline cost a full path per pixel.
+					if (attr.Emission.w > 0.5)
+					{
+						// Already counted, as emission, when it is the
+						// denoiser's surface.
+						if (!firstSurface)
+							radiance += throughput * attr.Albedo.rgb;
+						break;
+					}
+					// Shaded as white on the denoiser's surface: its colour goes back
+					// on afterwards.
+					vec3 shade = captured ? vec3(1.0) : attr.Albedo.rgb;
+					radiance += throughput * directLight(position, normal, shade, attr.Ambient.w > 0.5);
+					if (bounce == 0u)
+						primaryMoverShadow = shadowedByMover || litByChangingLight;
+
+					// The zone's ambient. Level surfaces carry their own, because a
+					// zone is a property of the surface; an instanced shape takes it
+					// from wherever the actor happens to be standing. Without this
+					// anything the light actors do not reach is pure black, which is
+					// not what the engine shows.
+					vec3 ambient = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
+					radiance += throughput * shade * ambient;
+
+					// The skybox is a backdrop. The engine never lights it by
+					// anything bouncing inside it, and bouncing around a box the
+					// size of the sky for every sky pixel is what the frame rate
+					// was spent on, so the first surface there is the last.
+					if (inSky)
+						break;
+
+					throughput *= shade;
+
+					// Russian roulette on the dim paths. Without it the loop spends
+					// most of its time on bounces that cannot change the pixel.
+					if (bounce >= 2u)
+					{
+						float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+						if (randomFloat() > p)
+							break;
+						throughput /= p;
+					}
+
 					origin = position + normal * Params.z;
 					rayMin = Params.z;
-					direction = reflect(direction, normal);
-					continue;
+					direction = cosineDirection(normal);
 				}
+			}
 
-				// Debug: light every instance that is not the static world, so
-				// that "the actors are not being drawn" can be told apart from
-				// "the actors are drawn and too dark to see". The static world
-				// is the only geometry whose attributes start at zero.
-				// Albedo only: no lights, no ambient, no bounces. If something is
-				// invisible in the finished image but plain here, it is lit
-				// wrongly rather than missing.
-				if (Params.w > 1.5)
+			// The picture put back together from the denoiser's parts.
+			vec3 diffuseSignal = vec3(0.0);
+			vec3 specularSignal = vec3(0.0);
+			float specularHitDistance = 0.0;
+			// What the mirror shows, and the part of it the denoiser takes:
+			// the lighting on the surface seen in it, while whatever lay
+			// between - glass, sprites, the sky - joins the emission.
+			vec3 reflectionSignal = vec3(0.0);
+			float reflectionHitDistance = 0.0;
+			vec3 reflectionRemodulation = vec3(0.0);
+			if (pendingSpecular)
+			{
+				if (reflectionFound)
 				{
-					radiance = attr.Albedo.rgb;
-					break;
+					reflectionSignal = radiance;
+					reflectionHitDistance = hitDistance;
+					reflectionRemodulation = specularAlbedo * reflectionThroughput * reflectionAlbedo;
+					specularSignal = reflectionEmission + reflectionThroughput * reflectionAlbedo * reflectionSignal;
 				}
-
-				if (Params.w > 0.5)
+				else
 				{
-					// Which instances the history is being thrown away for.
-					//   green:   an instance flagged as moved or changed shape
-					//            this frame - a door while it swings, a
-					//            character mid animation, every sprite.
-					//   magenta: an instance that is holding still.
-					//   dim:     the static world, which is instance zero.
-					int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
-					if (instanceId > 0)
-					{
-						bool moved = instanceAmbient[instanceId].w > 0.5;
-						radiance = (moved ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 1.0)) * 4.0;
-						break;
-					}
-					radiance += throughput * attr.Albedo.rgb * 0.1;
-					break;
+					specularSignal = radiance;
 				}
+				specularHitDistance = reflectionDistance;
+			}
+			else
+			{
+				diffuseRadiance = radiance;
+				diffuseHitDistance = hitDistance;
+			}
+			vec3 emissionPart = emission;
+			if (surfaceFound)
+			{
+				diffuseSignal = diffuseRadiance;
+				radiance = emission + diffuseAlbedo * diffuseSignal + specularAlbedo * specularSignal;
+				emissionPart = emission + specularAlbedo * (reflectionFound ? reflectionEmission : specularSignal);
+			}
+			else
+			{
+				emission = radiance;
+				emissionPart = radiance;
+				surfacePosition = primaryPosition;
+				surfaceObject = primaryPosition;
+			}
 
-				// These surfaces are single sided in the engine but solid from
-				// either direction here, so face the normal back at the ray.
-				if (dot(normal, direction) > 0.0)
-					normal = -normal;
+			// Depth along the view, and where this point was on screen last
+			// frame: carried back by its instance's last placement, then seen
+			// through last frame's camera. Measured in screen widths and
+			// heights, from here to there, as a denoiser expects.
+			float viewZ = dot(surfacePosition - CameraOrigin.xyz, CameraForward.xyz);
+			vec3 previousPosition = surfacePosition;
+			if (surfaceInstance >= 0)
+			{
+				vec4 object = vec4(surfaceObject, 1.0);
+				int row = surfaceInstance * 3;
+				previousPosition = vec3(dot(previousRows[row], object), dot(previousRows[row + 1], object), dot(previousRows[row + 2], object));
+			}
+			vec2 motion = screenMotion(surfacePosition, previousPosition);
 
-				// Self lit surfaces emit the colour they actually are, which is
-				// only known once the texture has been sampled. Emission.w is
-				// the flag; the rgb carries nothing.
-				//
-				// That is all an unlit surface is: the engine shows its texture
-				// at full brightness and nothing reaches it, so there is no
-				// lighting to gather and nothing to bounce. Carrying on from it
-				// is what made the unlit skyline cost a full path per pixel.
-				if (attr.Emission.w > 0.5)
-				{
-					radiance += throughput * attr.Albedo.rgb;
-					break;
-				}
-				radiance += throughput * directLight(position, normal, attr.Albedo.rgb, attr.Ambient.w > 0.5);
-				if (bounce == 0u)
-					primaryMoverShadow = shadowedByMover || litByChangingLight;
+			// The surface seen in a mirror, where it appears to be: as far
+			// behind the glass as it really is in front of it, along the line
+			// of sight. Its normal is turned the same way. The mirror and what
+			// it shows are taken as still, so this point moves on screen only
+			// as the camera does.
+			float reflectionViewZ = 1.0e7;
+			vec2 reflectionMotion = vec2(0.0);
+			vec3 virtualNormal = vec3(0.0, 0.0, 1.0);
+			if (reflectionFound)
+			{
+				vec3 toMirror = surfacePosition - CameraOrigin.xyz;
+				float mirrorDistance = length(toMirror);
+				vec3 virtualPosition = CameraOrigin.xyz + toMirror * ((mirrorDistance + reflectionDistance) / mirrorDistance);
+				reflectionViewZ = dot(virtualPosition - CameraOrigin.xyz, CameraForward.xyz);
+				reflectionMotion = screenMotion(virtualPosition, virtualPosition);
+				virtualNormal = reflect(reflectionNormal, surfaceNormal);
+			}
 
-				// The zone's ambient. Level surfaces carry their own, because a
-				// zone is a property of the surface; an instanced shape takes it
-				// from wherever the actor happens to be standing. Without this
-				// anything the light actors do not reach is pure black, which is
-				// not what the engine shows.
-				vec3 ambient = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
-				radiance += throughput * attr.Albedo.rgb * ambient;
+			if ((Disable & 64u) != 0u)
+			{
+				// Where there is nothing to denoise, NRD is told the pixel is
+				// beyond its range, the way it expects the sky to be marked.
+				imageStore(guideNormalImage, pixel, packNormalRoughness(surfaceFound ? surfaceNormal : vec3(0.0, 0.0, 1.0), surfaceRoughness));
+				imageStore(guideDepthMotionImage, pixel, vec4(surfaceFound ? viewZ : 1.0e7, motion, surfaceFound ? 1.0 : 0.0));
+				imageStore(diffuseImage, pixel, vec4(diffuseSignal, diffuseHitDistance));
+				imageStore(specularImage, pixel, vec4(reflectionSignal, reflectionHitDistance));
+				imageStore(emissionImage, pixel, vec4(emissionPart, 1.0));
+				imageStore(diffuseAlbedoImage, pixel, vec4(diffuseAlbedo, 1.0));
+				imageStore(specularAlbedoImage, pixel, vec4(reflectionRemodulation, 1.0));
+				imageStore(reflectionNormalImage, pixel, packNormalRoughness(virtualNormal, 1.0));
+				imageStore(reflectionDepthMotionImage, pixel, vec4(reflectionViewZ, reflectionMotion, reflectionFound ? 1.0 : 0.0));
+			}
 
-				// The skybox is a backdrop. The engine never lights it by
-				// anything bouncing inside it, and bouncing around a box the
-				// size of the sky for every sky pixel is what the frame rate
-				// was spent on, so the first surface there is the last.
-				if (inSky)
-					break;
-
-				throughput *= attr.Albedo.rgb;
-
-				// Russian roulette on the dim paths. Without it the loop spends
-				// most of its time on bounces that cannot change the pixel.
-				if (bounce >= 2u)
-				{
-					float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
-					if (randomFloat() > p)
-						break;
-					throughput /= p;
-				}
-
-				origin = position + normal * Params.z;
-				rayMin = Params.z;
-				direction = cosineDirection(normal);
+			// PT VIEW: one of the parts in place of the picture, averaged the
+			// same way. Lighting is shown tonemapped like the picture; the
+			// rest as plain values.
+			bool plainView = false;
+			if (Params.w > 2.5)
+			{
+				int view = int(Params.w + 0.5);
+				plainView = view != 6 && view != 7 && view != 8;
+				if (view == 3)
+					radiance = surfaceNormal * 0.5 + 0.5;
+				else if (view == 4)
+					radiance = vec3(clamp(log2(max(viewZ, 1.0)) / 16.0, 0.0, 1.0));
+				else if (view == 5)
+					radiance = vec3(0.5 + motion * 20.0, 0.5);
+				else if (view == 6)
+					radiance = diffuseSignal;
+				else if (view == 7)
+					radiance = specularSignal;
+				else if (view == 8)
+					radiance = emission;
+				else if (view == 9)
+					radiance = diffuseAlbedo + specularAlbedo;
+				else if (view == 10)
+					radiance = vec3(clamp(diffuseHitDistance / 2048.0, 0.0, 1.0), clamp(specularHitDistance / 2048.0, 0.0, 1.0), 0.0);
+				// 11, the history, is drawn once the average is updated.
 			}
 
 			// Average with what has already been traced from this viewpoint.
@@ -876,6 +1204,17 @@ std::string Shaders::Trace()
 			vec3 mapped = result * Params.x;
 			mapped = mapped / (mapped + vec3(1.0));
 			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
+			if (Params.w > 2.5)
+			{
+				// A view of one part: no fog or flash over it. The history view
+				// is how many frames each pixel has averaged, white at 64, red
+				// where a change in its light is holding it short.
+				vec3 shown = plainView ? result : mapped;
+				if (int(Params.w + 0.5) == 11)
+					shown = recentShadow > 0.0 ? vec3(1.0, 0.0, 0.0) : vec3(min(samples / 64.0, 1.0));
+				imageStore(outImage, pixel, vec4(shown, 1.0));
+				return;
+			}
 
 			// The engine's screen flash - taking damage, being under water -
 			// carried in the camera vectors' spare w. The same blend the other
@@ -891,11 +1230,65 @@ std::string Shaders::Trace()
 			{
 				vec4 fog = volumetricFog(CameraOrigin.xyz, viewDirection, primaryDistance);
 				mapped = fog.rgb + mapped * (1.0 - fog.a);
+				if ((Disable & 64u) != 0u)
+					imageStore(fogImage, pixel, fog);
+			}
+			else if ((Disable & 64u) != 0u)
+			{
+				imageStore(fogImage, pixel, vec4(0.0));
 			}
 
 			vec3 flashFog = vec3(CameraRight.w, CameraUp.w, CameraForward.w);
 			mapped = flashFog + mapped * CameraOrigin.w;
 
+			imageStore(outImage, pixel, vec4(mapped, 1.0));
+		}
+	)";
+}
+
+std::string Shaders::Composite()
+{
+	return R"(
+		#version 460
+
+		layout(local_size_x = 8, local_size_y = 8) in;
+
+		layout(binding = 0, rgba16f) uniform writeonly image2D outImage;
+		layout(binding = 1, rgba16f) uniform readonly image2D emissionImage;
+		layout(binding = 2, rgba16f) uniform readonly image2D diffuseAlbedoImage;
+		layout(binding = 3, rgba16f) uniform readonly image2D specularAlbedoImage;
+		layout(binding = 4, rgba16f) uniform readonly image2D diffuseImage;    // denoised, demodulated
+		layout(binding = 5, rgba16f) uniform readonly image2D specularImage;   // what mirrors show, denoised
+		layout(binding = 6, rgba16f) uniform readonly image2D fogImage;
+
+		layout(push_constant) uniform PushConstants
+		{
+			vec4 Flash;      // x the picture's scale, yzw the flash colour
+			float Exposure;
+		};
+
+		// The same finish the trace gives its own picture: the lighting put
+		// back on its surfaces, tonemapped, then the fog and the screen flash
+		// over it.
+		void main()
+		{
+			ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+			ivec2 size = imageSize(outImage);
+			if (pixel.x >= size.x || pixel.y >= size.y)
+				return;
+
+			vec3 result = imageLoad(emissionImage, pixel).rgb
+				+ imageLoad(diffuseAlbedoImage, pixel).rgb * max(imageLoad(diffuseImage, pixel).rgb, vec3(0.0))
+				+ imageLoad(specularAlbedoImage, pixel).rgb * max(imageLoad(specularImage, pixel).rgb, vec3(0.0));
+
+			vec3 mapped = result * Exposure;
+			mapped = mapped / (mapped + vec3(1.0));
+			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
+
+			vec4 fog = imageLoad(fogImage, pixel);
+			mapped = fog.rgb + mapped * (1.0 - fog.a);
+
+			mapped = Flash.yzw + mapped * Flash.x;
 			imageStore(outImage, pixel, vec4(mapped, 1.0));
 		}
 	)";

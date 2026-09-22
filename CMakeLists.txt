@@ -223,6 +223,7 @@ set(PATHTRACERDRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/PathTracerDrv")
 
 add_library(PathTracerDrv SHARED
 	"${PATHTRACERDRV_DIR}/AccelStructure.cpp"
+	"${PATHTRACERDRV_DIR}/Denoiser.cpp"
 	"${PATHTRACERDRV_DIR}/LevelScene.cpp"
 	"${PATHTRACERDRV_DIR}/mat.cpp"
 	"${PATHTRACERDRV_DIR}/PathTracerDrv.cpp"
@@ -234,6 +235,18 @@ add_library(PathTracerDrv SHARED
 target_include_directories(PathTracerDrv PRIVATE "${PATHTRACERDRV_DIR}")
 configure_deusex_renderdevice(PathTracerDrv PATHTRACERDRV_EXPORTS)
 target_link_libraries(PathTracerDrv PRIVATE zvulkan)
+
+# NVIDIA's NRD denoiser, when cmake/build-nrd.sh has built it. Without it the
+# driver builds as before and PT DENOISE says why it cannot.
+set(PATHTRACER_NRD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.nrd" CACHE PATH "Output of cmake/build-nrd.sh")
+if(EXISTS "${PATHTRACER_NRD_DIR}/x86/NRD.lib")
+	message(STATUS "PathTracerDrv: denoising with NRD from ${PATHTRACER_NRD_DIR}")
+	target_include_directories(PathTracerDrv PRIVATE "${PATHTRACER_NRD_DIR}/src/Include")
+	target_compile_definitions(PathTracerDrv PRIVATE PATHTRACER_NRD NRD_STATIC_LIBRARY)
+	target_link_libraries(PathTracerDrv PRIVATE "${PATHTRACER_NRD_DIR}/x86/NRD.lib")
+else()
+	message(STATUS "PathTracerDrv: no NRD at ${PATHTRACER_NRD_DIR}, building without the denoiser")
+endif()
 
 # ------------------------------------------------------------------- spikes ---
 

@@ -71,6 +71,10 @@ struct SceneInstance
 	// An actor carries its zone's ambient with it, because the same mesh is
 	// instanced in rooms with different lighting.
 	vec4 Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+	// Where it was last frame, for motion vectors. Left unset for anything
+	// that did not exist then, or never moves, which counts as not moving.
+	bool HasPrevious = false;
+	float PreviousTransform[12] = {};
 };
 
 // Turns the engine's level into geometry, lights and placements.
@@ -188,6 +192,10 @@ private:
 	int MirroredSurfaces = 0;
 	std::unordered_map<AActor*, PlacedPose> PreviousPoses;
 	std::unordered_map<AActor*, PlacedPose> CurrentPoses;
+	// The first person weapon's last placement, which is not an actor's
+	// placement in the level and so is not among the poses.
+	bool HaveViewModelTransform = false;
+	float ViewModelTransform[12] = {};
 
 public:
 	// How many distinct poses an animation is quantised into. Bounds the number
