@@ -217,8 +217,12 @@ std::string Shaders::Trace()
 				return true;
 
 			// Translucent adds and modulated multiplies; both are handled at the
-			// hit and neither stops light.
-			return !shadowRay;
+			// hit and neither stops light. Either can be masked as well, and
+			// then its holes are no part of it: a grille that is both showed
+			// palette entry zero - magenta - added over whatever lay behind.
+			if (shadowRay)
+				return false;
+			return textured ? texture(sceneTextures[nonuniformEXT(index)], uv).a > 0.5 : true;
 		}
 
 		// Is anything between two points? Terminate on the first hit rather than

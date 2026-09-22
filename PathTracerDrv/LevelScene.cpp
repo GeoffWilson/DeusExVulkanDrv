@@ -322,7 +322,12 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		// texture run unbroken across many nodes. Projecting a vertex onto those
 		// axes gives its position in texture space, in texels, which the texture
 		// size turns into the 0..1 the sampler wants.
-		const int textureIndex = TextureFor(surf.Texture);
+		// Masked by the surface as well as by the texture, as the engine does:
+		// a level can mask one surface of a texture that is solid everywhere
+		// else, and a grille drawn unmasked shows palette entry zero - Deus
+		// Ex's magenta - through every hole.
+		const bool surfaceMasked = surf.Texture && ((surf.PolyFlags | surf.Texture->PolyFlags) & PF_Masked) != 0;
+		const int textureIndex = TextureFor(surf.Texture, surfaceMasked);
 		FVector textureU(0, 0, 0), textureV(0, 0, 0), textureBase(0, 0, 0);
 		float uScale = 0.0f, vScale = 0.0f;
 		if (textureIndex >= 0 &&
@@ -391,7 +396,7 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 				const vec2 uv0 = surfaceUV(p0);
 				const vec2 uv1 = surfaceUV(p1);
 				const vec2 uv2 = surfaceUV(p2);
-				const bool masked = (surf.Texture->PolyFlags & PF_Masked) != 0;
+				const bool masked = surfaceMasked;
 				const bool translucent = (surf.PolyFlags & PF_Translucent) != 0;
 				const bool modulated = (surf.PolyFlags & PF_Modulated) != 0;
 				const bool mirrored = (surf.PolyFlags & PF_Mirrored) != 0;
@@ -623,8 +628,9 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 		// comes from the instance. w: special lit, as for the level's surfaces.
 		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, (poly.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f);
 
-		const int textureIndex = TextureFor(poly.Texture);
-		const bool masked = poly.Texture && (poly.Texture->PolyFlags & PF_Masked) != 0;
+		// Masked by the polygon as well as by the texture, as for the level.
+		const bool masked = poly.Texture && ((poly.PolyFlags | poly.Texture->PolyFlags) & PF_Masked) != 0;
+		const int textureIndex = TextureFor(poly.Texture, masked);
 		const bool translucent = (poly.PolyFlags & PF_Translucent) != 0;
 		const bool modulated = (poly.PolyFlags & PF_Modulated) != 0;
 		const bool mirrored = (poly.PolyFlags & PF_Mirrored) != 0;
