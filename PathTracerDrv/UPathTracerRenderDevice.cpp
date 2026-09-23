@@ -27,6 +27,25 @@ UPathTracerRenderDevice::UPathTracerRenderDevice()
 {
 }
 
+// An ANSI string as the engine's text. Not the SDK's ANSI_TO_TCHAR: it sizes
+// its stack buffer in bytes for a string of wide characters, so anything longer
+// than a few words wrote past the end of it - which is what a timing line in
+// the log did, taking the game down with it.
+static FString Widen(const char* text)
+{
+	FString result;
+	if (text)
+	{
+		TCHAR ch[2] = { 0, 0 };
+		for (; *text; text++)
+		{
+			ch[0] = (TCHAR)(unsigned char)*text;
+			result += ch;
+		}
+	}
+	return result;
+}
+
 void UPathTracerRenderDevice::StaticConstructor()
 {
 	guard(UPathTracerRenderDevice::StaticConstructor);
@@ -350,13 +369,13 @@ void UPathTracerRenderDevice::EnsureDenoiser()
 	}
 	catch (const std::exception& e)
 	{
-		debugf(TEXT("PathTracer denoiser failed: %s"), ANSI_TO_TCHAR(e.what()));
+		debugf(TEXT("PathTracer denoiser failed: %s"), *Widen(e.what()));
 		Denoise.reset();
 		DenoiseEnabled = false;
 	}
 	DescriptorsDirty = true;
 	if (Denoise)
-		debugf(TEXT("PathTracer denoiser: %s"), ANSI_TO_TCHAR(Denoise->Problem()));
+		debugf(TEXT("PathTracer denoiser: %s"), *Widen(Denoise->Problem()));
 }
 
 // The pass after the denoiser: the trace's emission and surface colours, NRD's
@@ -829,7 +848,7 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 		}
 		catch (const std::exception& e)
 		{
-			debugf(TEXT("PathTracer denoiser failed: %s"), ANSI_TO_TCHAR(e.what()));
+			debugf(TEXT("PathTracer denoiser failed: %s"), *Widen(e.what()));
 			Denoise.reset();
 			DenoiseEnabled = false;
 		}
@@ -1049,10 +1068,42 @@ void UPathTracerRenderDevice::WaitForPreviousFrame()
 		Timings.Wait += NowMs() - waitStart;
 		vkResetFences(Device->device, 1, &handle);
 	}
+	ReadTimestamps();
 
 	// The submission is done with them now.
 	PendingCommands.reset();
 	RealtimeStaging.clear();
+}
+
+// A timing line to the game's log, and to PathTracerTimings.log beside it. The
+// game's log is written in blocks, and a block not yet full when the game
+// closes under wine was lost; this one is flushed line by line.
+void UPathTracerRenderDevice::WriteTimingLine(const char* line)
+{
+	debugf(TEXT("%s"), *Widen(line));
+	if (FILE* f = fopen("PathTracerTimings.log", "a"))
+	{
+		fprintf(f, "%s\n", line);
+		fclose(f);
+	}
+}
+
+void UPathTracerRenderDevice::ReadTimestamps()
+{
+	if (!TimestampsPending || !Timestamps)
+		return;
+	TimestampsPending = false;
+
+	uint64_t t[TimestampCount] = {};
+	if (!Timestamps->getResults(0, TimestampCount, sizeof(t), t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT))
+		return;
+	auto ms = [&](int a, int b) { return t[b] > t[a] ? (double)(t[b] - t[a]) * TimestampPeriodMs : 0.0; };
+	Timings.GpuBuild += ms(0, 1);
+	Timings.GpuTrace += ms(1, 2);
+	Timings.GpuDenoise += ms(2, 3);
+	Timings.GpuComposite += ms(3, 4);
+	Timings.GpuTiles += ms(4, 5);
+	Timings.GpuFrames++;
 }
 
 void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
@@ -1287,6 +1338,29 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		auto commands = CommandPool->createBuffer();
 		commands->begin();
 
+		// Made on first use, and only where the queue can time anything.
+		if (!Timestamps && LogTimings)
+		{
+			const auto& props = Device->PhysicalDevice.Properties.Properties;
+			if (props.limits.timestampComputeAndGraphics && props.limits.timestampPeriod > 0.0f)
+			{
+				Timestamps = QueryPoolBuilder()
+					.QueryType(VK_QUERY_TYPE_TIMESTAMP, TimestampCount)
+					.DebugName("PathTracerTimestamps")
+					.Create(Device.get());
+				TimestampPeriodMs = props.limits.timestampPeriod * 1.0e-6;
+			}
+		}
+		const bool timing = Timestamps && LogTimings;
+		auto stamp = [&](uint32_t index)
+		{
+			if (timing)
+				commands->writeTimestamp(index ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, Timestamps.get(), index);
+		};
+		if (timing)
+			commands->resetQueryPool(Timestamps.get(), 0, TimestampCount);
+		stamp(0);
+
 		// Textures that generate themselves get a chance to advance before the
 		// trace reads them, recorded into this frame's command buffer rather
 		// than submitted one at a time.
@@ -1306,6 +1380,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			Timings.TopLevel += NowMs() - topStart;
 			traceThisFrame = Accel->IsReady();
 		}
+		stamp(1);
 
 		// One line per frame for the first few seconds: the black frames are
 		// intermittent, so the pattern is the evidence. Guessing at this from a
@@ -1321,6 +1396,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet);
 			commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
 			commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+			stamp(2);
 
 			// Denoised: NRD over the trace's split lighting, then the picture
 			// rebuilt from it over the one the trace wrote.
@@ -1352,6 +1428,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				inputs[1].Diffuse = GuideViews[3].get();
 				Denoise->Denoise(commands.get(), inputs, cameraOf(PushConstants), cameraOf(previousCamera), DenoiseRestart);
 				DenoiseRestart = false;
+				stamp(3);
 
 				struct { vec4 Flash; vec4 Exposure; } finish;
 				finish.Flash = vec4(PushConstants.CameraOrigin.w, PushConstants.CameraRight.w, PushConstants.CameraUp.w, PushConstants.CameraForward.w);
@@ -1361,10 +1438,18 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
 				commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
 			}
+			else
+			{
+				stamp(3);
+			}
+			stamp(4);
 		}
 
 		// HUD, menus and console on top of the traced world.
 		RenderTiles(commands.get());
+		stamp(5);
+		// Only a traced frame has every timestamp written.
+		TimestampsPending = timing && traceThisFrame;
 
 		// The trace writes the output image; the blit reads it.
 		// Waits on the tile pass as well as the trace: the HUD is drawn as a
@@ -1416,7 +1501,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		PendingCommands = std::move(commands);
 		FramePending = true;
 
+		// Paced after the present rather than before the next frame's work,
+		// so the game's own tick is what waits.
+		const double limitStart = NowMs();
 		LimitFrameRate();
+		Timings.Limit += NowMs() - limitStart;
+
 		// The scene gathering happens earlier, in SetSceneNode, so it is
 		// added to the frame's total rather than measured inside it.
 		Timings.Total += NowMs() - frameStart;
@@ -1426,10 +1516,22 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			{
 				Timings.Logged++;
 				const double n = Timings.Frames;
-				debugf(TEXT("PathTracer ms/frame: collect %.2f sync %.2f refresh %.2f toplevel %.2f gpu-wait %.2f unlock %.2f | %d instances, %d textures, %d realtime staged, %d poses rebuilt"),
+				char line[512];
+				snprintf(line, sizeof(line), "PathTracer ms/frame: collect %.2f sync %.2f refresh %.2f toplevel %.2f gpu-wait %.2f unlock %.2f limiter %.2f | %d instances, %d textures, %d realtime staged, %d poses rebuilt",
 					Timings.Collect / n, Timings.Sync / n, Timings.Refresh / n, Timings.TopLevel / n,
-					Timings.Wait / n, Timings.Total / n,
+					Timings.Wait / n, (Timings.Total - Timings.Limit) / n, Timings.Limit / n,
 					(int)Scene.Instances.size(), (int)Scene.Textures.size(), (int)RealtimeStaging.size(), Scene.MeshBuilds);
+				WriteTimingLine(line);
+				if (Timings.GpuFrames > 0)
+				{
+					const double g = Timings.GpuFrames;
+					snprintf(line, sizeof(line), "PathTracer GPU ms/frame: build %.2f trace %.2f denoise %.2f composite %.2f 2d %.2f | total %.2f at %dx%d, bounces %d, glossy bounces %d, materials %s, denoiser %s",
+						Timings.GpuBuild / g, Timings.GpuTrace / g, Timings.GpuDenoise / g, Timings.GpuComposite / g, Timings.GpuTiles / g,
+						(Timings.GpuBuild + Timings.GpuTrace + Timings.GpuDenoise + Timings.GpuComposite + Timings.GpuTiles) / g,
+						TraceWidth, TraceHeight, (int)Bounces, (int)GlossBounces,
+						MaterialsEnabled ? "on" : "off", (DenoiseEnabled && Denoise && Denoise->Available()) ? "on" : "off");
+					WriteTimingLine(line);
+				}
 			}
 			const int logged = Timings.Logged;
 			Timings = FrameTimings();
@@ -1653,7 +1755,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			DenoiseRestart = true;
 			EnsureDenoiser();
 			Ar.Logf(TEXT("PT: denoiser %s (%s)"), DenoiseEnabled ? TEXT("on") : TEXT("off"),
-				Denoise ? ANSI_TO_TCHAR(Denoise->Problem()) : TEXT("no device"));
+				Denoise ? *Widen(Denoise->Problem()) : TEXT("no device"));
 			handled = true;
 		}
 		// One of the denoiser's inputs in place of the picture. Numbered as

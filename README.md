@@ -178,7 +178,10 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `LightScale`: a percentage applied to every light's brightness.
 - `Denoise`: NRD from the start. `PT DENOISE` switches it for the session.
 - `LogTimings`: logs where each frame's time goes, averaged every few hundred
-  frames.
+  frames: the CPU's side, and the GPU's own time on the scene build, the trace,
+  the denoiser, the pass that puts the picture back together and the 2D, from
+  timestamps. Written to `PathTracerTimings.log` as well as the game's log,
+  which loses its last few lines when the game closes under wine.
 - `DebugMode`: 1 shows only what moves, 2 shows plain albedo with no lighting.
 - `Materials`: surfaces made of something, as above. Off, everything is matte
   and the frame costs what it did before materials: in the Hong Kong market on

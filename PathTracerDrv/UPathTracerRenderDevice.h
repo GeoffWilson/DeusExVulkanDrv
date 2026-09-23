@@ -234,6 +234,13 @@ private:
 	std::unique_ptr<VulkanCommandBuffer> PendingCommands;
 	bool FramePending = false;
 	void WaitForPreviousFrame();
+	// Timestamps around each part of the frame, read back once it completes.
+	static const uint32_t TimestampCount = 6;
+	std::unique_ptr<VulkanQueryPool> Timestamps;
+	bool TimestampsPending = false;
+	double TimestampPeriodMs = 0.0;
+	void ReadTimestamps();
+	void WriteTimingLine(const char* line);
 	// Sleeps until the next frame is due under FPSLimit.
 	void LimitFrameRate();
 	std::chrono::steady_clock::time_point NextFrameTime;
@@ -271,8 +278,13 @@ private:
 	// frames when LogTimings is set.
 	struct FrameTimings
 	{
-		double Collect = 0, Sync = 0, Refresh = 0, TopLevel = 0, Wait = 0, Total = 0;
+		double Collect = 0, Sync = 0, Refresh = 0, TopLevel = 0, Wait = 0, Total = 0, Limit = 0;
 		int Frames = 0;
+		// The GPU's own time on each part of a traced frame, from timestamps:
+		// the top level build and texture uploads, the trace, the denoiser, the
+		// pass that puts the picture back together, and the 2D.
+		double GpuBuild = 0, GpuTrace = 0, GpuDenoise = 0, GpuComposite = 0, GpuTiles = 0;
+		int GpuFrames = 0;
 		int Logged = 0;
 	} Timings;
 	uint32_t FrameIndex = 0;
