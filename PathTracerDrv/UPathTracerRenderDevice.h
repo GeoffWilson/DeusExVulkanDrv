@@ -6,6 +6,7 @@
 #include "Denoiser.h"
 #include "AccelStructure.h"
 #include "TextureCache.h"
+#include <chrono>
 #include <functional>
 #include <memory>
 
@@ -118,6 +119,11 @@ public:
 	// Denoise with NRD from the start ("Denoise" in the ini). PT DENOISE
 	// switches it for the session.
 	BITFIELD UseDenoiser;
+	// Frames per second to pace presentation to, or 0 for no limit. The engine
+	// only enforces a tick rate for network play, and Deus Ex misbehaves when
+	// left to run at several hundred frames a second - conversation audio is
+	// cut short, and the intro's dialogue with it.
+	INT FPSLimit;
 	// How far the reflection off a smooth surface is traced: 1 lights what it
 	// shows by the lights and ambient only, more carries on bouncing, 0 traces
 	// none and leaves highlights alone.
@@ -228,6 +234,9 @@ private:
 	std::unique_ptr<VulkanCommandBuffer> PendingCommands;
 	bool FramePending = false;
 	void WaitForPreviousFrame();
+	// Sleeps until the next frame is due under FPSLimit.
+	void LimitFrameRate();
+	std::chrono::steady_clock::time_point NextFrameTime;
 	size_t BoundSceneTextures = 0;
 	bool SceneTexturesInitialised = false;
 	int TextureFailuresLogged = 0;

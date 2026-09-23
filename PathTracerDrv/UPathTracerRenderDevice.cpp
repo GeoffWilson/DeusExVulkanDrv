@@ -4,6 +4,7 @@
 #include "Materials.h"
 #include <stdexcept>
 #include <chrono>
+#include <thread>
 
 static double NowMs()
 {
@@ -49,6 +50,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseVSync = 1;
 	LogTimings = 0;
 	UseDenoiser = 1;
+	FPSLimit = 120;
 	GlossBounces = 1;
 	UseMaterials = 1;
 
@@ -65,6 +67,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("Denoise"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDenoiser), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -1413,6 +1416,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		PendingCommands = std::move(commands);
 		FramePending = true;
 
+		LimitFrameRate();
 		// The scene gathering happens earlier, in SetSceneNode, so it is
 		// added to the frame's total rather than measured inside it.
 		Timings.Total += NowMs() - frameStart;
@@ -1441,6 +1445,54 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	}
 
 	unguard;
+}
+
+// The same pacing as VulkanDrv's FPSLimit, less its wait for the frame to
+// reach the screen: this device keeps the next frame's scene gathering running
+// while the GPU traces the last, and waiting for the present would serialise
+// the two again. What the game needs is its tick held down, which the deadline
+// alone does.
+void UPathTracerRenderDevice::LimitFrameRate()
+{
+	if (FPSLimit <= 0)
+	{
+		NextFrameTime = {};
+		return;
+	}
+
+	using namespace std::chrono;
+
+	auto interval = duration_cast<steady_clock::duration>(duration<double>(1.0 / (double)FPSLimit));
+	auto now = steady_clock::now();
+
+	// Pace off when the last frame was due rather than when it finished, so a
+	// frame that runs long is not paid for twice: the next one is due an
+	// interval after the last was, which may already have passed. More than a
+	// frame behind, the schedule starts again from now, with nothing to wait.
+	//
+	// Adding the interval after restarting, as VulkanDrv's limiter once did,
+	// makes a game that cannot reach the limit wait a whole interval every
+	// frame on top of its own time: a 13 ms frame under a 120 limit became
+	// 21 ms.
+	if (NextFrameTime == steady_clock::time_point())
+		NextFrameTime = now;
+	else
+		NextFrameTime += interval;
+	if (now > NextFrameTime + interval)
+		NextFrameTime = now;
+
+	// Sleeping is only accurate to a millisecond or so, so hand the last of the
+	// wait to a spin.
+	while (true)
+	{
+		auto remaining = NextFrameTime - steady_clock::now();
+		if (remaining <= steady_clock::duration::zero())
+			break;
+		if (remaining > milliseconds(2))
+			std::this_thread::sleep_for(remaining - milliseconds(1));
+		else
+			std::this_thread::yield();
+	}
 }
 
 void UPathTracerRenderDevice::Flush(UBOOL AllowPrecache)

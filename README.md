@@ -167,6 +167,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	VkDebug=False
 	DebugMode=0
 	LogTimings=False
+	FPSLimit=120
 	Materials=True
 	GlossBounces=1
 
@@ -189,6 +190,11 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   it shows by the lights and the zone's ambient; more carries the reflection on
   bouncing, at a cost; 0 traces none and keeps only the highlights.
   `PT GLOSSBOUNCES n` changes it for the session.
+- `FPSLimit`: frames per second to hold the game to, 120 by default and 0 for
+  no limit. Deus Ex cuts conversation audio short when left to run at a few
+  hundred frames a second, the intro included. Unlike VulkanDrv's it does not wait
+  for each frame to reach the screen, which would stop the CPU overlapping the
+  GPU.
 
 ### Console commands
 
