@@ -1916,12 +1916,19 @@ void UVulkanRenderDevice::LimitFrameRate()
 	auto now = steady_clock::now();
 
 	// Pace off when the last frame was due rather than when it finished, so a
-	// frame that runs long is not paid for twice. Restart the pacing if we have
-	// fallen more than one frame behind.
-	if (NextFrameTime == steady_clock::time_point() || now > NextFrameTime + interval)
+	// frame that runs long is not paid for twice: the next one is due an
+	// interval after the last was, which may already have passed. More than a
+	// frame behind, the schedule starts again from now, with nothing to wait.
+	//
+	// Adding the interval after restarting, as this used to, made a game that
+	// could not reach the limit wait a whole interval every frame on top of
+	// its own time: a 13 ms frame under a 120 limit became 21 ms.
+	if (NextFrameTime == steady_clock::time_point())
 		NextFrameTime = now;
-
-	NextFrameTime += interval;
+	else
+		NextFrameTime += interval;
+	if (now > NextFrameTime + interval)
+		NextFrameTime = now;
 
 	// Sleeping is only accurate to a millisecond or so, so hand the last of the
 	// wait to a spin.
