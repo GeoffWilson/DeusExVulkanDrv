@@ -142,6 +142,7 @@ struct Denoiser::Impl
 	};
 	std::vector<Texture> Pool;   // the permanent pool, then the transient
 	Texture Outputs[SignalCount];
+	Texture SpecularOutput;   // the first signal's glossy reflection
 	bool NeedsLayout = true;
 
 	int Width = 0, Height = 0;
@@ -174,7 +175,7 @@ struct Denoiser::Impl
 	}
 };
 
-Denoiser::Denoiser(VulkanDevice* device) : I(std::make_unique<Impl>())
+Denoiser::Denoiser(VulkanDevice* device, bool specular) : I(std::make_unique<Impl>()), Specular(specular)
 {
 	I->Device = device;
 	VkDevice d = device->device;
@@ -185,7 +186,9 @@ Denoiser::Denoiser(VulkanDevice* device) : I(std::make_unique<Impl>())
 		return;
 	}
 
-	const nrd::DenoiserDesc denoisers[SignalCount] = { { 0, nrd::Denoiser::RELAX_DIFFUSE }, { 1, nrd::Denoiser::RELAX_DIFFUSE } };
+	const nrd::DenoiserDesc denoisers[SignalCount] = {
+		{ 0, specular ? nrd::Denoiser::RELAX_DIFFUSE_SPECULAR : nrd::Denoiser::RELAX_DIFFUSE },
+		{ 1, nrd::Denoiser::RELAX_DIFFUSE } };
 	nrd::InstanceCreationDesc creation = {};
 	creation.denoisers = denoisers;
 	creation.denoisersNum = SignalCount;
@@ -401,6 +404,10 @@ void Denoiser::Resize(int width, int height)
 	addPool(desc.transientPool, desc.transientPoolSize);
 	for (int i = 0; i < SignalCount; i++)
 		I->Outputs[i] = I->MakeTexture(VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "PathTracerDenoiserOutput");
+	if (Specular)
+		I->SpecularOutput = I->MakeTexture(VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "PathTracerDenoiserSpecularOutput");
+	else
+		I->SpecularOutput = Impl::Texture();
 
 	I->Width = width;
 	I->Height = height;
@@ -408,6 +415,7 @@ void Denoiser::Resize(int width, int height)
 }
 
 VulkanImageView* Denoiser::Output(int signal) const { return I->Outputs[signal].View.get(); }
+VulkanImageView* Denoiser::SpecularOutput() const { return I->SpecularOutput.View ? I->SpecularOutput.View.get() : nullptr; }
 
 void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[SignalCount], const Camera& now, const Camera& previous, bool restart)
 {
@@ -428,6 +436,8 @@ void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[
 			barrier.AddImage(t.Image.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 		for (auto& t : I->Outputs)
 			barrier.AddImage(t.Image.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+		if (I->SpecularOutput.Image)
+			barrier.AddImage(I->SpecularOutput.Image.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 		barrier.Execute(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 		I->NeedsLayout = false;
 		clear = true;
@@ -481,6 +491,8 @@ void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[
 			case nrd::ResourceType::IN_VIEWZ: return inputs.ViewZ->view;
 			case nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST: return inputs.Diffuse->view;
 			case nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST: return I->Outputs[signal].View->view;
+			case nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST: return inputs.Specular ? inputs.Specular->view : VK_NULL_HANDLE;
+			case nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST: return I->SpecularOutput.View ? I->SpecularOutput.View->view : VK_NULL_HANDLE;
 			default: return VK_NULL_HANDLE;
 			}
 		};
@@ -567,10 +579,11 @@ void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[
 
 struct Denoiser::Impl {};
 
-Denoiser::Denoiser(VulkanDevice*) : I(std::make_unique<Impl>()) { Status = "built without NRD (see cmake/build-nrd.sh)"; }
+Denoiser::Denoiser(VulkanDevice*, bool specular) : I(std::make_unique<Impl>()), Specular(specular) { Status = "built without NRD (see cmake/build-nrd.sh)"; }
 Denoiser::~Denoiser() {}
 void Denoiser::Resize(int, int) {}
 void Denoiser::Denoise(VulkanCommandBuffer*, const Inputs (&)[SignalCount], const Camera&, const Camera&, bool) {}
 VulkanImageView* Denoiser::Output(int) const { return nullptr; }
+VulkanImageView* Denoiser::SpecularOutput() const { return nullptr; }
 
 #endif

@@ -118,6 +118,14 @@ public:
 	// Denoise with NRD from the start ("Denoise" in the ini). PT DENOISE
 	// switches it for the session.
 	BITFIELD UseDenoiser;
+	// How far the reflection off a smooth surface is traced: 1 lights what it
+	// shows by the lights and ambient only, more carries on bouncing, 0 traces
+	// none and leaves highlights alone.
+	INT GlossBounces;
+	// Surfaces made of something: see Materials.h. Off, everything is matte
+	// and the trace and the denoiser cost what they did before materials.
+	// PT NOMATERIALS switches it for the session.
+	BITFIELD UseMaterials;
 
 private:
 	void CreateSwapChainResources();
@@ -155,10 +163,11 @@ private:
 	std::unique_ptr<VulkanImageView> OutputView;
 
 	// A denoiser's inputs, written by the trace at bindings 9 to 15 when asked
-	// for, the fog at 17, and what mirrors show at 18 and 19: see the trace
+	// for, the fog at 17, what mirrors show at 18 and 19, and the glossy
+	// reflection off a surface and its colour at 21 and 22: see the trace
 	// shader.
-	static const int GuideImageCount = 10;
-	static int GuideBinding(int i) { return i < 7 ? 9 + i : 10 + i; }
+	static const int GuideImageCount = 12;
+	static int GuideBinding(int i) { return i < 7 ? 9 + i : (i < 10 ? 10 + i : 11 + i); }
 	static bool GuideIsDepth(int i) { return i == 1 || i == 9; }
 	std::unique_ptr<VulkanImage> GuideImages[GuideImageCount];
 	std::unique_ptr<VulkanImageView> GuideViews[GuideImageCount];
@@ -171,6 +180,7 @@ private:
 	// returns. PT DENOISE switches it on.
 	std::unique_ptr<Denoiser> Denoise;
 	bool DenoiseEnabled = false;
+	bool MaterialsEnabled = true;
 	bool DenoiseRestart = true;
 	void EnsureDenoiser();
 	std::unique_ptr<VulkanDescriptorSetLayout> CompositeLayout;
@@ -202,6 +212,11 @@ private:
 	// array binding is written as it grows; slots past what the scene uses hold
 	// a 1x1 white image so every descriptor is valid whether or not it is read.
 	std::unique_ptr<VulkanSampler> SceneSampler;
+	// What each of those textures is made of, one vec4 per slot, indexed the
+	// same way. Written as the texture array is; slots never written are matte.
+	std::unique_ptr<VulkanBuffer> MaterialBuffer;
+	size_t WrittenMaterials = 0;
+	void WriteMaterials();
 	// Staging for this frame's realtime texture uploads, released once the
 	// submission that reads them has completed.
 	std::vector<std::unique_ptr<VulkanBuffer>> RealtimeStaging;

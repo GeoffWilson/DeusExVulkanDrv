@@ -1,5 +1,6 @@
 #include "Precomp.h"
 #include "LevelScene.h"
+#include "Materials.h"
 
 namespace
 {
@@ -163,6 +164,7 @@ void LevelScene::Clear()
 	CurrentPoses.clear();
 	Textures.clear();
 	TextureMasked.clear();
+	TextureMaterials.clear();
 	TextureIndex.clear();
 	GeometryAdded = false;
 	MeshesLogged = 0;
@@ -1075,7 +1077,7 @@ int LevelScene::GeometryForBrush(UModel* brush)
 
 // The index this texture will have in the shader's array, uploading nothing:
 // the upload happens once per frame for whatever the registry ended up holding.
-int LevelScene::TextureFor(UTexture* texture, bool masked)
+int LevelScene::TextureFor(UTexture* texture, bool masked, AActor* owner)
 {
 	if (!texture)
 		return -1;
@@ -1092,6 +1094,7 @@ int LevelScene::TextureFor(UTexture* texture, bool masked)
 	const int index = (int)Textures.size();
 	Textures.push_back(texture);
 	TextureMasked.push_back(masked);
+	TextureMaterials.push_back(Materials::For(texture, owner));
 	TextureIndex[key] = index;
 	return index;
 }
@@ -1479,7 +1482,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		// a character with no glasses has a masked glasses slot showing a
 		// texture that is nothing but palette entry zero.
 		const bool masked = skin && ((skin->PolyFlags & PF_Masked) != 0 || (tri.PolyFlags & PF_Masked) != 0);
-		const int textureIndex = TextureFor(skin, masked);
+		const int textureIndex = TextureFor(skin, masked, envSource ? envSource : owner);
 		const bool translucent = (tri.PolyFlags & PF_Translucent) != 0;
 		const bool modulated = (tri.PolyFlags & PF_Modulated) != 0;
 		const bool mirrored = (tri.PolyFlags & PF_Mirrored) != 0;

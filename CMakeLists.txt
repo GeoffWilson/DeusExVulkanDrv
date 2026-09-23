@@ -225,6 +225,7 @@ add_library(PathTracerDrv SHARED
 	"${PATHTRACERDRV_DIR}/AccelStructure.cpp"
 	"${PATHTRACERDRV_DIR}/Denoiser.cpp"
 	"${PATHTRACERDRV_DIR}/LevelScene.cpp"
+	"${PATHTRACERDRV_DIR}/Materials.cpp"
 	"${PATHTRACERDRV_DIR}/mat.cpp"
 	"${PATHTRACERDRV_DIR}/PathTracerDrv.cpp"
 	"${PATHTRACERDRV_DIR}/Precomp.cpp"

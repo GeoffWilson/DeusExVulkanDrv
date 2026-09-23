@@ -44,6 +44,9 @@ std::string Shaders::Trace()
 		layout(binding = 5, std430) readonly buffer InstanceData { vec4 instanceAmbient[]; };
 		// Which lights reach which cell of the level: see WriteLightGrid.
 		layout(binding = 8, std430) readonly buffer LightGrid { uint lightGrid[]; };
+		// What each texture is made of, indexed as the texture array is: x
+		// roughness, y metalness, z reflectance face on. See Materials.h.
+		layout(binding = 20, std430) readonly buffer MaterialData { vec4 materials[1024]; };
 
 		// What a denoiser needs, written each frame when asked for (Disable bit
 		// 64): the first solid surface's normal and roughness, its depth and
@@ -64,6 +67,11 @@ std::string Shaders::Trace()
 		// own, where it appears to be behind the glass.
 		layout(binding = 18, rgba16f) uniform writeonly image2D reflectionNormalImage;
 		layout(binding = 19, rgba32f) uniform writeonly image2D reflectionDepthMotionImage;
+		// The glossy reflection off the first solid surface, demodulated, with
+		// its hit distance, and the colour that puts it back:
+		//   picture += glossAlbedo * gloss
+		layout(binding = 21, rgba16f) uniform writeonly image2D glossImage;
+		layout(binding = 22, rgba16f) uniform writeonly image2D glossAlbedoImage;
 		// Last frame's camera, as the push constants carry it, then each
 		// instance's last placement as three rows.
 		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 previousRows[]; };
@@ -78,14 +86,16 @@ std::string Shaders::Trace()
 			vec4 CameraRight;     // xyz, already scaled by the horizontal half extent
 			vec4 CameraUp;        // xyz, already scaled by the vertical half extent
 			vec4 CameraForward;   // xyz unit vector down the middle of the view
-			uvec4 Counts;         // x frame, y light count, z bounces, w accumulated frames
+			uvec4 Counts;         // x frame, y light count, z bounces (and glossy bounces << 8), w accumulated frames
 			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w debug mode
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog; 64 write the denoiser's inputs
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials; 64 write the denoiser's inputs
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
+
+		#define GlossBounces (Counts.z >> 8u)
 
 		// Does this point on the triangle actually exist? UE1 masked art keys
 		// transparency to palette index zero, which the upload turns into an
@@ -172,6 +182,165 @@ std::string Shaders::Trace()
 			vec3 t, b;
 			basisFrom(n, t, b);
 			return normalize(t * (cos(phi) * sinTheta) + b * (sin(phi) * sinTheta) + n * sqrt(max(0.0, 1.0 - r2)));
+		}
+
+		// What a solid surface is made of. Anything without a material shades
+		// exactly as every surface did before there were any: matte, its
+		// texture's colour and nothing else.
+		struct Material
+		{
+			float roughness;     // 0 a mirror, 1 fully matte
+			float metalness;
+			float reflectance;   // face on, for the part that is not metal
+			bool glossy;         // has a glossy half at all
+			bool traced;         // smooth enough for its reflection to be traced
+		};
+
+		Material matte()
+		{
+			Material m;
+			m.roughness = 1.0;
+			m.metalness = 0.0;
+			m.reflectance = 0.04;
+			m.glossy = false;
+			m.traced = false;
+			return m;
+		}
+
+		// Only for what is shaded as a solid, lit surface. Glass, decals,
+		// mirrors and the sky keep their own rules; a self lit surface has no
+		// lighting to reflect, and an environment mapped one is a reflection
+		// already.
+		Material surfaceMaterial(TriangleAttributes attr)
+		{
+			Material m = matte();
+			int index = int(attr.UV2Tex.z);
+			if ((Disable & 128u) != 0u || index < 0 || index >= 1024)
+				return m;
+			if (attr.UV2Tex.w > 1.5 || attr.Emission.w > 0.5 || attr.Normal.w > 0.5)
+				return m;
+			vec4 v = materials[index];
+			m.roughness = clamp(v.x, 0.02, 1.0);
+			m.metalness = clamp(v.y, 0.0, 1.0);
+			m.reflectance = clamp(v.z, 0.0, 1.0);
+			// Past this, a surface's sheen is too broad and too faint to be
+			// worth a ray of its own; it is shaded matte, as it always was.
+			m.glossy = m.roughness < 0.8 || m.metalness > 0.0;
+			// Rougher than this, the reflection of the surroundings is a blur
+			// that the zone's ambient stands in for well enough, and tracing
+			// it cost a second path for every pixel of wood and stone. Its
+			// highlights from the lights are kept.
+			m.traced = m.roughness < 0.5 && GlossBounces > 0u;
+			return m;
+		}
+
+		float luminance(vec3 c)
+		{
+			return dot(c, vec3(0.2126, 0.7152, 0.0722));
+		}
+
+		// The GGX microfacet model, with Smith's height correlated shadowing.
+		// alpha is the roughness squared, as the model's own parameter.
+		float ggxD(float NoH, float alpha2)
+		{
+			float d = NoH * NoH * (alpha2 - 1.0) + 1.0;
+			return alpha2 / (3.14159265 * d * d);
+		}
+
+		float smithLambda(float NoX, float alpha2)
+		{
+			float c2 = max(NoX * NoX, 1.0e-6);
+			return 0.5 * (sqrt(1.0 + alpha2 * max(1.0 - c2, 0.0) / c2) - 1.0);
+		}
+
+		vec3 fresnel(vec3 f0, float VoH)
+		{
+			return f0 + (1.0 - f0) * pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
+		}
+
+		// How much of the light arriving from every direction a glossy
+		// surface reflects towards the eye: Karis's fit to the integral. It
+		// is only the colour the reflection is divided by for the denoiser
+		// and multiplied by again afterwards, so the fit's error cancels.
+		vec3 reflectedAlbedo(vec3 f0, float roughness, float NoV)
+		{
+			const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+			const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+			vec4 r = roughness * c0 + c1;
+			float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+			vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
+			return f0 * ab.x + ab.y;
+		}
+
+		// What a material makes of a surface's colour, seen at NoV: its
+		// reflectance face on, the colour of its glossy half averaged over
+		// every direction light comes from, and what is left for the matte
+		// half. A matte material leaves the colour exactly as it was.
+		void splitColour(Material m, vec3 albedo, float NoV, out vec3 f0, out vec3 shineAlbedo, out vec3 diffuseColour)
+		{
+			f0 = mix(vec3(m.reflectance), albedo, m.metalness);
+			shineAlbedo = vec3(0.0);
+			diffuseColour = albedo;
+			if (m.glossy)
+			{
+				shineAlbedo = reflectedAlbedo(f0, m.roughness, NoV);
+				float dielectric = reflectedAlbedo(vec3(m.reflectance), m.roughness, NoV).x;
+				diffuseColour = albedo * (1.0 - m.metalness) * (1.0 - dielectric);
+			}
+		}
+
+		// The glossy reflection of a light from direction L, per unit of the
+		// light's brightness at the surface: the BRDF times the cosine, and
+		// times pi, since the engine's lights are scaled so that a matte
+		// surface reflects its albedo times the light rather than over pi.
+		// Point lights make an infinitely sharp highlight on a very smooth
+		// surface, so their roughness is held above a floor.
+		vec3 glossyLight(Material m, vec3 f0, vec3 N, vec3 V, vec3 L)
+		{
+			float NoL = dot(N, L);
+			float NoV = max(dot(N, V), 1.0e-4);
+			if (NoL <= 0.0)
+				return vec3(0.0);
+			vec3 H = normalize(V + L);
+			float alpha = max(m.roughness * m.roughness, 0.02);
+			float alpha2 = alpha * alpha;
+			float G2 = 1.0 / (1.0 + smithLambda(NoV, alpha2) + smithLambda(NoL, alpha2));
+			return fresnel(f0, max(dot(V, H), 0.0)) * (3.14159265 * ggxD(max(dot(N, H), 0.0), alpha2) * G2 / (4.0 * NoV));
+		}
+
+		// A direction off a glossy surface drawn from the microfacets the eye
+		// can see (Dupuy and Benyoub's spherical cap form of Heitz's method),
+		// and the weight the path carries for it: Fresnel times the shadowing
+		// the visible normals do not already account for. Returns false when
+		// the reflection points into the surface and the path ends.
+		bool sampleGlossy(Material m, vec3 f0, vec3 N, vec3 V, out vec3 L, out vec3 weight)
+		{
+			vec3 t, b;
+			basisFrom(N, t, b);
+			vec3 v = vec3(dot(V, t), dot(V, b), max(dot(V, N), 1.0e-4));
+			float alpha = m.roughness * m.roughness;
+			float alpha2 = alpha * alpha;
+
+			vec3 vh = normalize(vec3(alpha * v.x, alpha * v.y, v.z));
+			float phi = 6.2831853 * randomFloat();
+			float z = (1.0 - randomFloat()) * (1.0 + vh.z) - vh.z;
+			float sinTheta = sqrt(clamp(1.0 - z * z, 0.0, 1.0));
+			vec3 nh = vec3(sinTheta * cos(phi), sinTheta * sin(phi), z) + vh;
+			vec3 h = normalize(vec3(alpha * nh.x, alpha * nh.y, max(nh.z, 0.0)));
+
+			vec3 l = reflect(-v, h);
+			if (l.z <= 0.0)
+			{
+				L = N;
+				weight = vec3(0.0);
+				return false;
+			}
+			float lambdaV = smithLambda(v.z, alpha2);
+			float G1 = 1.0 / (1.0 + lambdaV);
+			float G2 = 1.0 / (1.0 + lambdaV + smithLambda(l.z, alpha2));
+			weight = fresnel(f0, max(dot(v, h), 0.0)) * (G2 / G1);
+			L = normalize(t * l.x + b * l.y + N * l.z);
+			return true;
 		}
 
 		// Should traversal accept this candidate triangle?
@@ -292,8 +461,24 @@ std::string Shaders::Trace()
 		// when "everyLight" is set: the same answer each frame. For glass and
 		// water, whose own lighting is added over what lies behind them and
 		// never passes through the denoiser.
-		vec3 directLight(vec3 position, vec3 normal, vec3 albedo, bool specialLit, bool everyLight)
+		//
+		// Returns the light a matte surface would take, to be multiplied by its
+		// colour. For a glossy surface's highlight it also says which light
+		// was sampled - its direction, and its brightness here before the
+		// angle to the surface, already divided by the chance of choosing it
+		// - or zero when it was blocked or there was none. The light is chosen
+		// by what it adds to the matte part, as it always was, and the
+		// highlight is worked out by the caller for that light alone: weighing
+		// every light in reach by its highlight cost more than the highlight
+		// was worth. A light only gives one where it also lights the surface,
+		// so nothing is missed, only noisier where a highlight is bright and
+		// its light dim. None of the material is needed in here, which keeps
+		// it out of the registers across the light loop.
+		// everyLight gives no light to sample: it is only asked of glass.
+		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, out vec3 lightDirection, out vec3 lightBase)
 		{
+			lightDirection = normal;
+			lightBase = vec3(0.0);
 			if ((Disable & 1u) != 0u)
 				return vec3(0.0);
 			uint count = Counts.y;
@@ -308,6 +493,7 @@ std::string Shaders::Trace()
 			vec3 chosenDir = vec3(0.0);
 			float chosenDistance = 0.0;
 			vec3 chosenValue = vec3(0.0);
+			vec3 chosenBase = vec3(0.0);
 
 			// Only the lights listed for the cell this point is in. A point
 			// outside the grid is beyond every light's reach.
@@ -422,8 +608,9 @@ std::string Shaders::Trace()
 
 				float falloff = 1.0 - reach / radius;
 
-				vec3 value = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * cosTheta * spot * disco);
-				float weight = dot(value, vec3(0.2126, 0.7152, 0.0722));
+				vec3 base = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * spot * disco);
+				vec3 value = base * cosTheta;
+				float weight = luminance(value);
 				if (weight <= 0.0)
 					continue;
 
@@ -440,6 +627,7 @@ std::string Shaders::Trace()
 					chosenDir = dir;
 					chosenDistance = distance;
 					chosenValue = value;
+					chosenBase = base;
 				}
 			}
 
@@ -447,7 +635,7 @@ std::string Shaders::Trace()
 			{
 				if (anyChanging)
 					litByChangingLight = true;
-				return albedo * total;
+				return total;
 			}
 
 			if (chosen < 0 || chosenWeight <= 0.0)
@@ -461,12 +649,12 @@ std::string Shaders::Trace()
 
 			// Divide by the probability it was chosen with, which is its share
 			// of the total weight.
-			return albedo * chosenValue * (weightSum / chosenWeight);
-		}
-
-		vec3 directLight(vec3 position, vec3 normal, vec3 albedo, bool specialLit)
-		{
-			return directLight(position, normal, albedo, specialLit, false);
+			// The highlight keeps the true angle to the light, whatever non
+			// incidence does to the matte part.
+			float scale = weightSum / chosenWeight;
+			lightDirection = chosenDir;
+			lightBase = chosenBase * scale;
+			return chosenValue * scale;
 		}
 
 		vec3 skyLight(vec3 dir)
@@ -626,13 +814,31 @@ std::string Shaders::Trace()
 			vec3 specularAlbedo = vec3(0.0);
 			vec3 surfaceNormal = vec3(0.0);
 			float surfaceRoughness = 1.0;
+			// A glossy first surface. Its reflection is traced in the second
+			// pass like a mirror's, but denoised as a reflection rather than as
+			// a surface of its own. A surface is never both, so the glossy one
+			// keeps its state in the mirror's variables rather than a set of
+			// its own: every value carried through the path costs the whole
+			// trace, glossy or not, in how many pixels the GPU can keep in
+			// flight. For a glossy surface:
+			//   specularOrigin, specularDirection  where its reflection starts
+			//   reflectionThroughput               what that ray carries
+			//   specularAlbedo                     the colour it goes back on with
+			//   reflectionEmission                 what the lights and the ambient
+			//                                      give it directly
+			bool glossySurface = false;
+			bool pendingGloss = false;
+			float surfaceMetalness = 0.0;
 			vec3 surfacePosition = origin + direction * 100000.0;
 			vec3 surfaceObject = surfacePosition;   // the same point in its instance's own space
 			int surfaceInstance = -1;
 			bool wantHitDistance = false;
 			float hitDistance = 0.0;
 
-			uint bounces = max(Counts.z, 1u);
+			// The path's bounces in the low byte, and in the next how many a
+			// glossy surface's reflection is given: the push constants are at
+			// the size every device must allow.
+			uint bounces = max(Counts.z & 255u, 1u);
 			// Two passes on a surface that is part mirror, so that a denoiser
 			// has both its halves every frame: the path off the surface as
 			// usual, then the reflection on its own, from the surface on.
@@ -643,12 +849,12 @@ std::string Shaders::Trace()
 			{
 				if (lobePass == 1)
 				{
-					if (!pendingSpecular)
+					if (!pendingSpecular && !pendingGloss)
 						break;
 					diffuseRadiance = radiance;
 					diffuseHitDistance = hitDistance;
 					radiance = vec3(0.0);
-					throughput = vec3(1.0);
+					throughput = pendingGloss ? reflectionThroughput : vec3(1.0);
 					origin = specularOrigin;
 					direction = specularDirection;
 					rayMin = Params.z;
@@ -668,7 +874,11 @@ std::string Shaders::Trace()
 				uint passedCount = 0u;
 				bool passingThrough = false;
 
-				for (uint bounce = firstBounce; bounce < bounces; bounce++)
+				// A glossy reflection goes as far as its own budget allows:
+				// with one, what it shows is lit by the lights and the ambient
+				// but not by light bounced on from there.
+				uint lastBounce = (lobePass == 1 && pendingGloss) ? min(bounces, 1u + GlossBounces) : bounces;
+				for (uint bounce = firstBounce; bounce < lastBounce; bounce++)
 				{
 					if (!passingThrough)
 						passedCount = 0u;
@@ -835,7 +1045,8 @@ std::string Shaders::Trace()
 							{
 								vec3 facing = dot(normal, direction) > 0.0 ? -normal : normal;
 								vec3 surroundings = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
-								contribution = directLight(position, facing, attr.Albedo.rgb, attr.Ambient.w > 0.5, true)
+								vec3 unusedDirection, unusedBase;
+								contribution = attr.Albedo.rgb * directLight(position, facing, attr.Ambient.w > 0.5, true, unusedDirection, unusedBase)
 									+ attr.Albedo.rgb * surroundings;
 							}
 							radiance += throughput * contribution;
@@ -880,10 +1091,11 @@ std::string Shaders::Trace()
 					// Likewise the first lit surface seen in a mirror. A mirror
 					// seen in a mirror gives only its own half here: its
 					// reflection would need a third pass.
-					bool reflectedSurface = lobePass == 1 && bounce == 1u && !reflectionFound && !inSky && attr.Emission.w < 0.5 &&
+					bool reflectedSurface = lobePass == 1 && pendingSpecular && bounce == 1u && !reflectionFound && !inSky && attr.Emission.w < 0.5 &&
 						(Params.w < 0.5 || Params.w > 2.5);
 					bool captured = firstSurface || reflectedSurface;
 					vec3 mirrorTint = 0.55 + 0.45 * clamp(attr.Albedo.rgb * 2.5, vec3(0.0), vec3(1.0));
+
 					if (reflectedSurface)
 					{
 						reflectionFound = true;
@@ -907,7 +1119,15 @@ std::string Shaders::Trace()
 						// A part-mirror surface is half each, as the two halves
 						// were taken half the time each before.
 						bool mirror = attr.UV2Tex.w > 2.5;
-						diffuseAlbedo = surfaceThroughput * attr.Albedo.rgb * (mirror ? 0.5 : 1.0);
+						// What it is made of, and what that makes of its colour.
+						// Worked out here and again where it is shaded rather
+						// than kept in between.
+						Material material = surfaceMaterial(attr);
+						vec3 toEye = -direction;
+						vec3 f0, shineAlbedo, diffuseColour;
+						splitColour(material, attr.Albedo.rgb,
+							max(abs(dot(normal, toEye)), 1.0e-4), f0, shineAlbedo, diffuseColour);
+						diffuseAlbedo = surfaceThroughput * diffuseColour * (mirror ? 0.5 : 1.0);
 						// Unlit, its half is exactly its texture: emission, with no
 						// lighting for the denoiser.
 						if (unlitSurface)
@@ -923,7 +1143,26 @@ std::string Shaders::Trace()
 							specularOrigin = position + surfaceNormal * Params.z;
 							specularDirection = reflect(direction, surfaceNormal);
 						}
-						surfaceRoughness = mirror ? 0.0 : 1.0;
+						surfaceRoughness = mirror ? 0.0 : (material.glossy ? material.roughness : 1.0);
+						surfaceMetalness = material.metalness;
+						// Glossy but too rough to trace, its reflection is what the
+						// lights and the ambient give it directly.
+						glossySurface = material.glossy;
+						if (glossySurface)
+							specularAlbedo = surfaceThroughput * shineAlbedo;
+						if (material.traced && lobePass == 0)
+						{
+							vec3 weight;
+							vec3 L;
+							if (sampleGlossy(material, f0, surfaceNormal, toEye, L, weight))
+							{
+								pendingGloss = true;
+								specularOrigin = position + surfaceNormal * Params.z;
+								specularDirection = L;
+								// Divided by the colour it is put back with.
+								reflectionThroughput = weight / max(shineAlbedo, vec3(1.0e-4));
+							}
+						}
 						surfacePosition = position;
 						surfaceObject = rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(position, 1.0);
 						surfaceInstance = rayQueryGetIntersectionInstanceIdEXT(rq, true);
@@ -998,9 +1237,31 @@ std::string Shaders::Trace()
 						break;
 					}
 					// Shaded as white on the denoiser's surface: its colour goes back
-					// on afterwards.
-					vec3 shade = captured ? vec3(1.0) : attr.Albedo.rgb;
-					radiance += throughput * directLight(position, normal, shade, attr.Ambient.w > 0.5);
+					// on afterwards. Its glossy reflection likewise, gathered apart
+					// and divided by the colour it goes back on with.
+					vec3 lightDirection, lightBase;
+					vec3 lit = directLight(position, normal, attr.Ambient.w > 0.5, false, lightDirection, lightBase);
+
+					// What it is made of, only now the light loop is done with.
+					// A surface seen in a mirror is captured as matte, since its
+					// own reflection would need a pass of its own.
+					Material material = reflectedSurface ? matte() : surfaceMaterial(attr);
+					vec3 toEye = -direction;
+					vec3 f0, shineAlbedo, diffuseColour;
+					splitColour(material, attr.Albedo.rgb, max(dot(normal, toEye), 1.0e-4), f0, shineAlbedo, diffuseColour);
+					bool glossCapture = firstSurface && material.glossy;
+					vec3 shade = captured ? vec3(1.0) : diffuseColour;
+					radiance += throughput * shade * lit;
+					// Only the denoiser's own surface can be both captured and
+					// glossy: one seen in a mirror is matte.
+					if (material.glossy)
+					{
+						vec3 shine = lightBase * glossyLight(material, f0, normal, toEye, lightDirection);
+						if (glossCapture)
+							reflectionEmission += shine / max(shineAlbedo, vec3(1.0e-4));
+						else
+							radiance += throughput * shine;
+					}
 					if (bounce == 0u)
 						primaryMoverShadow = shadowedByMover || litByChangingLight;
 
@@ -1008,9 +1269,15 @@ std::string Shaders::Trace()
 					// zone is a property of the surface; an instanced shape takes it
 					// from wherever the actor happens to be standing. Without this
 					// anything the light actors do not reach is pure black, which is
-					// not what the engine shows.
+					// not what the engine shows. A glossy surface reflects it too,
+					// as light arriving evenly from everywhere, which is what keeps
+					// metal from going black where no light reaches it.
 					vec3 ambient = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
 					radiance += throughput * shade * ambient;
+					if (glossCapture)
+						reflectionEmission += ambient;
+					else if (!captured)
+						radiance += throughput * shineAlbedo * ambient;
 
 					// The skybox is a backdrop. The engine never lights it by
 					// anything bouncing inside it, and bouncing around a box the
@@ -1019,7 +1286,37 @@ std::string Shaders::Trace()
 					if (inSky)
 						break;
 
-					throughput *= shade;
+					// All metal: nothing matte left for the diffuse path to find.
+					if (firstSurface && max(diffuseAlbedo.r, max(diffuseAlbedo.g, diffuseAlbedo.b)) <= 0.0)
+						break;
+
+					// Which way the path goes on. The denoiser's surface always
+					// takes the matte half here, its reflection having a pass of
+					// its own; anywhere else a glossy surface picks one of the
+					// two in proportion to what each reflects.
+					bool glossyBounce = false;
+					if (!captured && material.glossy)
+					{
+						float shineWeight = luminance(shineAlbedo);
+						float matteWeight = luminance(diffuseColour);
+						float pShine = matteWeight <= 0.0 ? 1.0 : clamp(shineWeight / max(shineWeight + matteWeight, 1.0e-4), 0.05, 0.95);
+						if (randomFloat() < pShine)
+						{
+							vec3 weight;
+							vec3 L;
+							if (!sampleGlossy(material, f0, normal, toEye, L, weight))
+								break;
+							throughput *= weight / pShine;
+							direction = L;
+							glossyBounce = true;
+						}
+						else
+						{
+							shade = diffuseColour / (1.0 - pShine);
+						}
+					}
+					if (!glossyBounce)
+						throughput *= shade;
 
 					// Russian roulette on the dim paths. Without it the loop spends
 					// most of its time on bounces that cannot change the pixel.
@@ -1033,7 +1330,8 @@ std::string Shaders::Trace()
 
 					origin = position + normal * Params.z;
 					rayMin = Params.z;
-					direction = cosineDirection(normal);
+					if (!glossyBounce)
+						direction = cosineDirection(normal);
 				}
 			}
 
@@ -1047,6 +1345,12 @@ std::string Shaders::Trace()
 			vec3 reflectionSignal = vec3(0.0);
 			float reflectionHitDistance = 0.0;
 			vec3 reflectionRemodulation = vec3(0.0);
+			vec3 glossSignal = vec3(0.0);
+			float glossHitDistance = 0.0;
+			// The glossy surface's colour lives where a mirror's would.
+			vec3 glossAlbedo = glossySurface ? specularAlbedo : vec3(0.0);
+			if (glossySurface)
+				specularAlbedo = vec3(0.0);
 			if (pendingSpecular)
 			{
 				if (reflectionFound)
@@ -1062,8 +1366,14 @@ std::string Shaders::Trace()
 				}
 				specularHitDistance = reflectionDistance;
 			}
+			else if (pendingGloss)
+			{
+				glossSignal = reflectionEmission + radiance;
+				glossHitDistance = hitDistance;
+			}
 			else
 			{
+				glossSignal = glossySurface ? reflectionEmission : vec3(0.0);
 				diffuseRadiance = radiance;
 				diffuseHitDistance = hitDistance;
 			}
@@ -1071,7 +1381,7 @@ std::string Shaders::Trace()
 			if (surfaceFound)
 			{
 				diffuseSignal = diffuseRadiance;
-				radiance = emission + diffuseAlbedo * diffuseSignal + specularAlbedo * specularSignal;
+				radiance = emission + diffuseAlbedo * diffuseSignal + specularAlbedo * specularSignal + glossAlbedo * glossSignal;
 				emissionPart = emission + specularAlbedo * (reflectionFound ? reflectionEmission : specularSignal);
 			}
 			else
@@ -1127,6 +1437,12 @@ std::string Shaders::Trace()
 				imageStore(specularAlbedoImage, pixel, vec4(reflectionRemodulation, 1.0));
 				imageStore(reflectionNormalImage, pixel, packNormalRoughness(virtualNormal, 1.0));
 				imageStore(reflectionDepthMotionImage, pixel, vec4(reflectionViewZ, reflectionMotion, reflectionFound ? 1.0 : 0.0));
+				// Without materials nothing is glossy, and nothing reads these.
+				if ((Disable & 128u) == 0u)
+				{
+					imageStore(glossImage, pixel, vec4(glossSignal, glossHitDistance));
+					imageStore(glossAlbedoImage, pixel, vec4(glossAlbedo, 1.0));
+				}
 			}
 
 			// PT VIEW: one of the parts in place of the picture, averaged the
@@ -1146,13 +1462,15 @@ std::string Shaders::Trace()
 				else if (view == 6)
 					radiance = diffuseSignal;
 				else if (view == 7)
-					radiance = specularSignal;
+					radiance = specularSignal + glossSignal;
 				else if (view == 8)
 					radiance = emission;
 				else if (view == 9)
-					radiance = diffuseAlbedo + specularAlbedo;
+					radiance = diffuseAlbedo + specularAlbedo + glossAlbedo;
 				else if (view == 10)
 					radiance = vec3(clamp(diffuseHitDistance / 2048.0, 0.0, 1.0), clamp(specularHitDistance / 2048.0, 0.0, 1.0), 0.0);
+				else if (view == 12)
+					radiance = vec3(glossySurface ? surfaceRoughness : 1.0, surfaceMetalness, glossySurface ? 1.0 : 0.0);   // roughness, metalness, glossy
 				// 11, the history, is drawn once the average is updated.
 			}
 
@@ -1291,11 +1609,13 @@ std::string Shaders::Composite()
 		layout(binding = 4, rgba16f) uniform readonly image2D diffuseImage;    // denoised, demodulated
 		layout(binding = 5, rgba16f) uniform readonly image2D specularImage;   // what mirrors show, denoised
 		layout(binding = 6, rgba16f) uniform readonly image2D fogImage;
+		layout(binding = 7, rgba16f) uniform readonly image2D glossAlbedoImage;
+		layout(binding = 8, rgba16f) uniform readonly image2D glossImage;      // glossy reflection, denoised
 
 		layout(push_constant) uniform PushConstants
 		{
 			vec4 Flash;      // x the picture's scale, yzw the flash colour
-			float Exposure;
+			vec4 Finish;     // x exposure, y 1 when there are glossy reflections to add
 		};
 
 		// The same finish the trace gives its own picture: the lighting put
@@ -1311,8 +1631,10 @@ std::string Shaders::Composite()
 			vec3 result = imageLoad(emissionImage, pixel).rgb
 				+ imageLoad(diffuseAlbedoImage, pixel).rgb * max(imageLoad(diffuseImage, pixel).rgb, vec3(0.0))
 				+ imageLoad(specularAlbedoImage, pixel).rgb * max(imageLoad(specularImage, pixel).rgb, vec3(0.0));
+			if (Finish.y > 0.5)
+				result += imageLoad(glossAlbedoImage, pixel).rgb * max(imageLoad(glossImage, pixel).rgb, vec3(0.0));
 
-			vec3 mapped = result * Exposure;
+			vec3 mapped = result * Finish.x;
 			mapped = mapped / (mapped + vec3(1.0));
 			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
 

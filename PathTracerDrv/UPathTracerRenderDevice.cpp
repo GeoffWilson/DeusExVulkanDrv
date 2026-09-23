@@ -1,6 +1,7 @@
 #include "Precomp.h"
 #include "UPathTracerRenderDevice.h"
 #include "Shaders.h"
+#include "Materials.h"
 #include <stdexcept>
 #include <chrono>
 
@@ -48,6 +49,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseVSync = 1;
 	LogTimings = 0;
 	UseDenoiser = 1;
+	GlossBounces = 1;
+	UseMaterials = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -60,6 +63,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LogTimings"), RF_Public) UBoolProperty(CPP_PROPERTY(LogTimings), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Denoise"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDenoiser), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -70,6 +75,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 
 	Viewport = InViewport;
 	DenoiseEnabled = UseDenoiser != 0;
+	MaterialsEnabled = UseMaterials != 0;
 
 	try
 	{
@@ -182,13 +188,16 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 		.AddBinding(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device.get());
 
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 + GuideImageCount)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures)
 		.MaxSets(1)
 		.DebugName("PathTracerDescriptorPool")
@@ -196,6 +205,24 @@ void UPathTracerRenderDevice::CreateTracePipeline()
 
 	DescriptorSetOwner = DescriptorPool->allocate(DescriptorLayout.get());
 	DescriptorSet = DescriptorSetOwner.get();
+
+	// Every slot matte until the scene says otherwise, which is how every
+	// surface was shaded before there were materials.
+	MaterialBuffer = BufferBuilder()
+		.Size(LevelScene::MaxTextures * sizeof(vec4))
+		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+		.DebugName("PathTracerMaterials")
+		.Create(Device.get());
+	{
+		auto* mapped = (vec4*)MaterialBuffer->Map(0, LevelScene::MaxTextures * sizeof(vec4));
+		for (int i = 0; i < LevelScene::MaxTextures; i++)
+			mapped[i] = Materials::Matte();
+		MaterialBuffer->Unmap();
+	}
+	WrittenMaterials = 0;
+	WriteDescriptors()
+		.AddBuffer(DescriptorSet, 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaterialBuffer.get())
+		.Execute(Device.get());
 
 	PipelineLayout = PipelineLayoutBuilder()
 		.AddSetLayout(DescriptorLayout.get())
@@ -273,6 +300,12 @@ static void DescribeActor(AActor* actor, UMesh* mesh, TextureCache* textures)
 		describe(texture, TEXT("texture"));
 		if (!texture)
 			continue;
+		{
+			const TCHAR* kind = nullptr;
+			const vec4 m = Materials::For(texture, actor, &kind);
+			debugf(TEXT("    material %s: roughness %.2f metalness %.2f reflectance %.2f (group %s)"),
+				kind, m.x, m.y, m.z, texture->GetOuter() ? texture->GetOuter()->GetName() : TEXT("none"));
+		}
 		for (TFieldIterator<UObjectProperty> it(texture->GetClass()); it; ++it)
 			if (!appStricmp(it->GetName(), TEXT("SourceTexture")))
 				describe(*(UTexture**)((BYTE*)texture + it->Offset), TEXT("source"));
@@ -293,12 +326,23 @@ static void DescribeActor(AActor* actor, UMesh* mesh, TextureCache* textures)
 // off rather than taking the device down with it.
 void UPathTracerRenderDevice::EnsureDenoiser()
 {
+	// Materials switched since it was made: its first signal is the wrong
+	// shape, so it is made again. Nothing may still be using the old one.
+	if (Denoise && Denoise->HasSpecular() != MaterialsEnabled)
+	{
+		WaitForPreviousFrame();
+		vkDeviceWaitIdle(Device->device);
+		Denoise.reset();
+		DenoiseRestart = true;
+		DescriptorsDirty = true;
+	}
+
 	if (!DenoiseEnabled || Denoise || !Device || !TraceWidth)
 		return;
 
 	try
 	{
-		Denoise.reset(new Denoiser(Device.get()));
+		Denoise.reset(new Denoiser(Device.get(), MaterialsEnabled));
 		Denoise->Resize(TraceWidth, TraceHeight);
 	}
 	catch (const std::exception& e)
@@ -317,12 +361,12 @@ void UPathTracerRenderDevice::EnsureDenoiser()
 void UPathTracerRenderDevice::CreateCompositePipeline()
 {
 	DescriptorSetLayoutBuilder layout;
-	for (int i = 0; i < 7; i++)
+	for (int i = 0; i < 9; i++)
 		layout.AddBinding(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
 	CompositeLayout = layout.DebugName("PathTracerCompositeSetLayout").Create(Device.get());
 
 	CompositePool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9)
 		.MaxSets(1)
 		.DebugName("PathTracerCompositePool")
 		.Create(Device.get());
@@ -360,6 +404,9 @@ void UPathTracerRenderDevice::WriteCompositeDescriptors()
 		.AddStorageImage(CompositeSet.get(), 4, Denoise->Output(0), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(CompositeSet.get(), 5, Denoise->Output(1), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(CompositeSet.get(), 6, GuideViews[7].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(CompositeSet.get(), 7, GuideViews[11].get(), VK_IMAGE_LAYOUT_GENERAL)
+		// Never read without materials, but a descriptor still has to be valid.
+		.AddStorageImage(CompositeSet.get(), 8, Denoise->SpecularOutput() ? Denoise->SpecularOutput() : GuideViews[10].get(), VK_IMAGE_LAYOUT_GENERAL)
 		.Execute(Device.get());
 }
 
@@ -831,6 +878,10 @@ void UPathTracerRenderDevice::UpdateSceneTextures()
 {
 	guard(UPathTracerRenderDevice::UpdateSceneTextures);
 
+	// Materials first: they mean something even where textures cannot be
+	// sampled, since a surface's texture index is still what it is made of.
+	WriteMaterials();
+
 	if (!CanSampleTextures || !DescriptorSet || !Textures || !SceneSampler)
 		return;
 
@@ -882,6 +933,28 @@ void UPathTracerRenderDevice::UpdateSceneTextures()
 	BoundSceneTextures = wanted;
 
 	unguard;
+}
+
+// The materials of whatever textures the scene has registered since the last
+// frame, into the slots the texture array gives them. Only ever called once
+// the previous frame is finished with the buffer.
+void UPathTracerRenderDevice::WriteMaterials()
+{
+	if (!MaterialBuffer)
+		return;
+
+	// A new level starts the registry again.
+	if (Scene.TextureMaterials.size() < WrittenMaterials)
+		WrittenMaterials = 0;
+	const size_t wanted = std::min<size_t>(Scene.TextureMaterials.size(), LevelScene::MaxTextures);
+	if (wanted <= WrittenMaterials)
+		return;
+
+	auto* mapped = (vec4*)MaterialBuffer->Map(0, LevelScene::MaxTextures * sizeof(vec4));
+	for (size_t i = WrittenMaterials; i < wanted; i++)
+		mapped[i] = Scene.TextureMaterials[i];
+	MaterialBuffer->Unmap();
+	WrittenMaterials = wanted;
 }
 
 void UPathTracerRenderDevice::UpdateDescriptors()
@@ -1173,10 +1246,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// denoiser.
 		EnsureDenoiser();
 		const bool denoising = DenoiseEnabled && Denoise && Denoise->Available() && ViewMode == 0;
-		PushConstants.Disable = DisableBits | ((ViewMode || denoising) ? 64u : 0u);
+		PushConstants.Disable = DisableBits | ((ViewMode || denoising) ? 64u : 0u) | (MaterialsEnabled ? 0u : 128u);
 		PushConstants.Counts[0] = FrameIndex++;
 		PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
-		PushConstants.Counts[2] = (uint32_t)Max(Bounces, 1);
+		PushConstants.Counts[2] = (uint32_t)Clamp(Bounces, 1, 255) | ((uint32_t)Clamp(GlossBounces, 0, 255) << 8);
 		PushConstants.Counts[3] = AccumulatedFrames;
 		UpdateSceneTextures();
 		PushConstants.TextureCount = (uint32_t)BoundSceneTextures;
@@ -1269,6 +1342,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				inputs[0].ViewZ = GuideViews[1].get();
 				inputs[0].Motion = MotionView.get();
 				inputs[0].Diffuse = GuideViews[2].get();
+				inputs[0].Specular = Denoise->HasSpecular() ? GuideViews[10].get() : nullptr;
 				inputs[1].NormalRoughness = GuideViews[8].get();
 				inputs[1].ViewZ = GuideViews[9].get();
 				inputs[1].Motion = ReflectionMotionView.get();
@@ -1278,7 +1352,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 
 				struct { vec4 Flash; vec4 Exposure; } finish;
 				finish.Flash = vec4(PushConstants.CameraOrigin.w, PushConstants.CameraRight.w, PushConstants.CameraUp.w, PushConstants.CameraForward.w);
-				finish.Exposure = vec4(PushConstants.Params.x, 0.0f, 0.0f, 0.0f);
+				finish.Exposure = vec4(PushConstants.Params.x, Denoise->HasSpecular() ? 1.0f : 0.0f, 0.0f, 0.0f);
 				commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
 				commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, CompositeSet.get());
 				commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
@@ -1426,6 +1500,20 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			player->XLevel->SingleLineCheck(hit, player, end, start, TRACE_AllColliding);
 			if (hit.Actor && hit.Actor != player->Level)
 				DescribeActor(hit.Actor, hit.Actor->Mesh, Textures.get());
+			// The level's own surface: its texture and what it counts as being
+			// made of, which is the name to use for an override in the ini.
+			UModel* model = player->XLevel->Model;
+			if (hit.Actor == player->Level && model && hit.Item >= 0 && hit.Item < model->Nodes.Num())
+			{
+				const FBspNode& node = model->Nodes(hit.Item);
+				UTexture* texture = node.iSurf < model->Surfs.Num() ? model->Surfs(node.iSurf).Texture : nullptr;
+				const TCHAR* kind = nullptr;
+				const vec4 m = Materials::For(texture, nullptr, &kind);
+				Ar.Logf(TEXT("PT: surface %s (group %s): %s, roughness %.2f metalness %.2f reflectance %.2f"),
+					texture ? texture->GetName() : TEXT("none"),
+					(texture && texture->GetOuter()) ? texture->GetOuter()->GetName() : TEXT("none"),
+					kind, m.x, m.y, m.z);
+			}
 			Ar.Logf(TEXT("PT: %s written to the log"), (hit.Actor && hit.Actor != player->Level) ? hit.Actor->GetName() : TEXT("nothing but the level"));
 			return 1;
 		}
@@ -1489,6 +1577,18 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			Bounces = Max(appAtoi(Cmd), 1);
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("NOMATERIALS")))
+		{
+			// The denoiser follows at the next frame, once nothing is
+			// using the one it replaces.
+			MaterialsEnabled = !MaterialsEnabled;
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("GLOSSBOUNCES")))
+		{
+			GlossBounces = Max(appAtoi(Cmd), 0);
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("RESET")))
 		{
 			DisableBits = 0;
@@ -1511,20 +1611,22 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			static const struct { const TCHAR* Name; int Mode; } views[] = {
 				{ TEXT("NORMALS"), 3 }, { TEXT("DEPTH"), 4 }, { TEXT("MOTION"), 5 }, { TEXT("DIFFUSE"), 6 },
 				{ TEXT("SPECULAR"), 7 }, { TEXT("EMISSION"), 8 }, { TEXT("ALBEDO"), 9 }, { TEXT("HITDIST"), 10 }, { TEXT("HISTORY"), 11 },
+				{ TEXT("MATERIAL"), 12 },
 			};
 			ViewMode = 0;
 			for (const auto& v : views)
 				if (ParseCommand(&Cmd, v.Name))
 					ViewMode = v.Mode;
-			Ar.Logf(TEXT("PT: view %s  (PT VIEW NORMALS | DEPTH | MOTION | DIFFUSE | SPECULAR | EMISSION | ALBEDO | HITDIST | HISTORY, or PT VIEW for the picture)"),
+			Ar.Logf(TEXT("PT: view %s  (PT VIEW NORMALS | DEPTH | MOTION | DIFFUSE | SPECULAR | EMISSION | ALBEDO | HITDIST | HISTORY | MATERIAL, or PT VIEW for the picture)"),
 				ViewMode ? TEXT("set") : TEXT("off"));
 			handled = true;
 		}
 		AccumulatedFrames = 0;
-		Ar.Logf(TEXT("PT: lights %s, shadows %s, sky %s, per-triangle checks %s, bounces %d%s"),
+		Ar.Logf(TEXT("PT: lights %s, shadows %s, sky %s, per-triangle checks %s, materials %s, bounces %d, glossy bounces %d%s"),
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
-			(int)Bounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | OPAQUE | DENOISE | VIEW name | GUIDES | BOUNCES n | RESET)"));
+			MaterialsEnabled ? TEXT("on") : TEXT("OFF"),
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOMATERIALS | OPAQUE | DENOISE | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

@@ -242,6 +242,9 @@ public:
 	std::vector<UTexture*> Textures;
 	// Whether each entry is wanted with palette entry zero as a hole.
 	std::vector<bool> TextureMasked;
+	// What each entry is made of, as Materials packs it: the shader's material
+	// buffer is indexed the same way as its texture array.
+	std::vector<vec4> TextureMaterials;
 	int MirroredCount() const { return MirroredSurfaces; }
 
 	// Textures that are shown as one fixed frame of their animation - a sprite
@@ -249,8 +252,9 @@ public:
 	// must not be advanced the way a looping animation is.
 	std::unordered_set<UTexture*> FixedFrames;
 	// Masked by the texture's own flags, or by the caller's when the polygon
-	// asks for it: the engine honours either.
-	int TextureFor(UTexture* texture, bool masked = false);
+	// asks for it: the engine honours either. The owner is the actor a mesh
+	// skin is being worn by, which can say what the skin is made of.
+	int TextureFor(UTexture* texture, bool masked = false, AActor* owner = nullptr);
 
 private:
 };

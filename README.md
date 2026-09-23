@@ -99,6 +99,37 @@ three bounces by default with Russian roulette after the second. Glass and water
 are lit by every light at once and without shadows, so the layer they add never
 flickers.
 
+**Materials.** Deus Ex has no material data for its renderer, but it does for
+its footsteps: every level texture is filed in a group named for what it is -
+Metal, Wood, Stone, Tiles, Textile - so the player sounds right walking on it.
+The path tracer reads that group as the surface's material. Mesh skins have no
+such group, so they fall back on their name ("ChairLeatherTex1") and on what
+their decoration breaks into when destroyed (a `WoodFragment`, a
+`MetalFragment`). Each material is a roughness, a metalness and a reflectance,
+shaded with a GGX microfacet reflection: wood, tiles, polished stone, metal and
+leather catch the lights and reflect their surroundings, while concrete, brick,
+fabric and anything unrecognised stay matte exactly as before. Glass, decals,
+mirrors, self lit and environment mapped surfaces keep their own rules.
+
+A first surface smooth enough to show its surroundings - roughness under 0.5,
+so tiles, metal and marble - has its reflection traced in a second, short pass
+of its own and denoised by ReLAX as specular, blurred by its roughness. Rougher
+glossy surfaces such as wood and leather take highlights from the lights and a
+sheen of the zone's ambient, but no traced reflection: at that roughness it is
+mostly blur, and tracing it cost a second path for every pixel of them. Anywhere
+further along a path, a glossy surface chooses between its matte and its glossy
+half in proportion to what each reflects.
+
+The built in choices can be overridden in the game's ini, in a
+`[PathTracerDrv.Materials]` section: a texture's own name, or `Group.<name>` for
+a whole group, set to `roughness, metalness` with an optional third value for
+the reflectance face on. `PT LOOK` names the texture under the crosshair and
+what it counts as.
+
+	[PathTracerDrv.Materials]
+	Group.Metal=0.3,1
+	ChairLeatherTex1=0.35,0
+
 **Noise.** Two things take it out:
 
 - **NRD's ReLAX denoiser**, on by default. The trace splits each pixel into the
@@ -109,7 +140,8 @@ flickers.
   together, with fog and the screen flash over it. What a mirror shows is
   treated as a surface in its own right, where it appears to be behind the glass,
   and denoised by a second ReLAX pass: ReLAX will not blur a perfect mirror
-  itself.
+  itself. Glossy reflections go through ReLAX's specular half alongside the
+  diffuse lighting.
 - **Per pixel accumulation** while the view is still. Each pixel checks that it
   is looking at the same instance in the same place as last frame, and keeps a
   short history where a moving shadow or an animated light crosses it.
@@ -135,6 +167,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	VkDebug=False
 	DebugMode=0
 	LogTimings=False
+	Materials=True
+	GlossBounces=1
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Exposure`: overall brightness, a byte around a midpoint of 128.
@@ -145,6 +179,16 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `LogTimings`: logs where each frame's time goes, averaged every few hundred
   frames.
 - `DebugMode`: 1 shows only what moves, 2 shows plain albedo with no lighting.
+- `Materials`: surfaces made of something, as above. Off, everything is matte
+  and the frame costs what it did before materials: in the Hong Kong market on
+  an RTX 4090 at 1920x1440 they add about 2 ms of GPU time a frame, 104 frames a
+  second against 85. Half a millisecond of that is the denoiser's specular half,
+  which is only built with materials on. `PT NOMATERIALS` switches them for the
+  session.
+- `GlossBounces`: how far a smooth surface's reflection is traced. 1 lights what
+  it shows by the lights and the zone's ambient; more carries the reflection on
+  bouncing, at a cost; 0 traces none and keeps only the highlights.
+  `PT GLOSSBOUNCES n` changes it for the session.
 
 ### Console commands
 
@@ -156,14 +200,18 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   lights cyan, at eight times their brightness.
 - `PT WEAPON`, `PT LOOK`: log how the held weapon, or the actor under the
   crosshair, is drawn - its style, glow, skins, and every material's flags and
-  texture, including what is in the texture.
+  texture, including what is in the texture and what it counts as being made
+  of. For the level itself, `PT LOOK` names the surface's texture, its group and
+  its material.
 - `PT VIEW NORMALS | DEPTH | MOTION | DIFFUSE | SPECULAR | EMISSION | ALBEDO |
-  HITDIST | HISTORY`: shows one of the denoiser's inputs, or how many frames each
-  pixel has averaged, in place of the picture. `PT VIEW` alone goes back.
+  HITDIST | HISTORY | MATERIAL`: shows one of the denoiser's inputs, how many
+  frames each pixel has averaged, or each surface's material (red roughness,
+  green metalness, blue where it is glossy), in place of the picture. `PT VIEW`
+  alone goes back.
 - `PT DENOISE`: denoiser on or off.
-- `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch one
-  thing off to see what it costs or what it is doing.
-- `PT BOUNCES n`, `PT RESET`.
+- `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT NOMATERIALS`,
+  `PT OPAQUE`: switch one thing off to see what it costs or what it is doing.
+- `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
 
 ### What it does not do yet
 
