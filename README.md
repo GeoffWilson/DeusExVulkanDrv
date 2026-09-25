@@ -56,6 +56,15 @@ and should simply work, but it has not been tried.
 It has been developed on an RTX 4090 at 3440x1440, where it measured 150 to 175
 frames per second before the denoiser was added, which costs some of that back.
 
+Fullscreen is a borderless window over the whole screen. Alt-tabbing away
+leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
+a second, rather than letting the engine drop to a window and minimise it: on
+the way back the engine destroys the device and makes a new one, and under wine
+the restyle that follows took the focus away again, so the game could not be
+brought back at all. `PathTracerEvents.log`, beside the game's log, records the
+window's focus and size changes, mode switches, swap chain rebuilds and any
+crash, flushed as they happen.
+
 ### How it works
 
 **The scene is read from the level, not from the render calls.** A render device

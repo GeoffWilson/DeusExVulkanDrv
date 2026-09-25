@@ -46,6 +46,155 @@ static FString Widen(const char* text)
 	return result;
 }
 
+// Window and swap chain events, and any crash, to PathTracerEvents.log beside
+// the game's log. The game's own log is written in blocks, and the block that
+// would say what happened is the one lost when the process dies: this file is
+// flushed line by line. Started afresh each time the device starts.
+static void PathTracerEvent(const char* format, ...)
+{
+	FILE* f = fopen("PathTracerEvents.log", "a");
+	if (!f)
+		return;
+	SYSTEMTIME now = {};
+	GetLocalTime(&now);
+	fprintf(f, "%02d:%02d:%02d.%03d ", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+	va_list args;
+	va_start(args, format);
+	vfprintf(f, format, args);
+	va_end(args);
+	fprintf(f, "\n");
+	fclose(f);
+}
+
+// Where an address is: module and offset, which a disassembly or the build's
+// map can turn into a function.
+static void PathTracerDescribeAddress(const void* address, char* out, size_t size)
+{
+	HMODULE module = nullptr;
+	char name[MAX_PATH] = "?";
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address, &module))
+		GetModuleFileNameA(module, name, MAX_PATH);
+	const char* base = strrchr(name, '\\');
+	snprintf(out, size, "%s+0x%lx", base ? base + 1 : name, (unsigned long)((uintptr_t)address - (uintptr_t)module));
+}
+
+// The call stack from here, one module and offset per frame.
+static void PathTracerLogStack(const char* label)
+{
+	void* frames[24] = {};
+	const USHORT count = CaptureStackBackTrace(1, 24, frames, nullptr);
+	PathTracerEvent("%s, stack:", label);
+	for (USHORT i = 0; i < count; i++)
+	{
+		char where[MAX_PATH + 32];
+		PathTracerDescribeAddress(frames[i], where, sizeof(where));
+		PathTracerEvent("    %s", where);
+	}
+}
+
+// Exceptions as they are raised, before anything handles them: faults, and
+// C++ exceptions with the type thrown, each with the stack that raised it.
+// Most C++ exceptions are the device's own error handling and are caught
+// where they are thrown; one that is not ends up in the engine's error
+// handler, which closes everything down before the game's log is written.
+static LONG CALLBACK PathTracerExceptionLogger(EXCEPTION_POINTERS* info)
+{
+	static int logged = 0;
+	const EXCEPTION_RECORD* record = info->ExceptionRecord;
+	const DWORD code = record->ExceptionCode;
+	// Thread naming and debug output are raised as exceptions and are noise.
+	if (code == 0x406D1388 || code == 0x40010006 || code == 0x4001000A || logged >= 40)
+		return EXCEPTION_CONTINUE_SEARCH;
+	logged++;
+
+	char where[MAX_PATH + 32];
+	PathTracerDescribeAddress(record->ExceptionAddress, where, sizeof(where));
+
+	// An MSVC C++ exception: the thrown type's name is in its throw info, as
+	// a decorated name such as .?AVruntime_error@std@@. x86 keeps pointers
+	// there directly.
+	if (code == 0xE06D7363 && record->NumberParameters >= 3)
+	{
+		const char* type = "?";
+		const DWORD* throwInfo = (const DWORD*)record->ExceptionInformation[2];
+		if (throwInfo && throwInfo[3])
+		{
+			const DWORD* catchables = (const DWORD*)throwInfo[3];
+			if (catchables[0] >= 1 && catchables[1])
+			{
+				const DWORD* catchable = (const DWORD*)catchables[1];
+				if (catchable[1])
+					type = (const char*)catchable[1] + 8;
+			}
+		}
+		// The object itself, if it is a std::exception: its what().
+		const char* what = "";
+		if (strstr(type, "exception@std") || strstr(type, "error@std") || strstr(type, "Vulkan"))
+		{
+			const std::exception* e = (const std::exception*)record->ExceptionInformation[1];
+			if (e)
+				what = e->what();
+		}
+		char label[512];
+		snprintf(label, sizeof(label), "C++ exception %s \"%s\"", type, what);
+		PathTracerLogStack(label);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	char label[512];
+	snprintf(label, sizeof(label), "exception %08lx at %s%s", (unsigned long)code, where,
+		code == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2
+			? (record->ExceptionInformation[0] ? " (writing)" : " (reading)") : "");
+	PathTracerLogStack(label);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The engine's window procedure, and the messages worth knowing about on the
+// way to it: activation, minimising and restoring, resizing, and the
+// system commands behind them.
+//
+// Also where alt-tab out of fullscreen is kept from undoing fullscreen. On
+// losing focus the engine drops back to a window and minimises it; on being
+// restored it destroys this device and makes a new one in fullscreen. Under
+// wine the restyle that follows takes the focus away again a moment later,
+// and the engine, seeing that as another alt-tab, drops out and minimises
+// once more - so the game could never be brought back. While the window is
+// fullscreen the engine is not told it has lost focus at all: the window
+// stays as it is, underneath whatever the player switched to, and coming
+// back is only raising it. Windows' own handling of those messages still
+// happens, and the mouse is released here as the engine would have released
+// it.
+static WNDPROC PathTracerEngineWndProc = nullptr;
+static UPathTracerRenderDevice* PathTracerWindowDevice = nullptr;
+static LRESULT CALLBACK PathTracerWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	const bool fullscreen = PathTracerWindowDevice && PathTracerWindowDevice->IsFullscreenWindow();
+	const bool losingFocus =
+		(message == WM_ACTIVATEAPP && !wParam) ||
+		(message == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE) ||
+		message == WM_KILLFOCUS;
+	if (fullscreen && losingFocus)
+	{
+		PathTracerEvent("kept fullscreen through message %04x", message);
+		ClipCursor(nullptr);
+		ReleaseCapture();
+		return DefWindowProc(window, message, wParam, lParam);
+	}
+
+	switch (message)
+	{
+	case WM_ACTIVATEAPP: PathTracerEvent("WM_ACTIVATEAPP %s", wParam ? "active" : "inactive"); break;
+	case WM_ACTIVATE: PathTracerEvent("WM_ACTIVATE %d%s", (int)LOWORD(wParam), HIWORD(wParam) ? " minimised" : ""); break;
+	case WM_SIZE: PathTracerEvent("WM_SIZE type %d %dx%d", (int)wParam, (int)LOWORD(lParam), (int)HIWORD(lParam)); break;
+	case WM_SYSCOMMAND: PathTracerEvent("WM_SYSCOMMAND %04x", (unsigned)(wParam & 0xfff0)); break;
+	case WM_SETFOCUS: PathTracerEvent("WM_SETFOCUS"); break;
+	case WM_KILLFOCUS: PathTracerEvent("WM_KILLFOCUS"); break;
+	}
+	return CallWindowProc(PathTracerEngineWndProc, window, message, wParam, lParam);
+}
+
+static void* PathTracerExceptionHandle = nullptr;
+
 void UPathTracerRenderDevice::StaticConstructor()
 {
 	guard(UPathTracerRenderDevice::StaticConstructor);
@@ -98,6 +247,23 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	Viewport = InViewport;
 	DenoiseEnabled = UseDenoiser != 0;
 	MaterialsEnabled = UseMaterials != 0;
+
+	// Started afresh once per run: the engine can make a new device mid
+	// session, and what led up to that is the part worth keeping.
+	static bool eventsStarted = false;
+	if (!eventsStarted)
+		remove("PathTracerEvents.log");
+	eventsStarted = true;
+	PathTracerEvent("Init %dx%d %s", (int)NewX, (int)NewY, Fullscreen ? "fullscreen" : "windowed");
+	if (!PathTracerExceptionHandle)
+		PathTracerExceptionHandle = AddVectoredExceptionHandler(1, PathTracerExceptionLogger);
+	if (!PathTracerEngineWndProc)
+	{
+		HWND window = (HWND)InViewport->GetWindow();
+		PathTracerEngineWndProc = (WNDPROC)SetWindowLongPtr(window, GWLP_WNDPROC, (LONG_PTR)PathTracerWndProc);
+		SubclassedWindow = window;
+	}
+	PathTracerWindowDevice = this;
 
 	try
 	{
@@ -687,6 +853,14 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 
 	HWND window = (HWND)Viewport->GetWindow();
 
+	// Whether this is the player changing mode, or the engine dropping out of
+	// fullscreen because the player has switched to something else. Only the
+	// first should end with the game in front.
+	const bool wasActive = GetForegroundWindow() == window;
+	PathTracerEvent("SetRes %dx%d %s (was %s, %s, %s)", (int)NewX, (int)NewY, Fullscreen ? "fullscreen" : "windowed",
+		FullscreenState.Enabled ? "fullscreen" : "windowed", wasActive ? "foreground" : "background",
+		IsIconic(window) ? "minimised" : "not minimised");
+
 	if (!Fullscreen && FullscreenState.Enabled) // Leaving fullscreen
 	{
 		SetWindowLong(window, GWL_STYLE, FullscreenState.Style);
@@ -741,11 +915,16 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 	// Restyling a window can leave it behind whatever was in front of it, with
 	// the engine still believing it has focus and swallowing the input that
 	// would bring it back. Ask for the foreground explicitly on either
-	// transition rather than relying on the restyle to carry it.
-	SetForegroundWindow(window);
-	SetFocus(window);
-
-	ReclipCursorToWindow(window);
+	// transition rather than relying on the restyle to carry it - but only
+	// when the game had it. Alt-tabbing out of fullscreen reaches here too,
+	// as the engine drops back to a window, and taking the foreground then
+	// snatched it back from whatever the player had switched to.
+	if (wasActive)
+	{
+		SetForegroundWindow(window);
+		SetFocus(window);
+		ReclipCursorToWindow(window);
+	}
 
 	SaveConfig();
 	Flush(1);
@@ -763,6 +942,7 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 
 	if (AccumImage && width == TraceWidth && height == TraceHeight)
 		return;
+	PathTracerEvent("trace buffers %dx%d -> %dx%d", TraceWidth, TraceHeight, width, height);
 
 	vkDeviceWaitIdle(Device->device);
 
@@ -1327,13 +1507,18 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 
 		if (SwapChain->Lost() || SwapChain->Width() != windowWidth || SwapChain->Height() != windowHeight || UsingVsync != UseVSync)
 		{
+			PathTracerEvent("swap chain %dx%d -> %dx%d%s", SwapChain->Width(), SwapChain->Height(), windowWidth, windowHeight,
+				SwapChain->Lost() ? " (lost)" : "");
 			UsingVsync = UseVSync;
 			SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, false, false);
 		}
 
 		int imageIndex = SwapChain->AcquireImage(ImageAvailableSemaphore.get());
 		if (imageIndex == -1)
+		{
+			PathTracerEvent("no swap chain image%s", SwapChain->Lost() ? " (lost)" : "");
 			return;
+		}
 
 		auto commands = CommandPool->createBuffer();
 		commands->begin();
@@ -1494,12 +1679,16 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			.AddSignal(RenderFinishedSemaphore.get())
 			.Execute(Device.get(), Device->GraphicsQueue, RenderFinishedFence.get());
 
-		SwapChain->QueuePresent(imageIndex, RenderFinishedSemaphore.get());
-
 		// Not waited for here. The command buffer and the staging copies have
-		// to outlive the submission, so they are kept until the wait.
+		// to outlive the submission, so they are kept until the wait - and
+		// kept before presenting, not after. A present that failed threw past
+		// this, which freed the command buffer the GPU was still running and
+		// left the fence signalled with nothing to wait on it, so the next
+		// frame submitted against a fence already set.
 		PendingCommands = std::move(commands);
 		FramePending = true;
+
+		SwapChain->QueuePresent(imageIndex, RenderFinishedSemaphore.get());
 
 		// Paced after the present rather than before the next frame's work,
 		// so the game's own tick is what waits.
@@ -1543,7 +1732,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	}
 	catch (const std::exception& e)
 	{
-		debugf(TEXT("PathTracer frame failed: %s"), appFromAnsi(e.what()));
+		PathTracerEvent("frame failed: %s", e.what());
+		debugf(TEXT("PathTracer frame failed: %s"), *Widen(e.what()));
 	}
 
 	unguard;
@@ -1556,7 +1746,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 // alone does.
 void UPathTracerRenderDevice::LimitFrameRate()
 {
-	if (FPSLimit <= 0)
+	// Fullscreen and behind whatever the player alt-tabbed to, the game still
+	// runs, as it would have minimised; there is no call to trace it at full
+	// rate while nobody can see it.
+	const bool background = FullscreenState.Enabled && Viewport && GetForegroundWindow() != (HWND)Viewport->GetWindow();
+	const int limit = background ? (FPSLimit > 0 ? Min(FPSLimit, 20) : 20) : FPSLimit;
+	if (limit <= 0)
 	{
 		NextFrameTime = {};
 		return;
@@ -1564,7 +1759,7 @@ void UPathTracerRenderDevice::LimitFrameRate()
 
 	using namespace std::chrono;
 
-	auto interval = duration_cast<steady_clock::duration>(duration<double>(1.0 / (double)FPSLimit));
+	auto interval = duration_cast<steady_clock::duration>(duration<double>(1.0 / (double)limit));
 	auto now = steady_clock::now();
 
 	// Pace off when the last frame was due rather than when it finished, so a
@@ -1812,6 +2007,17 @@ void UPathTracerRenderDevice::Exit()
 {
 	guard(UPathTracerRenderDevice::Exit);
 
+	PathTracerLogStack("Exit");
+	if (PathTracerEngineWndProc && SubclassedWindow && IsWindow(SubclassedWindow))
+		SetWindowLongPtr(SubclassedWindow, GWLP_WNDPROC, (LONG_PTR)PathTracerEngineWndProc);
+	PathTracerEngineWndProc = nullptr;
+	SubclassedWindow = nullptr;
+	if (PathTracerWindowDevice == this)
+		PathTracerWindowDevice = nullptr;
+	// The exception logger stays: the engine destroys and recreates this
+	// device mid session - restoring the window from alt-tab does - and a
+	// crash on the way down is exactly what it is there to catch.
+
 	if (Device) vkDeviceWaitIdle(Device->device);
 	FramePending = false;
 	PendingCommands.reset();
@@ -1836,6 +2042,15 @@ void UPathTracerRenderDevice::Exit()
 	}
 	MotionBuffer.reset();
 	MotionCapacity = 0;
+	// Both released here rather than left to the member destructors, which
+	// run after the device is gone and destroyed them against a dead handle.
+	// Restoring the window from alt-tab makes the engine destroy this device
+	// and make a new one, and this is what crashed it.
+	MaterialBuffer.reset();
+	WrittenMaterials = 0;
+	Timestamps.reset();
+	TimestampsPending = false;
+	NextFrameTime = {};
 
 	OutputView.reset();
 	OutputImage.reset();
@@ -1880,6 +2095,7 @@ void UPathTracerRenderDevice::Exit()
 	Device.reset();
 	Surface.reset();
 	Instance.reset();
+	PathTracerEvent("Exit complete");
 
 	unguard;
 }

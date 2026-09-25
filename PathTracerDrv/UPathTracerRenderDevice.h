@@ -99,6 +99,9 @@ public:
 	// builds, which happen once per level rather than once per frame.
 	void ExecuteImmediate(const std::function<void(VulkanCommandBuffer*)>& fn);
 
+	// Whether the window is currently the borderless fullscreen one.
+	bool IsFullscreenWindow() const { return FullscreenState.Enabled; }
+
 	// Configuration.
 	INT Bounces;
 	BYTE Exposure;
@@ -305,4 +308,6 @@ private:
 	} FullscreenState;
 
 	bool InSetResCall = false;
+	// The engine's window, while its messages pass through the events log.
+	HWND SubclassedWindow = nullptr;
 };
