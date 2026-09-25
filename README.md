@@ -248,6 +248,21 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
   path traced version of them should look. Some scenes are darker or flatter
   than the rasterised game.
 
+### Building it on Windows
+
+The CMake project builds natively with MSVC, from an x86 developer prompt
+(`vcvarsall amd64_x86`); the Visual Studio solution has no PathTracerDrv project
+and is still Unreal Tournament's. The case-compat step is skipped on a Windows
+host, which resolves those include spellings itself, so python is not needed
+there.
+
+```sh
+cmake -S . -B build-win32 -G Ninja
+cmake --build build-win32 --target PathTracerDrv vkrtcheck
+```
+
+Copy `build-win32/PathTracerDrv.dll` and `PathTracerDrv.int` into `System`.
+
 ### Building the denoiser
 
 NRD is not in this repository - its licence does not allow its source to be

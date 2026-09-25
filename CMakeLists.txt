@@ -101,7 +101,11 @@ add_library(VulkanDrv SHARED
 # The SDK headers include each other with Windows' casing rules, and the D3D
 # sources ask the Windows SDK for <D3D11.h> and <D3D12.h> when the files are
 # lower case. Both are the same problem; see the script.
+# A Windows host resolves those spellings itself, so the whole step - and its
+# dependency on python - is only for the cross build.
 set(CASE_COMPAT_DIR "${CMAKE_CURRENT_BINARY_DIR}/sdk-case-compat")
+file(MAKE_DIRECTORY "${CASE_COMPAT_DIR}")
+if(NOT CMAKE_HOST_WIN32)
 execute_process(
 	COMMAND "${CMAKE_COMMAND}" -E env python3
 		"${CMAKE_CURRENT_SOURCE_DIR}/cmake/case-compat.py"
@@ -119,6 +123,7 @@ if(DEFINED XWIN_DIR)
 			--scan "${CMAKE_CURRENT_SOURCE_DIR}/D3D11Drv" "${CMAKE_CURRENT_SOURCE_DIR}/D3D12Drv"
 			--search "${XWIN_DIR}/sdk/include/um" "${XWIN_DIR}/sdk/include/shared"
 		COMMAND_ERROR_IS_FATAL ANY)
+endif()
 endif()
 
 # Everything the three render devices share. Their vcxproj DeusExRelease

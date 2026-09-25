@@ -3,7 +3,12 @@
 
 std::string Shaders::Trace()
 {
-	return R"(
+	// MSVC caps a single string literal at 16384 bytes - clang-cl does not -
+	// and this shader is four times that, so the GLSL is carried in pieces and
+	// joined here. The splits are only there to stay under the cap and mean
+	// nothing to the shader; each one falls on a blank line between statements,
+	// and a new one is needed whenever a piece grows past the cap.
+	std::string source = R"(
 		#version 460
 		#extension GL_EXT_ray_query : enable
 		// Each ray lands on whatever triangle it lands on, so the texture index
@@ -342,7 +347,9 @@ std::string Shaders::Trace()
 			L = normalize(t * l.x + b * l.y + N * l.z);
 			return true;
 		}
+	)";
 
+	source += R"(
 		// Should traversal accept this candidate triangle?
 		//
 		//   opaque      always.
@@ -656,7 +663,9 @@ std::string Shaders::Trace()
 			lightBase = chosenBase * scale;
 			return chosenValue * scale;
 		}
+	)";
 
+	source += R"(
 		vec3 skyLight(vec3 dir)
 		{
 			// Standing in for the level's own sky, which is drawn through a
@@ -746,7 +755,9 @@ std::string Shaders::Trace()
 			}
 			return fog;
 		}
+	)";
 
+	source += R"(
 		void main()
 		{
 			ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -1011,7 +1022,9 @@ std::string Shaders::Trace()
 						// and fade in over many frames.
 						if (bounce == 0u && instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w > 0.5)
 							primaryChanged = true;
+	)";
 
+	source += R"(
 						if (kind > 3.5)
 						{
 							// Modulated: the surface multiplies what is behind it,
@@ -1289,7 +1302,9 @@ std::string Shaders::Trace()
 					// All metal: nothing matte left for the diffuse path to find.
 					if (firstSurface && max(diffuseAlbedo.r, max(diffuseAlbedo.g, diffuseAlbedo.b)) <= 0.0)
 						break;
+	)";
 
+	source += R"(
 					// Which way the path goes on. The denoiser's surface always
 					// takes the matte half here, its reflection having a pass of
 					// its own; anywhere else a glossy surface picks one of the
@@ -1593,6 +1608,8 @@ std::string Shaders::Trace()
 			imageStore(outImage, pixel, vec4(mapped, 1.0));
 		}
 	)";
+
+	return source;
 }
 
 std::string Shaders::Composite()
