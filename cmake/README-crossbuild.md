@@ -27,9 +27,10 @@ cmake -S . -B build-deusex -G Ninja \
 cmake --build build-deusex -j8
 ```
 
-The result is `build-deusex/VulkanDrv.dll`, `D3D11Drv.dll` and `D3D12Drv.dll`,
-32 bit DLLs linked against the Deus Ex 1112f import libraries in
-`Thirdparty/DeusEx`. The Windows SDK that `xwin` fetches carries the Direct3D
+The result is `build-deusex/VulkanDrv.dll`, `PathTracerDrv.dll`, `D3D11Drv.dll`
+and `D3D12Drv.dll`, 32 bit DLLs linked against the Deus Ex 1112f import
+libraries in `Thirdparty/DeusEx`. PathTracerDrv has no Visual Studio project,
+so this is its only build. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 
@@ -52,7 +53,7 @@ path tracer builds as before and `PT DENOISE` says the denoiser is missing.
 ## Installing
 
 ```sh
-cmake/deploy-deusex.sh /path/to/DeusEx/System [vulkan|d3d11|d3d12|none]
+cmake/deploy-deusex.sh /path/to/DeusEx/System [vulkan|pathtracer|d3d11|d3d12|none]
 ```
 
 That copies every driver that was built, with its `.int`, into the game's System
@@ -111,8 +112,11 @@ than the render device's, so nobody has to rediscover them:
 - **Frame rate.** The engine only enforces a tick rate for network play, so
   Deus Ex free-runs at whatever the GPU manages. Above a few hundred frames per
   second it truncates conversation audio and the intro's camera interpolation
-  drifts, which makes cinematics look mis-framed. The driver's `FPSLimit`
-  setting caps presentation; 120 or 60 is a reasonable value.
+  drifts, which makes cinematics look mis-framed. VulkanDrv's and
+  PathTracerDrv's `FPSLimit` setting caps presentation; 120, PathTracerDrv's
+  default, or 60 is a reasonable value. Once a frame is already late the
+  limiter no longer waits at all: it used to add a whole interval to every frame
+  of a game that could not reach the limit.
 - **Field of view.** UE1 treats `FovAngle` as the *horizontal* field of view, so
   a wider display crops the top and bottom rather than showing more at the
   sides. A render device cannot widen this on its own - the engine culls and
@@ -140,6 +144,17 @@ than the render device's, so nobody has to rediscover them:
   wine/compositor/driver handoff rather than the render device.
   `UseDirectDraw=False` in DeusEx.ini removes the mode switch, which a Vulkan
   device has no use for, should it help.
+- **Alt-tab out of fullscreen.** The engine drops back to a window and
+  minimises it when it loses focus, and on being restored destroys the render
+  device and makes a new one in fullscreen (`AttemptFullscreen` in WinDrv.dll).
+  Under wine the restyle that follows takes the focus away again, the engine
+  sees another alt-tab, and the game can never be brought back. PathTracerDrv
+  keeps the engine from seeing focus loss while fullscreen, so the window stays
+  as it is and returning only raises it; its `PathTracerEvents.log` records the
+  focus, size and mode changes if this needs looking at again. VulkanDrv
+  destroys and recreates itself the same way and has not been changed.
+- **Hiding the HUD.** The game has its own console command for it, `ShowHud 0`
+  and `ShowHud 1`, on the player. Nothing in the render device is needed.
 - **Test on Windows, not only on Proton.** Wine enforces the cursor clip
   loosely, which hid a fault that made the game unplayable on Windows: the
   engine's pointer clip was left describing the window as it stood before this

@@ -10,8 +10,9 @@
 Two render devices for Deus Ex:
 
 - **PathTracerDrv** draws the game by path tracing it with hardware ray tracing:
-  real shadows, bounced light, mirrors that reflect, and the game's own lights,
-  light effects and fog, denoised with NVIDIA's NRD.
+  real shadows, bounced light, mirrors that reflect, surfaces that shine or stay
+  matte according to what they are made of, and the game's own lights, light
+  effects and fog, denoised with NVIDIA's NRD.
 - **VulkanDrv** is a conventional rasteriser, the one to play the game on. It
   adds supersampling, HDR, anisotropic filtering and a frame limiter to what the
   game shipped with.
@@ -53,8 +54,11 @@ cmake/run-deusex-wine.sh
 question for any other setup. Native Windows has no translation layer in the way
 and should simply work, but it has not been tried.
 
-It has been developed on an RTX 4090 at 3440x1440, where it measured 150 to 175
-frames per second before the denoiser was added, which costs some of that back.
+It has been developed on an RTX 4090 with a 3440x1440 display and the game at
+1920x1440. The Hong Kong market, one of the heaviest scenes, runs at about 85
+frames a second with materials and 104 with `Materials=False`; smaller scenes
+reach the 120 the frame limiter holds them to. `LogTimings` says where a
+frame's time goes, the GPU's side included.
 
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
@@ -210,7 +214,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 
 ### Console commands
 
-`PT` on its own lists them. All of them are diagnostics:
+`PT` on its own lists them. Most are diagnostics:
 
 - `PT LIGHTS`: the nearest lights that change or have an effect, with their type,
   effect and where they are relative to the view.
@@ -230,6 +234,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT NOMATERIALS`,
   `PT OPAQUE`: switch one thing off to see what it costs or what it is doing.
 - `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
+
+The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
 
 ### What it does not do yet
 
@@ -308,7 +314,9 @@ the Deus Ex specific behaviour worth knowing before filing a bug against a
 renderer. It is the only build of PathTracerDrv.
 
 On Windows, the Visual Studio solution builds VulkanDrv, D3D11Drv and D3D12Drv
-from their `DeusExRelease` configurations. It does not include PathTracerDrv yet.
+from their `DeusExRelease` configurations. It does not include PathTracerDrv
+yet, and NRD is only built by the Linux script, so a release's PathTracerDrv
+comes from the cross build.
 
 ## License
 
