@@ -20,6 +20,32 @@
 	//    misrepresented as being the original software.
 	// 3. This notice may not be removed or altered from any source distribution.
 
+## License for the PathTracerDrv folder
+
+	// Copyright (c) 2026 Geoff Wilson
+	// 
+	// This software is provided 'as-is', without any express or implied
+	// warranty.  In no event will the authors be held liable for any damages
+	// arising from the use of this software.
+	// 
+	// Permission is granted to anyone to use this software for any purpose,
+	// including commercial applications, and to alter it and redistribute it
+	// freely, subject to the following restrictions:
+	// 
+	// 1. The origin of this software must not be misrepresented; you must not
+	//    claim that you wrote the original software. If you use this software
+	//    in a product, an acknowledgment in the product documentation would be
+	//    appreciated but is not required.
+	// 2. Altered source versions must be plainly marked as such, and must not be
+	//    misrepresented as being the original software.
+	// 3. This notice may not be removed or altered from any source distribution.
+
+`vec.h`, `mat.h` and `mat.cpp` are copied unchanged from VulkanDrv, and parts of
+the window handling in `UPathTracerRenderDevice.cpp` are adapted from it; those
+remain Copyright (c) 2020-2023 Magnus Norddahl under the licence above for the
+VulkanDrv folder. PathTracerDrv links NVIDIA's NRD when it has been built, which
+is under the NVIDIA RTX SDKs licence and is not part of this repository.
+
 ## License for Thirdparty/ut432pubsrc
 
 	All files contained here are the property of Epic Games, Inc. They are provided

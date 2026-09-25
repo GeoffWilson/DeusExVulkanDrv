@@ -349,7 +349,9 @@ comes from the cross build.
 ## License
 
 See [LICENSE.md](LICENSE.md): the render devices carry Magnus Norddahl's zlib
-style licence, and `Thirdparty/ut432pubsrc` is Epic Games' public source under
+style licence, PathTracerDrv the same licence with Geoff Wilson as its copyright
+holder (less the few files it copies from VulkanDrv, which stay Magnus
+Norddahl's), and `Thirdparty/ut432pubsrc` is Epic Games' public source under
 the terms of the Unreal retail licence. ZVulkan has its own
 [licence](ZVulkan/LICENSE.md). NVIDIA's NRD, which the path tracer links when it
 has been built, is under the NVIDIA RTX SDKs licence and is not included here.
