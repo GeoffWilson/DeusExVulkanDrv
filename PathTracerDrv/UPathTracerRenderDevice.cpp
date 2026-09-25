@@ -304,7 +304,9 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 			debugf(TEXT("The GPU almost certainly supports them. Whether a 32 bit client is told about them is a separate question:"));
 			debugf(TEXT("  - Proton does not pass them through to 32 bit clients (every build tested, as of 2026-09)."));
 			debugf(TEXT("  - Upstream wine 11.17 does."));
-			debugf(TEXT("  - Native Windows uses the driver directly and has no such layer in the way."));
+			debugf(TEXT("  - Native Windows asks the driver directly, and NVIDIA's 32 bit ICD does not offer them"));
+			debugf(TEXT("    at all: measured on an RTX 4090, driver 32.0.16.1692, where the same machine's 64 bit"));
+			debugf(TEXT("    client is offered all of them."));
 			debugf(TEXT("spike/vkrtcheck.cpp reports what any given environment actually offers."));
 			Exit();
 			return 0;

@@ -51,8 +51,19 @@ cmake/run-deusex-wine.sh
 ```
 
 `spike/README.md` has the measurements, and `spike/vkrtcheck` answers the
-question for any other setup. Native Windows has no translation layer in the way
-and should simply work, but it has not been tried.
+question for any other setup.
+
+**Native Windows cannot run it, which is the opposite of what was expected.**
+Windows has no translation layer in the way, so the driver is asked directly -
+and NVIDIA's 32 bit Windows ICD does not offer the ray tracing extensions at
+all. Measured on an RTX 4090 on driver 32.0.16.1692: a 32 bit client is offered
+270 device extensions and none of the four ray tracing ones, while a 64 bit
+client on the same machine and the same driver is offered 289 including all of
+them. The driver builds and loads on Windows, says so in the log and hands the
+viewport back to the engine, which falls back as it would for any device that
+cannot be initialised. Until a 32 bit ICD offers them, wine is the only way to
+play it - the translation layer that looked like the obstacle is what makes it
+work, because winevulkan thunks a 32 bit client's calls to the 64 bit driver.
 
 It has been developed on an RTX 4090 with a 3440x1440 display and the game at
 1920x1440. The Hong Kong market, one of the heaviest scenes, runs at about 85
@@ -239,7 +250,8 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
 
 ### What it does not do yet
 
-- **Windows is untested.** Everything above was built and played under wine.
+- **Windows builds but cannot run it**, for the driver reason above rather than
+  anything in this code. Everything else here was built and played under wine.
 - Two mirrors facing each other show one reflection each rather than a corridor,
   while denoising.
 - A character's motion vectors follow the whole character, not its animation.
@@ -261,7 +273,8 @@ cmake -S . -B build-win32 -G Ninja
 cmake --build build-win32 --target PathTracerDrv vkrtcheck
 ```
 
-Copy `build-win32/PathTracerDrv.dll` and `PathTracerDrv.int` into `System`.
+Copy `build-win32/PathTracerDrv.dll` and `PathTracerDrv.int` into `System`. It
+will load and then report that the device has no ray tracing; see above.
 
 ### Building the denoiser
 
