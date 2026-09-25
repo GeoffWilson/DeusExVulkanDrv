@@ -145,6 +145,21 @@ std::string FileResource::readAllText(const std::string& filename)
 					outColor.rgb = fogcolor.rgb + outColor.rgb * (1.0 - fogcolor.a);
 				}
 
+				// A modulated poly is not a colour but a multiplier, and the
+				// hardware blend applies it to whatever the buffer already
+				// holds. The engine's convention for that multiplier is a
+				// display space figure - mid grey means "leave this alone" -
+				// so with sRGB textures it has to go back to display space
+				// before the blend sees it. Sampled as linear, mid grey
+				// arrives as 0.216 instead of 0.5 and the blend darkens
+				// everything under the poly to 43%: a dark rectangle the size
+				// of the tile, of which the mouse cursor's shadow is the
+				// clearest example.
+				if ((flags & 128) != 0)
+				{
+					outColor.rgb = uSrgbLight != 0 ? pow(max(outColor.rgb, 0.0), vec3(1.0 / 2.2)) : outColor.rgb;
+				}
+
 				#if defined(ALPHATEST)
 					#if defined(ALPHATOCOVERAGE)
 						// The hardware turns this alpha into a coverage mask, so
