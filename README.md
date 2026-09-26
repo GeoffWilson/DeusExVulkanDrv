@@ -66,9 +66,8 @@ That makes it run:
   DW-Proton too;
 - **under upstream wine**, with the retail `DeusEx.exe` from the 1112fm patch,
   through `cmake/run-deusex-wine.sh`;
-- **on Windows**, as far as the sharing goes: `spike/vkxshare` showed NVIDIA's
-  32 and 64 bit drivers sharing an image and semaphores intact. The game itself
-  has not yet been played there with the helper.
+- **on Windows**, natively: NVIDIA's 32 bit driver takes the frame from its
+  64 bit one just as winevulkan does.
 
 `spike/README.md` has the measurements. Handing the frame over costs about a
 tenth of a millisecond, whatever its size.
@@ -259,8 +258,6 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
 
 ### What it does not do yet
 
-- **Not yet played on native Windows** with the helper. Everything here was
-  built and played under wine and Proton.
 - Two mirrors facing each other show one reflection each rather than a corridor,
   while denoising.
 - A character's motion vectors follow the whole character, not its animation.
