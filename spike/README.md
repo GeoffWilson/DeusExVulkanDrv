@@ -271,3 +271,8 @@ WINEDLLOVERRIDES="nvapi64,nvapi,dxgi,d3d11,d3d10core,d3d9=n" DXVK_ENABLE_NVAPI=1
 
 Upstream wine needs the same pieces installed by hand: DXVK and dxvk-nvapi in
 the prefix, the driver's two NGX DLLs, and the same two environment variables.
+
+The path tracer now uses it (`DLSS=True`). In the game, from Steam under
+Proton-CachyOS, the helper inherits what it needs from the game: NGX found its
+core through the environment Proton sets
+(`/run/host/usr/lib/nvidia/wine`) and Ray Reconstruction ran.

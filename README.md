@@ -12,7 +12,8 @@ Two render devices for Deus Ex:
 - **PathTracerDrv** draws the game by path tracing it with hardware ray tracing:
   real shadows, bounced light, mirrors that reflect, surfaces that shine or stay
   matte according to what they are made of, and the game's own lights, light
-  effects and fog, denoised with NVIDIA's NRD.
+  effects and fog, denoised with NVIDIA's NRD or, on an RTX GPU, NVIDIA DLSS
+  Ray Reconstruction.
 - **VulkanDrv** is a conventional rasteriser, the one to play the game on. It
   adds supersampling, HDR, anisotropic filtering and a frame limiter to what the
   game shipped with.
@@ -74,9 +75,10 @@ tenth of a millisecond, whatever its size.
 
 It has been developed on an RTX 4090 with a 3440x1440 display and the game at
 1920x1440. The Hong Kong market, one of the heaviest scenes, runs at about 145
-frames a second uncapped with materials on, with a 1% low of about 118; the
-frame limiter holds it to 120 by default. `LogTimings` says where a frame's
-time goes, the GPU's side included, and what frame rate that came to.
+frames a second uncapped with materials on and NRD, with a 1% low of about 130,
+and at about 190 with DLSS Ray Reconstruction at Quality, 1% low 160; the frame
+limiter holds it to 120 by default. `LogTimings` says where a frame's time
+goes, the GPU's side included, and what frame rate that came to.
 
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
@@ -161,7 +163,7 @@ what it counts as.
 	Group.Metal=0.3,1
 	ChairLeatherTex1=0.35,0
 
-**Noise.** Two things take it out:
+**Noise.** One of two denoisers takes it out:
 
 - **NRD's ReLAX denoiser**, on by default. The trace splits each pixel into the
   first solid surface it sees - through any glass or decals - and records that
@@ -172,10 +174,28 @@ what it counts as.
   treated as a surface in its own right, where it appears to be behind the glass,
   and denoised by a second ReLAX pass: ReLAX will not blur a perfect mirror
   itself. Glossy reflections go through ReLAX's specular half alongside the
-  diffuse lighting.
-- **Per pixel accumulation** while the view is still. Each pixel checks that it
-  is looking at the same instance in the same place as last frame, and keeps a
-  short history where a moving shadow or an animated light crosses it.
+  diffuse lighting. With it, **per pixel accumulation** while the view is
+  still: each pixel checks that it is looking at the same instance in the same
+  place as last frame, and keeps a short history where a moving shadow or an
+  animated light crosses it.
+- **DLSS Ray Reconstruction**, NVIDIA's network that denoises and upscales in
+  one pass, on an RTX GPU when `DLSS` is on. It wants the noisy picture as it
+  was traced, not the lighting split from its colour, and works the lighting
+  back out from the albedos, normals, roughness, depth and motion it is given
+  with it; the trace writes that set in place of NRD's. The primary rays are
+  jittered by one offset a frame, the one it is told, and the trace runs at
+  the render size the network is trained for at the chosen quality - 1280x960
+  for 1920x1440 at Quality - which it upscales. A last pass tonemaps what comes
+  back and puts the fog and the screen flash over it. NGX, which it runs on, is
+  64-bit only: it is possible because the tracing is in the helper. Where it
+  cannot run - another GPU, an old driver, wine without NVIDIA's NGX core,
+  dxvk-nvapi and DXVK, which Proton provides (see `spike/README.md`) - NRD
+  stands in and `PathTracerHelper.log` says why.
+
+  In the Hong Kong market on an RTX 4090 at 1920x1440: NRD takes 6.9 ms of GPU
+  time a frame, Ray Reconstruction at Quality 3.8 (tracing 2.0, the network
+  1.4) and at DLAA, which does not upscale, 7.4. At Quality the frame is then
+  bound by the game's own CPU time rather than the GPU.
 
 **The CPU overlaps the GPU.** Gathering the next frame's actors runs while the
 previous frame is still tracing, and the helper records the next frame while
@@ -199,6 +219,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	MaxAccumulatedFrames=256
 	LightScale=100
 	Denoise=True
+	DLSS=False
+	DLSSQuality=1
 	UseVSync=True
 	VkDeviceIndex=0
 	VkDebug=False
@@ -213,7 +235,12 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `SkyIntensity`: the stand-in sky used only where a level has no sky zone.
 - `MaxAccumulatedFrames`: how long a still picture keeps refining.
 - `LightScale`: a percentage applied to every light's brightness.
-- `Denoise`: NRD from the start. `PT DENOISE` switches it for the session.
+- `Denoise`: denoising from the start. `PT DENOISE` switches it for the
+  session.
+- `DLSS`: denoise with DLSS Ray Reconstruction rather than NRD, where it can
+  run. `DLSSQuality` is how far it upscales: 0 DLAA (not at all), 1 Quality,
+  2 Balanced, 3 Performance, 4 Ultra Performance. `PT DLSS` switches it for the
+  session.
 - `LogTimings`: logs where each frame's time goes, averaged every few hundred
   frames: the CPU's side and the helper's, the GPU's own time on the scene
   build, the trace, the denoiser and the pass that puts the picture back
@@ -255,7 +282,10 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   frames each pixel has averaged, or each surface's material (red roughness,
   green metalness, blue where it is glossy), in place of the picture. `PT VIEW`
   alone goes back.
-- `PT DENOISE`: denoiser on or off.
+- `PT DENOISE`: denoising on or off. Says what denoises.
+- `PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE]`: DLSS
+  Ray Reconstruction on or off, or on at that quality; turns denoising on with
+  it. Says whether it is running, and why not when NRD stands in.
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT NOMATERIALS`,
   `PT OPAQUE`: switch one thing off to see what it costs or what it is doing.
 - `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
@@ -293,12 +323,15 @@ Copy `build-win32/PathTracerDrv.dll`, `PathTracerDrv.int` and
 cross built from Linux, as in [cmake/README-crossbuild.md](cmake/README-crossbuild.md),
 rather than with MSVC.
 
-### Building the denoiser
+### Building the denoisers
 
-NRD is not in this repository - its licence does not allow its source to be
-redistributed here - so `cmake/build-nrd.sh` fetches a pinned release and builds
-it as a 64 bit library for the helper (and a 32 bit one as well). Without it
-the path tracer still builds and runs, just without the denoiser. See
+Neither is in this repository - their licence does not allow them to be
+redistributed here. `cmake/build-nrd.sh` fetches a pinned NRD release and builds
+it as a 64 bit library for the helper (and a 32 bit one as well), and
+`cmake/fetch-dlss.sh` fetches a pinned release of the DLSS SDK: NGX's loader,
+which the helper links, and Ray Reconstruction's runtime, `nvngx_dlssd.dll`,
+which goes beside it. Without either the path tracer still builds and runs,
+just without that denoiser. See
 [cmake/README-crossbuild.md](cmake/README-crossbuild.md).
 
 ## VulkanDrv
@@ -371,5 +404,7 @@ style licence, PathTracerDrv the same licence with Geoff Wilson as its copyright
 holder (less the few files it copies from VulkanDrv, which stay Magnus
 Norddahl's), and `Thirdparty/ut432pubsrc` is Epic Games' public source under
 the terms of the Unreal retail licence. ZVulkan has its own
-[licence](ZVulkan/LICENSE.md). NVIDIA's NRD, which the path tracer links when it
-has been built, is under the NVIDIA RTX SDKs licence and is not included here.
+[licence](ZVulkan/LICENSE.md). NVIDIA's NRD and the DLSS SDK, which the path
+tracer's helper links when they have been fetched, are under the NVIDIA RTX
+SDKs licence and are not included here. This software uses NVIDIA DLSS; NVIDIA
+and DLSS are trademarks of NVIDIA Corporation.

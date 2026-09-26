@@ -76,6 +76,24 @@ afterwards and CMake reports `PathTracerHelper: denoising with NRD`; without it
 the helper builds without the denoiser and `PT DENOISE` says it is missing.
 `Denoise=False` in the device's ini section turns it off at startup.
 
+### DLSS Ray Reconstruction
+
+The helper can also denoise with NVIDIA's DLSS Ray Reconstruction, when the
+DLSS SDK is there to link. Fetch it once, before configuring:
+
+```sh
+cmake/fetch-dlss.sh         # into ../.dlss, beside .xwin
+```
+
+The script downloads a pinned release's headers, NGX's static loader
+(`x64/nvsdk_ngx_s.lib`, static CRT like the helper) and Ray Reconstruction's
+runtime (`nvngx_dlssd.dll`, 48 MB), and nothing else. Configure `build-x64`
+afterwards and CMake reports `PathTracerHelper: DLSS Ray Reconstruction`; the
+build copies `nvngx_dlssd.dll` beside `PathTracerHelper.exe` and
+`deploy-deusex.sh` installs it with the helper, since NGX looks for it there.
+`cmake --build build-x64 --target ngxcheck` builds the spike that asks whether
+it runs at all on a given setup; see `spike/README.md`.
+
 ## Installing
 
 ```sh
