@@ -7,10 +7,18 @@
 // semaphores. What it cannot check is the engine's end - LevelScene and the
 // textures - which only the game can.
 //
-//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality]    (helper beside it)
+//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still] [--jittersign]
+//   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
 // 4 ultra performance) rather than NRD, where it can run.
+//
+// --still holds everything still instead - no animation, nothing arriving, no
+// change of size - and reports how much the picture changes from one frame
+// to the next over the last quarter of them: with nothing moving, what is
+// left is noise and shimmer, which is what a wrong jitter shows up as.
+// --jittersign tells DLSS the jitter the old way round (the game's
+// PT JITTERSIGN), to compare.
 //
 // Frames are taken the way the render device takes them: the next is asked
 // for before the last is waited for, so the helper records one while the GPU
@@ -113,10 +121,15 @@ int main(int argc, char** argv)
 {
 	std::vector<const char*> args;
 	int dlss = -1;
+	bool still = false, jitterSign = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
 			dlss = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--still"))
+			still = true;
+		else if (!strcmp(argv[i], "--jittersign"))
+			jitterSign = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -254,6 +267,12 @@ int main(int argc, char** argv)
 		frame.Camera[3] = vec4(forward.x, forward.y, forward.z, 0.0f);
 		for (int i = 0; i < 4; i++)
 			frame.PreviousCamera[i] = frame.Camera[i];
+		if (jitterSign)
+			frame.DisableBits |= 512u;
+		// Frame to frame change over the last quarter, for --still.
+		std::vector<float> lastPicture;
+		double changeSum = 0.0;
+		int changeCount = 0;
 
 		auto pool = CommandPoolBuilder().QueueFamily(device->GraphicsFamily).Create(device.get());
 		auto fence = FenceBuilder().Create(device.get());
@@ -269,14 +288,15 @@ int main(int argc, char** argv)
 		QueryPerformanceCounter(&loopStart);
 		for (int i = 0; i < frames; i++)
 		{
-			client.Geometry(1, animated(i, i >= frames / 3));
-			if (i == frames / 5)
+			if (!still || i == 0)
+				client.Geometry(1, animated(still ? 0 : i, !still && i >= frames / 3));
+			if (!still && i == frames / 5)
 			{
 				client.Geometry(2, cube);
 				instances.insert(instances.end(), ring.begin(), ring.end());
 				lights.insert(lights.end(), ringLights.begin(), ringLights.end());
 			}
-			if (i == frames / 4)
+			if (!still && i == frames / 4)
 			{
 				client.Geometry(3, panel);
 				instances.push_back(placed);
@@ -285,7 +305,7 @@ int main(int argc, char** argv)
 			client.Instances(instances, 1);
 			client.Lights(lights, {});
 			frame.Frame = (uint32_t)i;
-			if (i == frames / 2)
+			if (!still && i == frames / 2)
 			{
 				frame.Width = width * 3 / 2;
 				frame.Height = height * 3 / 2;
@@ -360,6 +380,29 @@ int main(int argc, char** argv)
 			pending = std::move(commands);
 			arrived++;
 
+			if (still && i >= frames - frames / 4 - 1)
+			{
+				vkWaitForFences(device->device, 1, &fence->fence, VK_TRUE, UINT64_MAX);
+				vkResetFences(device->device, 1, &fence->fence);
+				pending.reset();
+				const size_t count = (size_t)client.OutputWidth() * client.OutputHeight();
+				const uint16_t* half = (const uint16_t*)readback->Map(0, count * 8);
+				std::vector<float> picture(count * 3);
+				for (size_t p = 0; p < count; p++)
+					for (int c = 0; c < 3; c++)
+						picture[p * 3 + c] = std::min(std::max(HalfToFloat(half[p * 4 + c]), 0.0f), 1.0f);
+				readback->Unmap();
+				if (lastPicture.size() == picture.size())
+				{
+					double sum = 0.0;
+					for (size_t p = 0; p < picture.size(); p++)
+						sum += std::abs(picture[p] - lastPicture[p]);
+					changeSum += sum / picture.size();
+					changeCount++;
+				}
+				lastPicture.swap(picture);
+			}
+
 			const auto& s = client.Status();
 			if (i == 0 || i == frames / 2 || i == frames - 1)
 			{
@@ -397,6 +440,9 @@ int main(int argc, char** argv)
 		readback->Unmap();
 		const double mean = sum / (outWidth * outHeight * 3.0);
 		printf("mean brightness %.3f, written to helper-test.ppm\n", mean);
+		if (still && changeCount > 0)
+			printf("still: frame to frame change %.5f on average over the last %d frames%s\n",
+				changeSum / changeCount, changeCount, jitterSign ? " (jitter the old way round)" : "");
 
 		vkDeviceWaitIdle(device->device);
 		const bool ok = arrived == frames && mean > 0.02;

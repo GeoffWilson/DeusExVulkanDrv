@@ -260,10 +260,15 @@ bool RayReconstruction::Evaluate(VulkanCommandBuffer* commands, const Inputs& in
 	eval.pInDepth = &depth;
 	eval.pInMotionVectors = &motion;
 	eval.pInOutput = &output;
-	// Exactly the offset the primary rays were given: told anything else it
-	// puts sub-pixel detail in the wrong place, and nothing says why.
-	eval.InJitterOffsetX = jitter.x;
-	eval.InJitterOffsetY = jitter.y;
+	// DLSS's jitter is how far the picture was moved: the offset a raster
+	// engine adds to its projection, in pixels, which leaves each pixel
+	// showing what lay that far the other way. Here the primary rays were
+	// moved to the sample instead, so the picture moved by minus their offset.
+	// Passing the rays' own offset put each frame's detail up to a pixel from
+	// where it was sampled, and fine detail - the flowers in a pot - shimmered
+	// even at DLAA, where nothing is upscaled.
+	eval.InJitterOffsetX = -jitter.x;
+	eval.InJitterOffsetY = -jitter.y;
 	eval.InRenderSubrectDimensions = { renderWidth, renderHeight };
 	eval.InReset = reset ? 1 : 0;
 	// The motion is in screen widths and heights; it wants render pixels.

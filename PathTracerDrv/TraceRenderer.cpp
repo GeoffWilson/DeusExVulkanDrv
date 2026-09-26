@@ -840,7 +840,10 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		inputs.Depth = target(RrDepthImage, RrDepthView, VK_FORMAT_R32_SFLOAT);
 		inputs.Motion = target(RrMotionImage, RrMotionView, VK_FORMAT_R16G16_SFLOAT);
 		inputs.Output = target(RrOutputImage, RrOutputView, VK_FORMAT_R16G16B16A16_SFLOAT);
-		const bool reconstructed = Rr->Evaluate(commands, inputs, TraceWidth, TraceHeight, OutputWidth, OutputHeight, quality, jitter, DenoiseRestart, frameMs);
+		// PT JITTERSIGN (Disable bit 512) reports the jitter the old way round,
+		// to compare against.
+		const vec2 reported = (frame.DisableBits & 512u) ? vec2(-jitter.x, -jitter.y) : jitter;
+		const bool reconstructed = Rr->Evaluate(commands, inputs, TraceWidth, TraceHeight, OutputWidth, OutputHeight, quality, reported, DenoiseRestart, frameMs);
 		DenoiseRestart = false;
 		stamp(3);
 

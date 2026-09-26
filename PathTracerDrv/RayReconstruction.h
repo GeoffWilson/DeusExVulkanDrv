@@ -67,7 +67,8 @@ public:
 	// Records one frame's denoise and upscale, made (again) first if the sizes
 	// or the quality have changed - the caller must have waited for the
 	// frames in flight when they have. jitter is the offset the primary rays
-	// were given, in render pixels.
+	// were given within their pixels, in render pixels; DLSS is told the
+	// picture moved the other way.
 	bool Evaluate(VulkanCommandBuffer* commands, const Inputs& inputs,
 		uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, int quality,
 		vec2 jitter, bool reset, float frameMs);

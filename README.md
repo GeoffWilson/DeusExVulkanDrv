@@ -305,6 +305,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in.
 - `PT WIDESCREEN`: the widescreen field of view on or off.
+- `PT JITTERSIGN`: tells DLSS the sub-pixel jitter the other way round, the
+  way it was told before 1.2, to compare: static fine detail should hold
+  still with it off and shimmer with it on.
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).

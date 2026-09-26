@@ -55,7 +55,12 @@ cmake --build build-x64 --target PathTracerHelper
 program that drives the helper with a made up scene, as the device would, and
 writes the frame it gets back to `helper-test.ppm`: a check of the helper and
 the channel to it without the game. Put it beside `PathTracerHelper.exe` and
-run `wine PathTracerHelperTest.exe [frames] [width] [height]`. The Windows SDK that `xwin` fetches carries the Direct3D
+run `wine PathTracerHelperTest.exe [frames] [width] [height]`. `--dlss 0`
+to `--dlss 4` denoises with DLSS Ray Reconstruction at that quality instead of
+NRD, and `--still` holds the scene still and reports how much the picture
+changes from frame to frame - noise and shimmer, which a wrong sub-pixel
+jitter shows up as; `--jittersign` reports the jitter the old way round to
+compare. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 
