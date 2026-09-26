@@ -923,6 +923,35 @@ void UPathTracerRenderDevice::WriteTimingLine(const char* line)
 	}
 }
 
+// The scene holds the engine's own objects - the level's textures, meshes and
+// actors - by pointer from one frame to the next, and a garbage collection can
+// free any of them. EnsureSceneBuilt rebuilds when the level changes, but it
+// can only tell by the level's address and size: loading a save of the map
+// already being played frees the old level and loads the same map again,
+// which can land at the same address with the same number of nodes. The
+// scene then went on animating textures that had been freed, calling into
+// whatever had taken their place - a HUD graphics context, the engine said,
+// as it gave up. So a collection of any kind drops everything held, and the
+// scene is built again from the level as it now is.
+//
+// Looked up through the object table rather than dereferenced, since once
+// collected it is freed memory; the name makes sure an object that has taken
+// both its slot and its address is not taken for it.
+bool UPathTracerRenderDevice::GarbageCollected()
+{
+	const bool alive = GcSentinel && UObject::GetIndexedObject(GcSentinelIndex) == GcSentinel &&
+		GcSentinel->GetFName() == GcSentinelName;
+	if (alive)
+		return false;
+
+	const bool collected = GcSentinel != nullptr;
+	static int serial = 0;
+	GcSentinelName = FName(*FString::Printf(TEXT("PathTracerGcSentinel%d"), ++serial));
+	GcSentinel = UObject::StaticConstructObject(UTextBuffer::StaticClass(), UObject::GetTransientPackage(), GcSentinelName, 0);
+	GcSentinelIndex = GcSentinel ? GcSentinel->GetIndex() : INDEX_NONE;
+	return collected;
+}
+
 void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 {
 	if (!level || !level->Model)
@@ -1074,6 +1103,20 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 
 	try
 	{
+		// Before anything this frame reaches for what the scene holds.
+		if (GarbageCollected())
+		{
+			PathTracerEvent("garbage collected: the scene is built again");
+			WaitForPreviousFrame();
+			if (Device)
+				vkDeviceWaitIdle(Device->device);
+			Scene.Clear();
+			SceneReset = true;
+			DenoiseRestart = true;
+			if (Textures)
+				Textures->Clear();
+		}
+
 		CreateSwapChainResources();
 		HaveCamera = false;
 		FlashScale = InFlashScale;

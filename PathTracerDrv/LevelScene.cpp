@@ -171,6 +171,7 @@ void LevelScene::Clear()
 	SummaryLogged = false;
 	SourceLevel = nullptr;
 	SourceNodeCount = 0;
+	MirroredSurfaces = 0;
 }
 
 bool LevelScene::BuildStatic(ULevel* level)

@@ -151,6 +151,12 @@ private:
 	void CreateTilePipeline();
 	void RenderTiles(VulkanCommandBuffer* commands);
 	void EnsureSceneBuilt(ULevel* level);
+	// Whether the engine has collected garbage since last asked, told by a
+	// transient object nothing refers to, which every collection destroys.
+	bool GarbageCollected();
+	UObject* GcSentinel = nullptr;
+	INT GcSentinelIndex = INDEX_NONE;
+	FName GcSentinelName;
 
 	std::shared_ptr<VulkanInstance> Instance;
 	std::shared_ptr<VulkanSurface> Surface;
