@@ -7,8 +7,9 @@
 
 class UPathTracerRenderDevice;
 
-// One uploaded texture, plus the descriptor set that binds it. The set is made
-// once with the image because a tile draw binds nothing else.
+// One uploaded texture, plus the descriptor sets that bind it: one for each way
+// a tile can ask for it to be sampled (see UPathTracerRenderDevice::TileSet),
+// made the first time one does, since a tile draw binds nothing else.
 struct CachedTexture
 {
 	// The object this came from, kept only for textures that regenerate.
@@ -21,7 +22,7 @@ struct CachedTexture
 	UTexture* LastFrame = nullptr;
 	std::unique_ptr<VulkanImage> Image;
 	std::unique_ptr<VulkanImageView> View;
-	std::unique_ptr<VulkanDescriptorSet> Set;
+	std::unique_ptr<VulkanDescriptorSet> Sets[4];
 };
 
 // Uploads the engine's textures for the 2D pass.
@@ -64,7 +65,7 @@ public:
 	void Clear();
 
 private:
-	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet = true);
+	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked);
 
 
 	UPathTracerRenderDevice* renderer = nullptr;

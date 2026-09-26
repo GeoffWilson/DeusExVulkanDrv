@@ -22,6 +22,7 @@ struct TileBatch
 {
 	CachedTexture* Texture = nullptr;
 	int BlendMode = 0;      // 0 alpha, 1 additive, 2 modulated
+	int SamplerMode = 0;    // TileSamplers' index
 	int FirstVertex = 0;
 	int VertexCount = 0;
 };
@@ -81,8 +82,9 @@ public:
 	void GetStats(TCHAR* Result) override;
 	void ReadPixels(FColor* Pixels) override;
 
-	// Made per cached texture, since a tile draw binds nothing else.
-	std::unique_ptr<VulkanDescriptorSet> AllocateTileDescriptorSet(VulkanImageView* view);
+	// The set binding a cached texture with one of the tile samplers, made the
+	// first time a tile asks for it. mode is TileSamplers' index.
+	VulkanDescriptorSet* TileSet(CachedTexture* texture, int mode);
 
 	VulkanDevice* GetDevice() const { return Device.get(); }
 
@@ -201,7 +203,12 @@ private:
 	std::unique_ptr<TextureCache> Textures;
 	std::unique_ptr<VulkanDescriptorSetLayout> TileSetLayout;
 	std::unique_ptr<VulkanDescriptorPool> TileDescriptorPool;
-	std::unique_ptr<VulkanSampler> TileSampler;
+	// As the other devices sample the engine's 2D: bit 1 nearest rather than
+	// linear, for art drawn with PF_NoSmooth - which is most of Deus Ex's
+	// interface, and filtering it anyway is what made the HUD soft - and bit 2
+	// clamped rather than repeating, for a tile that shows its whole texture,
+	// so linear filtering does not pull in the opposite edge.
+	std::unique_ptr<VulkanSampler> TileSamplers[4];
 	std::unique_ptr<VulkanPipelineLayout> TilePipelineLayout;
 	std::unique_ptr<VulkanRenderPass> TileRenderPass;
 	std::unique_ptr<VulkanPipeline> TilePipelines[3];

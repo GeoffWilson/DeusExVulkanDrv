@@ -402,35 +402,45 @@ static void DescribeActor(AActor* actor, UMesh* mesh)
 	}
 }
 
-std::unique_ptr<VulkanDescriptorSet> UPathTracerRenderDevice::AllocateTileDescriptorSet(VulkanImageView* view)
+VulkanDescriptorSet* UPathTracerRenderDevice::TileSet(CachedTexture* texture, int mode)
 {
-	auto set = TileDescriptorPool->allocate(TileSetLayout.get());
-	WriteDescriptors()
-		.AddCombinedImageSampler(set.get(), 0, view, TileSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-		.Execute(Device.get());
-	return set;
+	std::unique_ptr<VulkanDescriptorSet>& set = texture->Sets[mode];
+	if (!set)
+	{
+		set = TileDescriptorPool->allocate(TileSetLayout.get());
+		WriteDescriptors()
+			.AddCombinedImageSampler(set.get(), 0, texture->View.get(), TileSamplers[mode].get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+			.Execute(Device.get());
+	}
+	return set.get();
 }
 
 void UPathTracerRenderDevice::CreateTilePipeline()
 {
-	TileSampler = SamplerBuilder()
-		.MinFilter(VK_FILTER_LINEAR)
-		.MagFilter(VK_FILTER_LINEAR)
-		.AddressMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-		.DebugName("PathTracerTileSampler")
-		.Create(Device.get());
+	for (int mode = 0; mode < 4; mode++)
+	{
+		const VkFilter filter = (mode & 1) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+		const VkSamplerAddressMode address = (mode & 2) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		TileSamplers[mode] = SamplerBuilder()
+			.MinFilter(filter)
+			.MagFilter(filter)
+			.AddressMode(address, address, address)
+			.DebugName("PathTracerTileSampler")
+			.Create(Device.get());
+	}
 
 	TileSetLayout = DescriptorSetLayoutBuilder()
 		.AddBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT)
 		.DebugName("PathTracerTileSetLayout")
 		.Create(Device.get());
 
-	// One set per cached texture. A generous ceiling: a Deus Ex menu touches a
-	// few hundred distinct textures at most, and the pool is only reset when the
-	// cache is flushed.
+	// A set per cached texture for each way it is sampled, which in practice is
+	// one or two. A generous ceiling: a Deus Ex menu touches a few hundred
+	// distinct textures at most, and the pool is only reset when the cache is
+	// flushed.
 	TileDescriptorPool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096)
-		.MaxSets(4096)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192)
+		.MaxSets(8192)
 		.DebugName("PathTracerTileDescriptorPool")
 		.Create(Device.get());
 
@@ -579,7 +589,8 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 	int boundMode = -1;
 	for (const TileBatch& batch : TileBatches)
 	{
-		if (!batch.Texture || !batch.Texture->Set || batch.VertexCount == 0)
+		VulkanDescriptorSet* set = batch.Texture ? batch.Texture->Sets[batch.SamplerMode].get() : nullptr;
+		if (!set || batch.VertexCount == 0)
 			continue;
 
 		if (batch.BlendMode != boundMode)
@@ -588,7 +599,7 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 			boundMode = batch.BlendMode;
 		}
 
-		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, TilePipelineLayout.get(), 0, batch.Texture->Set.get());
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, TilePipelineLayout.get(), 0, set);
 		commands->draw(batch.VertexCount, 1, batch.FirstVertex, 0);
 	}
 
@@ -1812,7 +1823,7 @@ void UPathTracerRenderDevice::Exit()
 	// they outlive the device and destroy themselves against a dead handle,
 	// which crashed on exit - and when the engine replaces the device on
 	// restoring from alt-tab.
-	TileSampler.reset();
+	for (auto& sampler : TileSamplers) sampler.reset();
 
 	RenderFinishedSemaphore.reset();
 	ImageAvailableSemaphore.reset();
@@ -1910,11 +1921,20 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	corners[2] = { vec2(x1 * sx - 1.0f, y1 * sy - 1.0f), vec2(u1, v1), colour };
 	corners[3] = { vec2(x0 * sx - 1.0f, y1 * sy - 1.0f), vec2(u0, v1), colour };
 
-	if (TileBatches.empty() || TileBatches.back().Texture != texture || TileBatches.back().BlendMode != blendMode)
+	// Sampled the way the other devices sample it: see TileSamplers.
+	int samplerMode = (flags & PF_NoSmooth) ? 1 : 0;
+	if (Min(u0, u1) >= 0.0f && Max(u0, u1) <= 1.00001f && Min(v0, v1) >= 0.0f && Max(v0, v1) <= 1.00001f)
+		samplerMode |= 2;
+	if (!TileSet(texture, samplerMode))
+		return;
+
+	if (TileBatches.empty() || TileBatches.back().Texture != texture || TileBatches.back().BlendMode != blendMode ||
+		TileBatches.back().SamplerMode != samplerMode)
 	{
 		TileBatch batch;
 		batch.Texture = texture;
 		batch.BlendMode = blendMode;
+		batch.SamplerMode = samplerMode;
 		batch.FirstVertex = (int)TileVertices.size();
 		batch.VertexCount = 0;
 		TileBatches.push_back(batch);

@@ -165,7 +165,7 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 	unguard;
 }
 
-std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet)
+std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked)
 {
 	guard(TextureCache::Upload);
 
@@ -217,12 +217,6 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 			.AddImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
 			.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 	});
-
-	// What actually landed in the image, so a texture that comes out the wrong
-	// colour on screen can be compared against what the engine says it is,
-	// rather than reasoned about.
-	if (withDescriptorSet)
-		cached->Set = renderer->AllocateTileDescriptorSet(cached->View.get());
 
 	return cached;
 
