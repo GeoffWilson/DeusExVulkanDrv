@@ -237,6 +237,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	FPSLimit=120
 	Materials=False
 	GlossBounces=1
+	WidescreenFOV=True
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Exposure`: overall brightness, a byte around a midpoint of 128.
@@ -263,6 +264,14 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   millisecond of that is the denoiser's specular half,
   which is only built with materials on. `PT MATERIALS` switches them for the
   session.
+- `WidescreenFOV`: on a screen wider than 4:3, keep the height of view the
+  game's field of view gives at 4:3 and widen the view to the screen ("Hor+").
+  The engine's field of view is horizontal, so at 21:9 it keeps the width and
+  crops the top and bottom, and conversations and cinematics framed for 4:3
+  lose heads and feet; the raster devices cannot help that, since they only
+  draw what the engine has projected, but the trace builds the view from the
+  level. Keep the game's own field of view at its 4:3 value (75 by default).
+  `PT WIDESCREEN` switches it for the session.
 - `GlossBounces`: how far a smooth surface's reflection is traced. 1 lights what
   it shows by the lights and the zone's ambient; more carries the reflection on
   bouncing, at a cost; 0 traces none and keeps only the highlights.
@@ -295,6 +304,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE]`: DLSS
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in.
+- `PT WIDESCREEN`: the widescreen field of view on or off.
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).

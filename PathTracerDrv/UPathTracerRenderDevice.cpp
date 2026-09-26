@@ -222,6 +222,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	FPSLimit = 120;
 	GlossBounces = 1;
 	UseMaterials = 0;
+	UseWidescreenFOV = 1;
 	UseDLSS = 0;
 	DLSSQuality = 1;
 
@@ -237,6 +238,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("LogTimings"), RF_Public) UBoolProperty(CPP_PROPERTY(LogTimings), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Denoise"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDenoiser), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("WidescreenFOV"), RF_Public) UBoolProperty(CPP_PROPERTY(UseWidescreenFOV), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
@@ -254,6 +256,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	DlssEnabled = UseDLSS != 0;
 	DlssQualityNow = Clamp(DLSSQuality, 0, 4);
 	MaterialsEnabled = UseMaterials != 0;
+	WidescreenFovEnabled = UseWidescreenFOV != 0;
 
 	// Started afresh once per run: the engine can make a new device mid
 	// session, and what led up to that is the part worth keeping.
@@ -938,8 +941,23 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 		halfWidth = Frame->FX / (2.0f * Frame->Proj.Z);
 	else
 		halfWidth = 1.0f;
+	float halfHeight = halfWidth * Frame->FY / Frame->FX;
 
-	const float aspect = Frame->FY / Frame->FX;
+	// That field of view is horizontal: FovAngle across the screen, whatever
+	// the screen's shape. On one wider than 4:3 the engine keeps the width and
+	// crops the top and bottom - at 21:9 its 75 degrees shows under 60% of the
+	// height it does at 4:3, and the conversations and cinematics, framed for
+	// 4:3, lose heads and feet. The raster devices can do nothing about it:
+	// they draw what the engine has already projected, and it projects only
+	// what fits its own view. The trace builds the view from the level itself,
+	// so it can keep the height the same FovAngle gives at 4:3 and widen the
+	// view to fill the screen instead. A screen 4:3 or narrower is left as the
+	// engine has it.
+	if (WidescreenFovEnabled && Frame->FX * 3.0f > Frame->FY * 4.0f)
+	{
+		halfHeight = halfWidth * 0.75f;
+		halfWidth = halfHeight * Frame->FX / Frame->FY;
+	}
 
 	// Coords, not Uncoords. FCoords transforms by dotting against its axes, so
 	// Coords.XAxis/YAxis/ZAxis are the world space directions of the view's own
@@ -955,7 +973,7 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 
 	Camera.Origin = vec4(c.Origin.X, c.Origin.Y, c.Origin.Z, 0.0f);
 	Camera.Right = vec4(c.XAxis.X, c.XAxis.Y, c.XAxis.Z, 0.0f) * halfWidth;
-	Camera.Up = vec4(c.YAxis.X, c.YAxis.Y, c.YAxis.Z, 0.0f) * (halfWidth * aspect);
+	Camera.Up = vec4(c.YAxis.X, c.YAxis.Y, c.YAxis.Z, 0.0f) * halfHeight;
 	Camera.Forward = vec4(c.ZAxis.X, c.ZAxis.Y, c.ZAxis.Z, 0.0f);
 
 	HaveCamera = true;
@@ -1685,6 +1703,12 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			MaterialsEnabled = !MaterialsEnabled;
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("WIDESCREEN")))
+		{
+			WidescreenFovEnabled = !WidescreenFovEnabled;
+			Ar.Logf(TEXT("PT: widescreen field of view %s"), WidescreenFovEnabled ? TEXT("on (Hor+)") : TEXT("off (the engine's own, cropped top and bottom)"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("GLOSSBOUNCES")))
 		{
 			GlossBounces = Max(appAtoi(Cmd), 0);
@@ -1750,7 +1774,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

@@ -138,6 +138,11 @@ public:
 	// the session and sets the quality.
 	BITFIELD UseDLSS;
 	INT DLSSQuality;
+	// On a screen wider than 4:3, keep the height of view the game's field of
+	// view gives at 4:3 and widen it to the screen ("Hor+"), rather than keep
+	// the width and crop the top and bottom as the engine does. See
+	// SetSceneNode. PT WIDESCREEN switches it for the session.
+	BITFIELD UseWidescreenFOV;
 
 private:
 	FString DescribeDenoiser() const;
@@ -188,12 +193,13 @@ private:
 	// in the level are arriving and being left to the trace: see DrawTile.
 	bool LoggedWorldSprite = false;
 
-	// PT DENOISE, PT DLSS and PT MATERIALS, for the session; the helper
-	// follows.
+	// PT DENOISE, PT DLSS, PT MATERIALS and PT WIDESCREEN, for the session;
+	// the helper follows.
 	bool DenoiseEnabled = false;
 	bool DlssEnabled = false;
 	int DlssQualityNow = 1;
 	bool MaterialsEnabled = true;
+	bool WidescreenFovEnabled = true;
 	bool DenoiseRestart = true;
 	// Which part of the picture PT VIEW shows in its place, as the trace
 	// shader numbers them; 0 for the picture itself.
