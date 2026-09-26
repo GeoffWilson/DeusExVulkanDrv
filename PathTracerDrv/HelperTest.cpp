@@ -7,7 +7,7 @@
 // semaphores. What it cannot check is the engine's end - LevelScene and the
 // textures - which only the game can.
 //
-//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still] [--jittersign]
+//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still]
 //                            [--lightsize radius] [--reference] [--backlight]
 //   (helper beside it)
 //
@@ -18,8 +18,6 @@
 // change of size - and reports how much the picture changes from one frame
 // to the next over the last quarter of them: with nothing moving, what is
 // left is noise and shimmer, which is what a wrong jitter shows up as.
-// --jittersign tells DLSS the jitter the old way round (the game's
-// PT JITTERSIGN), to compare.
 //
 // --lightsize casts shadows from a disc of that radius around the light
 // rather than from its centre (the game's LightSize). --reference holds the
@@ -129,7 +127,7 @@ int main(int argc, char** argv)
 {
 	std::vector<const char*> args;
 	int dlss = -1;
-	bool still = false, jitterSign = false, reference = false, backlight = false;
+	bool still = false, reference = false, backlight = false;
 	uint32_t lightSize = 0;
 	for (int i = 1; i < argc; i++)
 	{
@@ -137,8 +135,6 @@ int main(int argc, char** argv)
 			dlss = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--still"))
 			still = true;
-		else if (!strcmp(argv[i], "--jittersign"))
-			jitterSign = true;
 		else if (!strcmp(argv[i], "--lightsize") && i + 1 < argc)
 			lightSize = (uint32_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--reference"))
@@ -283,8 +279,6 @@ int main(int argc, char** argv)
 		frame.Camera[3] = vec4(forward.x, forward.y, forward.z, 0.0f);
 		for (int i = 0; i < 4; i++)
 			frame.PreviousCamera[i] = frame.Camera[i];
-		if (jitterSign)
-			frame.DisableBits |= 512u;
 		// Frame to frame change over the last quarter, for --still.
 		std::vector<float> lastPicture;
 		double changeSum = 0.0;
@@ -457,8 +451,8 @@ int main(int argc, char** argv)
 		const double mean = sum / (outWidth * outHeight * 3.0);
 		printf("mean brightness %.3f, written to helper-test.ppm\n", mean);
 		if (still && changeCount > 0)
-			printf("still: frame to frame change %.5f on average over the last %d frames%s\n",
-				changeSum / changeCount, changeCount, jitterSign ? " (jitter the old way round)" : "");
+			printf("still: frame to frame change %.5f on average over the last %d frames\n",
+				changeSum / changeCount, changeCount);
 
 		vkDeviceWaitIdle(device->device);
 		const bool ok = arrived == frames && mean > 0.02;

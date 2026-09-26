@@ -1913,14 +1913,6 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			MaterialsEnabled = !MaterialsEnabled;
 			handled = true;
 		}
-		if (ParseCommand(&Cmd, TEXT("JITTERSIGN")))
-		{
-			DisableBits ^= 512u;
-			Ar.Logf(TEXT("PT: DLSS told the jitter %s"), (DisableBits & 512u)
-				? TEXT("the old way round, as the rays' own offset (for comparison)")
-				: TEXT("as the picture's movement, the way DLSS expects"));
-			handled = true;
-		}
 		if (ParseCommand(&Cmd, TEXT("WIDESCREEN")))
 		{
 			WidescreenFovEnabled = !WidescreenFovEnabled;
@@ -2019,7 +2011,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | JITTERSIGN | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

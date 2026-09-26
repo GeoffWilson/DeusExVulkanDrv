@@ -391,9 +391,6 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT LIGHTSIZE n`: the size lights cast shadows from, as `LightSize`.
 - `PT PINNEDUI 16:9 | 4:3 | OFF`: the UI kept to a box of that shape in the
   middle of the screen, or across all of it. Any ratio or number works.
-- `PT JITTERSIGN`: tells DLSS the sub-pixel jitter the other way round, the
-  way it was told before 1.2, to compare: static fine detail should hold
-  still with it off and shimmer with it on.
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).
