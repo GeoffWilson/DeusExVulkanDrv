@@ -110,6 +110,11 @@ crash, flushed as they happen.
 - **Particles traced with the level** - steam, smoke, sparks - so walls hide
   them, rather than drawn over the picture.
 - **A sharp HUD**, sampled the way the other devices sample it.
+- **The game's Brightness setting**, applied over the finished picture as
+  VulkanDrv applies it; it did nothing before.
+- **Torch and fire waver and watery shimmer**, which lit as steady lights.
+- **Animated textures on the engine's clock** - fire, water, screens - which
+  could run at the wrong speed, and stopped behind the pause menu.
 - **Materials off by default** until they have been checked by hand.
 - **Fixes:** a crash loading a save of the map already being played; a crash
   starting the game in a mode narrower than the screen under Proton's Wayland
@@ -152,7 +157,9 @@ source and was read by disassembly:
 - light types: pulse, subtle pulse, blink, flicker and strobe, on the engine's
   clock and with its exact formulas;
 - light effects: spotlights (a pawn's following where it looks), static spots,
-  non incidence, cylinder, disco, searchlight and rotor;
+  non incidence, cylinder, disco, searchlight and rotor, and the torch and
+  fire wavers and watery shimmer, which flicker across the surfaces they
+  light a lightmap texel at a time;
 - special lighting, zone ambient light, and volumetric fog lights in fog zones,
   integrated per pixel along the view ray;
 - unlit meshes at the engine's own brightness, and the screen flash for damage
