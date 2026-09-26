@@ -132,8 +132,10 @@ three bounces by default with Russian roulette after the second. Glass and water
 are lit by every light at once and without shadows, so the layer they add never
 flickers.
 
-**Materials.** Deus Ex has no material data for its renderer, but it does for
-its footsteps: every level texture is filed in a group named for what it is -
+**Materials.** Off by default for now (the `Materials` setting): guessed as
+below and not yet checked by hand, some come out wrong - Liberty Island's brick
+path is as shiny as glass. Deus Ex has no material data for its renderer, but
+it does for its footsteps: every level texture is filed in a group named for what it is -
 Metal, Wood, Stone, Tiles, Textile - so the player sounds right walking on it.
 The path tracer reads that group as the surface's material. Mesh skins have no
 such group, so they fall back on their name ("ChairLeatherTex1") and on what
@@ -227,7 +229,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	DebugMode=0
 	LogTimings=False
 	FPSLimit=120
-	Materials=True
+	Materials=False
 	GlossBounces=1
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
@@ -248,11 +250,12 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   Written to `PathTracerTimings.log` as well as the game's log, which loses its
   last few lines when the game closes under wine.
 - `DebugMode`: 1 shows only what moves, 2 shows plain albedo with no lighting.
-- `Materials`: surfaces made of something, as above. Off, everything is matte
-  and the frame costs what it did before materials: in the Hong Kong market on
+- `Materials`: surfaces made of something, as above; off by default until the
+  materials have been checked by hand. Off, everything is matte and the frame
+  costs what it did before materials: in the Hong Kong market on
   an RTX 4090 at 1920x1440 they add about 2 ms of GPU time a frame. Half a
   millisecond of that is the denoiser's specular half,
-  which is only built with materials on. `PT NOMATERIALS` switches them for the
+  which is only built with materials on. `PT MATERIALS` switches them for the
   session.
 - `GlossBounces`: how far a smooth surface's reflection is traced. 1 lights what
   it shows by the lights and the zone's ambient; more carries the reflection on
@@ -286,8 +289,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE]`: DLSS
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in.
-- `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT NOMATERIALS`,
-  `PT OPAQUE`: switch one thing off to see what it costs or what it is doing.
+- `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
+  one thing off to see what it costs or what it is doing. `PT MATERIALS`
+  switches materials on or off (`PT NOMATERIALS` still works).
 - `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
 
 The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.

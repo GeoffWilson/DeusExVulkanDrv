@@ -221,7 +221,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseDenoiser = 1;
 	FPSLimit = 120;
 	GlossBounces = 1;
-	UseMaterials = 1;
+	UseMaterials = 0;
 	UseDLSS = 0;
 	DLSSQuality = 1;
 
@@ -1665,7 +1665,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			Bounces = Max(appAtoi(Cmd), 1);
 			handled = true;
 		}
-		if (ParseCommand(&Cmd, TEXT("NOMATERIALS")))
+		if (ParseCommand(&Cmd, TEXT("MATERIALS")) || ParseCommand(&Cmd, TEXT("NOMATERIALS")))
 		{
 			// The denoiser follows at the next frame, once nothing is
 			// using the one it replaces.
@@ -1736,8 +1736,8 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		Ar.Logf(TEXT("PT: lights %s, shadows %s, sky %s, per-triangle checks %s, materials %s, bounces %d, glossy bounces %d%s"),
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
-			MaterialsEnabled ? TEXT("on") : TEXT("OFF"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOMATERIALS | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			MaterialsEnabled ? TEXT("on") : TEXT("off"),
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

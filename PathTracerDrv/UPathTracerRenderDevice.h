@@ -124,7 +124,9 @@ public:
 	INT GlossBounces;
 	// Surfaces made of something: see Materials.h. Off, everything is matte
 	// and the trace and the denoiser cost what they did before materials.
-	// PT NOMATERIALS switches it for the session.
+	// Off by default until the materials have been checked by hand: guessed
+	// from texture groups, some come out wrong (Liberty Island's brick path
+	// as shiny as glass). PT MATERIALS switches it for the session.
 	BITFIELD UseMaterials;
 	// Denoise with NVIDIA's DLSS Ray Reconstruction rather than NRD ("DLSS"
 	// in the ini), wherever it can run - an RTX GPU, and under wine the
@@ -181,7 +183,7 @@ private:
 	int TextureFailuresLogged = 0;
 	bool TracerLost = false;
 
-	// PT DENOISE, PT DLSS and PT NOMATERIALS, for the session; the helper
+	// PT DENOISE, PT DLSS and PT MATERIALS, for the session; the helper
 	// follows.
 	bool DenoiseEnabled = false;
 	bool DlssEnabled = false;
