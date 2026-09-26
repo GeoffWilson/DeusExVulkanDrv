@@ -142,13 +142,38 @@ Measured on an RTX 4090, driver 615.71.09, each Proton in a fresh prefix:
 | GE-Proton 11-6      | no                 | yes                | intact            | 0.116 ms             |
 | Proton-CachyOS      | no                 | yes                | intact            | 0.115 ms             |
 | DW-Proton           | no                 | yes                | intact            | 0.117 ms             |
-| Windows             | no                 | yes                | not yet measured  |                      |
+| Windows             | no                 | yes                | intact            | 0.207 ms             |
 
 So under every Proton a 64-bit helper gets the ray tracing the 32-bit game
 does not, and the two share an image with nothing lost, on the same GPU (UUID
 and LUID agree). That makes a helper process the way to run the path tracer
-from Steam, not only under upstream wine - and on Windows too, if NVIDIA's
-32-bit ICD imports the 64-bit one's memory as winevulkan does. The per handoff
-figure is the whole of the game's submission - waiting on the helper's
-semaphore, taking ownership, copying 256 KB back and returning it - from submit
-to fence.
+from Steam, not only under upstream wine. The per handoff figure is the whole
+of the game's submission - waiting on the helper's semaphore, taking ownership,
+copying 256 KB back and returning it - from submit to fence.
+
+Native Windows does it too, which the table above had left open: NVIDIA's
+32-bit ICD imports the 64-bit one's memory exactly as winevulkan does. Both
+sides report the same UUID and LUID, an RGBA8 and an RGBA16F storage image and
+a semaphore all export and import, and 60 of 60 frames arrive intact. The
+handoff costs about 0.21 ms against wine's 0.117, so roughly 1.8 times as much
+for the same work - still a small share of a frame, and measured on the same
+RTX 4090 on driver 32.0.16.1692.
+
+**The per handoff figure does not scale to a real render target, and the reason
+is this spike rather than the design.** Its timed region copies the whole image
+into host visible memory so every texel can be checked, which is verification
+and not something a render device would ever do - it would sample the shared
+image on the GPU or blit it to the swap chain, and never pull it across PCIe.
+Raising `kSize` on Windows shows what that copy costs rather than what a
+handoff costs:
+
+| Shared image | Bytes  | Per handoff |
+| ------------ | ------ | ----------- |
+| 256x256      | 256 KB | 0.21 ms     |
+| 1024x1024    | 4 MB   | 0.43-0.67 ms|
+| 2048x2048    | 16 MB  | 5.7 ms      |
+
+What is representative is the sync floor at the small sizes, where the copy is
+nothing: about 0.2 ms. What a 1920x1440 target costs without the readback is
+the question this spike does not answer, and the one to answer before building
+a device around a helper.
