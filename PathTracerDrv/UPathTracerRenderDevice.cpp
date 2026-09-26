@@ -67,6 +67,62 @@ static void PathTracerEvent(const char* format, ...)
 	fclose(f);
 }
 
+// The game's window and every other one the process has on screen, at one
+// step of a mode change. A compositor that refuses a window change ends the
+// process without an exception, so the last of these is all that is left to
+// say which step it was and what else was on screen.
+static BOOL CALLBACK PathTracerDescribeOtherWindow(HWND window, LPARAM game)
+{
+	DWORD process = 0;
+	GetWindowThreadProcessId(window, &process);
+	if (process != GetCurrentProcessId() || window == (HWND)game || !IsWindowVisible(window))
+		return TRUE;
+	char name[64] = "";
+	GetClassNameA(window, name, sizeof(name));
+	RECT box = {};
+	GetWindowRect(window, &box);
+	PathTracerEvent("    also %p %s style %08lx ex %08lx owner %p %ld,%ld %ldx%ld", (void*)window, name,
+		(unsigned long)GetWindowLong(window, GWL_STYLE), (unsigned long)GetWindowLong(window, GWL_EXSTYLE),
+		(void*)GetWindow(window, GW_OWNER), box.left, box.top, box.right - box.left, box.bottom - box.top);
+	return TRUE;
+}
+
+// The launcher's splash - an ownerless dialog without a caption - is still up
+// when the device first sets a mode, and only goes once the engine has
+// finished starting. Wine's Wayland driver, as Proton-GE and CachyOS patch it,
+// makes a window like that an xdg_popup of whatever lies beneath its corner,
+// which is the game's window. Entering a fullscreen mode narrower than the
+// monitor then ended the process with the compositor's "destroyed popup not
+// top most popup", the splash still being above. Hidden first, it has no
+// surface to be in the way; the engine destroys it later as before.
+static BOOL CALLBACK PathTracerHideSplash(HWND window, LPARAM game)
+{
+	DWORD process = 0;
+	GetWindowThreadProcessId(window, &process);
+	if (process != GetCurrentProcessId() || window == (HWND)game || !IsWindowVisible(window) || GetWindow(window, GW_OWNER))
+		return TRUE;
+	char name[16] = "";
+	GetClassNameA(window, name, sizeof(name));
+	const LONG style = GetWindowLong(window, GWL_STYLE);
+	if (lstrcmpA(name, "#32770") != 0 || !(style & WS_POPUP) || (style & WS_CAPTION) == WS_CAPTION)
+		return TRUE;
+	PathTracerEvent("hiding the splash %p", (void*)window);
+	ShowWindow(window, SW_HIDE);
+	return TRUE;
+}
+
+static void PathTracerWindowEvent(const char* step, HWND window)
+{
+	RECT box = {}, client = {};
+	GetWindowRect(window, &box);
+	GetClientRect(window, &client);
+	PathTracerEvent("%s: style %08lx ex %08lx owner %p window %ld,%ld %ldx%ld client %ldx%ld", step,
+		(unsigned long)GetWindowLong(window, GWL_STYLE), (unsigned long)GetWindowLong(window, GWL_EXSTYLE),
+		(void*)GetWindow(window, GW_OWNER), box.left, box.top, box.right - box.left, box.bottom - box.top,
+		client.right, client.bottom);
+	EnumWindows(PathTracerDescribeOtherWindow, (LPARAM)window);
+}
+
 // Where an address is: module and offset, which a disassembly or the build's
 // map can turn into a function.
 static void PathTracerDescribeAddress(const void* address, char* out, size_t size)
@@ -672,6 +728,7 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 	PathTracerEvent("SetRes %dx%d %s (was %s, %s, %s)", (int)NewX, (int)NewY, Fullscreen ? "fullscreen" : "windowed",
 		FullscreenState.Enabled ? "fullscreen" : "windowed", wasActive ? "foreground" : "background",
 		IsIconic(window) ? "minimised" : "not minimised");
+	PathTracerWindowEvent("SetRes start", window);
 
 	if (!Fullscreen && FullscreenState.Enabled) // Leaving fullscreen
 	{
@@ -700,6 +757,8 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 		FullscreenState.ExStyle = GetWindowLong(window, GWL_EXSTYLE);
 	}
 
+	EnumWindows(PathTracerHideSplash, (LPARAM)window);
+
 	// BLIT_Fullscreen even though the window below is only borderless. The engine
 	// keys a good deal off believing it is fullscreen - input capture, the
 	// pointer clip, and whether the system cursor is shown - so telling it
@@ -709,6 +768,7 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 	// entirely, which a device presenting through Vulkan has no use for.
 	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), NewX, NewY, NewColorBytes))
 		return 0;
+	PathTracerWindowEvent("engine resized", window);
 
 	if (enteringFullscreen)
 	{
@@ -717,9 +777,12 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 		int screenHeight = GetDeviceCaps(screenDC, VERTRES);
 		ReleaseDC(0, screenDC);
 
+		PathTracerEvent("screen %dx%d", screenWidth, screenHeight);
 		SetWindowLong(window, GWL_STYLE, WS_OVERLAPPED | WS_VISIBLE);
 		SetWindowLong(window, GWL_EXSTYLE, WS_EX_APPWINDOW);
+		PathTracerWindowEvent("restyled", window);
 		SetWindowPos(window, HWND_TOP, 0, 0, screenWidth, screenHeight, SWP_FRAMECHANGED | SWP_NOSENDCHANGING | SWP_NOZORDER);
+		PathTracerWindowEvent("placed", window);
 
 		FullscreenState.Enabled = true;
 	}

@@ -592,6 +592,29 @@ static void ReclipCursorToWindow(HWND hWnd)
 	ClipCursor(&client);
 }
 
+// The launcher's splash - an ownerless dialog without a caption - is still up
+// when the device first sets a mode, and only goes once the engine has
+// finished starting. Wine's Wayland driver, as Proton-GE and CachyOS patch it,
+// makes a window like that an xdg_popup of whatever lies beneath its corner,
+// which is the game's window, and entering a fullscreen mode narrower than the
+// monitor then ended the process with the compositor's "destroyed popup not
+// top most popup". Hidden first, it has no surface to be in the way; the
+// engine destroys it later as before.
+static BOOL CALLBACK HideStartupSplash(HWND window, LPARAM game)
+{
+	DWORD process = 0;
+	GetWindowThreadProcessId(window, &process);
+	if (process != GetCurrentProcessId() || window == (HWND)game || !IsWindowVisible(window) || GetWindow(window, GW_OWNER))
+		return TRUE;
+	char name[16] = "";
+	GetClassNameA(window, name, sizeof(name));
+	const LONG style = GetWindowLong(window, GWL_STYLE);
+	if (lstrcmpA(name, "#32770") != 0 || !(style & WS_POPUP) || (style & WS_CAPTION) == WS_CAPTION)
+		return TRUE;
+	ShowWindow(window, SW_HIDE);
+	return TRUE;
+}
+
 UBOOL UD3D11RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fullscreen)
 {
 	guard(UD3D11RenderDevice::SetRes);
@@ -604,6 +627,8 @@ UBOOL UD3D11RenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL Fu
 		return TRUE;
 	}
 	SetResCallLock lock(InSetResCall);
+
+	EnumWindows(HideStartupSplash, (LPARAM)Viewport->GetWindow());
 
 	ReleaseSwapChainResources();
 
