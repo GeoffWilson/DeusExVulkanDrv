@@ -89,14 +89,16 @@ case "$SELECT" in
 	*) echo "usage: $0 [SystemDir] [vulkan|d3d11|d3d12|pathtracer|none]" >&2; exit 1 ;;
 esac
 
+# The inis are CRLF, and a value matched with .* takes the CR with it.
+CR=$'\r'
 if [ -n "$DEV" ]; then
 	for f in "${INIS[@]}"; do
-		sed -i "s|^GameRenderDevice=.*|GameRenderDevice=$DEV|" "$f"
+		sed -i "s|^GameRenderDevice=[^$CR]*|GameRenderDevice=$DEV|" "$f"
 		# These devices present through Vulkan or D3D and never through
 		# DirectDraw, but the engine still asks DirectDraw for a real display
 		# mode change when going fullscreen. Under wine that fails and the engine
 		# gives up with EndFullscreen the moment it has entered.
-		sed -i "s|^UseDirectDraw=.*|UseDirectDraw=False|" "$f"
+		sed -i "s|^UseDirectDraw=[^$CR]*|UseDirectDraw=False|" "$f"
 		echo "$(basename "$f"): GameRenderDevice=$DEV, UseDirectDraw=False"
 	done
 fi
