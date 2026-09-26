@@ -1461,6 +1461,28 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	unguard;
 }
 
+// What PT DENOISE and PT DLSS have asked for, as the next frame will be
+// denoised: NRD, Ray Reconstruction at a quality, or nothing - and NRD in Ray
+// Reconstruction's place, with the helper's reason, where it cannot run.
+FString UPathTracerRenderDevice::DescribeDenoiser() const
+{
+	static const TCHAR* qualityNames[] = { TEXT("DLAA"), TEXT("quality"), TEXT("balanced"), TEXT("performance"), TEXT("ultra performance") };
+	const bool helper = Tracer && Tracer->Alive();
+	if (!DenoiseEnabled)
+		return TEXT("denoising off");
+	if (!DlssEnabled)
+		return FString::Printf(TEXT("denoising with NRD (%s)"), helper ? *Widen(Tracer->Status().DenoiserStatus) : TEXT("no helper"));
+	const FString quality = qualityNames[Clamp(DlssQualityNow, 0, 4)];
+	if (!helper)
+		return FString::Printf(TEXT("denoising with DLSS Ray Reconstruction, %s (no helper)"), *quality);
+	const char* status = Tracer->Status().DlssStatus;
+	// Started the first time a frame asks for it, so on the frame after this
+	// one; until then there is nothing to report either way.
+	if (!strcmp(status, "ready") || !strcmp(status, "not asked for yet"))
+		return FString::Printf(TEXT("denoising with DLSS Ray Reconstruction, %s"), *quality);
+	return FString::Printf(TEXT("DLSS Ray Reconstruction asked for, %s, but NRD stands in: %s"), *quality, *Widen(status));
+}
+
 // The same pacing as VulkanDrv's FPSLimit, less its wait for the frame to
 // reach the screen: this device keeps the next frame's scene gathering running
 // while the GPU traces the last, and waiting for the present would serialise
@@ -1678,19 +1700,19 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				}
 			if (!named)
 				DlssEnabled = !DlssEnabled;
+			// Asking for DLSS is asking for denoising: PT DENOISE is the
+			// switch for both, and left off it would make this do nothing.
+			if (DlssEnabled)
+				DenoiseEnabled = true;
 			DenoiseRestart = true;
-			static const TCHAR* qualityNames[] = { TEXT("DLAA"), TEXT("quality"), TEXT("balanced"), TEXT("performance"), TEXT("ultra performance") };
-			Ar.Logf(TEXT("PT: DLSS Ray Reconstruction %s, %s (%s)  (PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE])"),
-				DlssEnabled ? TEXT("on") : TEXT("off"), qualityNames[Clamp(DlssQualityNow, 0, 4)],
-				(Tracer && Tracer->Alive()) ? *Widen(Tracer->Status().DlssStatus) : TEXT("no helper"));
+			Ar.Logf(TEXT("PT: %s  (PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE])"), *DescribeDenoiser());
 			handled = true;
 		}
 		if (ParseCommand(&Cmd, TEXT("DENOISE")))
 		{
 			DenoiseEnabled = !DenoiseEnabled;
 			DenoiseRestart = true;
-			Ar.Logf(TEXT("PT: denoiser %s (%s)"), DenoiseEnabled ? TEXT("on") : TEXT("off"),
-				(Tracer && Tracer->Alive()) ? *Widen(Tracer->Status().DenoiserStatus) : TEXT("no helper"));
+			Ar.Logf(TEXT("PT: %s"), *DescribeDenoiser());
 			handled = true;
 		}
 		// One of the denoiser's inputs in place of the picture. Numbered as

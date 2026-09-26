@@ -136,6 +136,7 @@ public:
 	INT DLSSQuality;
 
 private:
+	FString DescribeDenoiser() const;
 	void CreateSwapChainResources();
 	void ReleaseSwapChainResources();
 	void CreateTilePipeline();
