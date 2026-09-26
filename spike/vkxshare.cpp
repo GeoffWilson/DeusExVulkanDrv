@@ -16,7 +16,17 @@
 // reports whether it gets ray tracing, which is the other half of the question.
 //
 //   vkxshare.exe                         32-bit, the game's side
-//   vkxshare64.exe --helper <pid> <uuid> 64-bit, started by the above
+//   vkxshare.exe --present <w> <h>       the same at a real render target's size
+//   vkxshare64.exe --helper ...          64-bit, started by the above
+//
+// By default every texel is checked, which means copying the whole image back
+// to the CPU - verification, not something a render device would do, and at a
+// real size the copy is most of what gets timed. --present does what a device
+// would: the helper fills an RGBA16F image of that size on the GPU, and the
+// game's side scales it into an 8-bit image of its own as presenting it would,
+// reading back only a few texels to check the right frame arrived. It then
+// times the same scale from an image of its own with no sharing at all, so the
+// difference is what the sharing costs.
 //
 // Loads the loader by hand so it needs no import library.
 
@@ -33,9 +43,10 @@
 #include <string>
 #include <vector>
 
-static const uint32_t kSize = 256;       // the shared image is kSize x kSize
+static uint32_t gWidth = 256, gHeight = 256;   // the shared image
 static const int kFrames = 60;
-static const VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+static VkFormat gFormat = VK_FORMAT_R8G8B8A8_UNORM;
+static bool gPresent = false;
 // The usage a render target shared this way would really have, so the
 // question is asked of the image that would be asked of it.
 static const VkImageUsageFlags kUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -71,6 +82,7 @@ FN(vkBindImageMemory); FN(vkCreateBuffer); FN(vkGetBufferMemoryRequirements); FN
 FN(vkMapMemory); FN(vkCreateSemaphore); FN(vkCreateFence); FN(vkWaitForFences); FN(vkResetFences);
 FN(vkCreateCommandPool); FN(vkAllocateCommandBuffers); FN(vkBeginCommandBuffer); FN(vkEndCommandBuffer);
 FN(vkResetCommandBuffer); FN(vkCmdPipelineBarrier); FN(vkCmdCopyBufferToImage); FN(vkCmdCopyImageToBuffer);
+FN(vkCmdClearColorImage); FN(vkCmdBlitImage);
 FN(vkQueueSubmit); FN(vkDeviceWaitIdle); FN(vkDestroyDevice); FN(vkDestroyInstance);
 FN(vkGetMemoryWin32HandleKHR); FN(vkGetSemaphoreWin32HandleKHR); FN(vkImportSemaphoreWin32HandleKHR);
 #undef FN
@@ -259,6 +271,7 @@ static bool createDevice(Gpu& g)
 	LOAD_D(g.device, vkResetFences); LOAD_D(g.device, vkCreateCommandPool); LOAD_D(g.device, vkAllocateCommandBuffers);
 	LOAD_D(g.device, vkBeginCommandBuffer); LOAD_D(g.device, vkEndCommandBuffer); LOAD_D(g.device, vkResetCommandBuffer);
 	LOAD_D(g.device, vkCmdPipelineBarrier); LOAD_D(g.device, vkCmdCopyBufferToImage); LOAD_D(g.device, vkCmdCopyImageToBuffer);
+	LOAD_D(g.device, vkCmdClearColorImage); LOAD_D(g.device, vkCmdBlitImage);
 	LOAD_D(g.device, vkQueueSubmit); LOAD_D(g.device, vkDeviceWaitIdle); LOAD_D(g.device, vkDestroyDevice);
 	LOAD_D(g.device, vkGetMemoryWin32HandleKHR); LOAD_D(g.device, vkGetSemaphoreWin32HandleKHR);
 	LOAD_D(g.device, vkImportSemaphoreWin32HandleKHR);
@@ -289,10 +302,10 @@ static int memoryType(const Gpu& g, uint32_t bits, VkMemoryPropertyFlags want)
 }
 
 // A host visible buffer for the pattern going in or the frame coming back.
-static bool hostBuffer(const Gpu& g, VkBufferUsageFlags usage, VkBuffer& buffer, uint32_t*& mapped)
+static bool hostBuffer(const Gpu& g, VkBufferUsageFlags usage, VkDeviceSize size, VkBuffer& buffer, uint32_t*& mapped)
 {
 	VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-	bci.size = kSize * kSize * 4;
+	bci.size = size;
 	bci.usage = usage;
 	vkCreateBuffer(g.device, &bci, nullptr, &buffer);
 	VkMemoryRequirements req;
@@ -316,8 +329,8 @@ static VkImage sharedImage(const Gpu& g)
 	VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
 	ici.pNext = &ext;
 	ici.imageType = VK_IMAGE_TYPE_2D;
-	ici.format = kFormat;
-	ici.extent = { kSize, kSize, 1 };
+	ici.format = gFormat;
+	ici.extent = { gWidth, gHeight, 1 };
 	ici.mipLevels = 1;
 	ici.arrayLayers = 1;
 	ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -379,7 +392,44 @@ static VkBufferImageCopy wholeImage()
 {
 	VkBufferImageCopy c{};
 	c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-	c.imageExtent = { kSize, kSize, 1 };
+	c.imageExtent = { gWidth, gHeight, 1 };
+	return c;
+}
+
+// An image of this process's own, not shared, in device local memory.
+static VkImage localImage(const Gpu& g, VkFormat format, VkImageUsageFlags usage)
+{
+	VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = format;
+	ici.extent = { gWidth, gHeight, 1 };
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = usage;
+	VkImage image = VK_NULL_HANDLE;
+	vkCreateImage(g.device, &ici, nullptr, &image);
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(g.device, image, &req);
+	VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+	mai.allocationSize = req.size;
+	mai.memoryTypeIndex = (uint32_t)memoryType(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	VkDeviceMemory memory;
+	vkAllocateMemory(g.device, &mai, nullptr, &memory);
+	vkBindImageMemory(g.device, image, memory, 0);
+	return image;
+}
+
+// What the helper clears frame "frame" to in --present mode: exact in half
+// float, and different every frame.
+static VkClearColorValue presentColour(int frame)
+{
+	VkClearColorValue c{};
+	c.float32[0] = frame / 64.0f;
+	c.float32[1] = 1.0f - frame / 64.0f;
+	c.float32[2] = 0.5f;
+	c.float32[3] = 1.0f;
 	return c;
 }
 
@@ -459,9 +509,9 @@ static int helperMain(DWORD clientPid, const char* uuid)
 			return 1;
 		}
 
-	VkBuffer staging;
+	VkBuffer staging = VK_NULL_HANDLE;
 	uint32_t* pixels = nullptr;
-	if (!hostBuffer(g, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging, pixels))
+	if (!gPresent && !hostBuffer(g, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, (VkDeviceSize)gWidth * gHeight * 4, staging, pixels))
 		return 1;
 
 	std::printf("HANDLES %llx %llx %llx %llu\n", (unsigned long long)(uintptr_t)theirs[0], (unsigned long long)(uintptr_t)theirs[1],
@@ -471,9 +521,10 @@ static int helperMain(DWORD clientPid, const char* uuid)
 	char line[256];
 	for (int frame = 0; frame < kFrames; frame++)
 	{
-		for (uint32_t y = 0; y < kSize; y++)
-			for (uint32_t x = 0; x < kSize; x++)
-				pixels[y * kSize + x] = pattern(x, y, frame);
+		if (!gPresent)
+			for (uint32_t y = 0; y < gHeight; y++)
+				for (uint32_t x = 0; x < gWidth; x++)
+					pixels[y * gWidth + x] = pattern(x, y, frame);
 
 		beginCommands(g);
 		if (frame == 0)
@@ -482,8 +533,18 @@ static int helperMain(DWORD clientPid, const char* uuid)
 		else
 			barrier(g, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 				VK_QUEUE_FAMILY_EXTERNAL, g.family, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-		VkBufferImageCopy c = wholeImage();
-		vkCmdCopyBufferToImage(g.cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+		if (gPresent)
+		{
+			// Filled on the GPU, as a trace would fill it.
+			VkClearColorValue colour = presentColour(frame);
+			VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+			vkCmdClearColorImage(g.cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colour, 1, &range);
+		}
+		else
+		{
+			VkBufferImageCopy c = wholeImage();
+			vkCmdCopyBufferToImage(g.cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+		}
 		barrier(g, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
 			g.family, VK_QUEUE_FAMILY_EXTERNAL, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 		vkEndCommandBuffer(g.cmd);
@@ -550,6 +611,107 @@ struct Pipe
 	}
 };
 
+// A 4x4 block from the middle of the 8-bit target, into the readback buffer.
+static void readCentre(const Gpu& g, VkImage target, VkBuffer readback)
+{
+	VkBufferImageCopy c{};
+	c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+	c.imageOffset = { (int32_t)gWidth / 2, (int32_t)gHeight / 2, 0 };
+	c.imageExtent = { 4, 4, 1 };
+	vkCmdCopyImageToBuffer(g.cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &c);
+}
+
+// The shared image scaled into the 8-bit target, as presenting it would be.
+static void blitTo(const Gpu& g, VkImage source, VkImage target, bool first)
+{
+	barrier(g, target, first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	VkImageBlit b{};
+	b.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+	b.srcOffsets[1] = { (int32_t)gWidth, (int32_t)gHeight, 1 };
+	b.dstSubresource = b.srcSubresource;
+	b.dstOffsets[1] = b.srcOffsets[1];
+	vkCmdBlitImage(g.cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+	barrier(g, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+}
+
+static int presentLoop(Gpu& g, VkImage shared, VkSemaphore* semaphores, VkBuffer readback, uint32_t* pixels,
+	Pipe& fromHelper, Pipe& toHelper, PROCESS_INFORMATION& pi)
+{
+	VkImage target = localImage(g, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+	const uint8_t* bytes = (const uint8_t*)pixels;
+	std::string line;
+	int good = 0;
+	double sharedMs = 0.0;
+	for (int frame = 0; frame < kFrames; frame++)
+	{
+		if (!fromHelper.readLine(line, 20000) || std::strncmp(line.c_str(), "FRAME ", 6) || std::atoi(line.c_str() + 6) != frame)
+		{
+			say("FAIL frame %d never arrived (%s)", frame, line.c_str());
+			break;
+		}
+		const auto start = std::chrono::steady_clock::now();
+		beginCommands(g);
+		barrier(g, shared, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			VK_QUEUE_FAMILY_EXTERNAL, g.family, 0, VK_ACCESS_TRANSFER_READ_BIT);
+		blitTo(g, shared, target, frame == 0);
+		barrier(g, shared, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+			g.family, VK_QUEUE_FAMILY_EXTERNAL, VK_ACCESS_TRANSFER_READ_BIT, 0);
+		readCentre(g, target, readback);
+		vkEndCommandBuffer(g.cmd);
+		submit(g, semaphores[0], semaphores[1]);
+		sharedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+		// Within one step of the colour the helper cleared to: the blit's
+		// conversion from half float to 8 bits may round either way.
+		VkClearColorValue want = presentColour(frame);
+		bool right = true;
+		for (int i = 0; i < 16; i++)
+			for (int ch = 0; ch < 4; ch++)
+				right = right && std::abs((int)bytes[i * 4 + ch] - (int)(want.float32[ch] * 255.0f + 0.5f)) <= 1;
+		good += right ? 1 : 0;
+		if (frame == 0 || !right)
+			say("frame %d: centre %u %u %u %u, %s", frame, bytes[0], bytes[1], bytes[2], bytes[3],
+				right ? "the helper's frame" : "NOT the helper's frame");
+		toHelper.writeLine("OK %d", frame);
+	}
+	toHelper.writeLine("DONE");
+	WaitForSingleObject(pi.hProcess, 5000);
+
+	// The same scale from an image of this process's own, with no sharing:
+	// what presenting costs anyway.
+	VkImage own = localImage(g, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+	beginCommands(g);
+	barrier(g, own, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+	VkClearColorValue colour = presentColour(0);
+	VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	vkCmdClearColorImage(g.cmd, own, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colour, 1, &range);
+	barrier(g, own, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	vkEndCommandBuffer(g.cmd);
+	submit(g, VK_NULL_HANDLE, VK_NULL_HANDLE);
+	double ownMs = 0.0;
+	for (int frame = 0; frame < kFrames; frame++)
+	{
+		const auto start = std::chrono::steady_clock::now();
+		beginCommands(g);
+		blitTo(g, own, target, false);
+		readCentre(g, target, readback);
+		vkEndCommandBuffer(g.cmd);
+		submit(g, VK_NULL_HANDLE, VK_NULL_HANDLE);
+		ownMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	}
+
+	say("");
+	say("%d of %d frames arrived, %ux%u RGBA16F scaled to RGBA8", good, kFrames, gWidth, gHeight);
+	say("shared, from the helper:  %.3f ms a frame (submit to fence)", sharedMs / kFrames);
+	say("own image, no sharing:    %.3f ms a frame", ownMs / kFrames);
+	say("=> what the sharing adds: %.3f ms a frame", (sharedMs - ownMs) / kFrames);
+	return good == kFrames ? 0 : 1;
+}
+
 static int clientMain()
 {
 	Gpu g;
@@ -570,8 +732,8 @@ static int clientMain()
 	char* slash = std::strrchr(path, '\\');
 	std::strcpy(slash ? slash + 1 : path, "vkxshare64.exe");
 	char cmdline[MAX_PATH + 128];
-	std::snprintf(cmdline, sizeof(cmdline), "\"%s\" --helper %lu %s", path, GetCurrentProcessId(),
-		hex(g.uuid, VK_UUID_SIZE).c_str());
+	std::snprintf(cmdline, sizeof(cmdline), "\"%s\" --helper %lu %s %u %u %d", path, GetCurrentProcessId(),
+		hex(g.uuid, VK_UUID_SIZE).c_str(), gWidth, gHeight, gPresent ? 1 : 0);
 
 	SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
 	Pipe fromHelper, toHelper;
@@ -651,8 +813,10 @@ static int clientMain()
 
 	VkBuffer readback;
 	uint32_t* pixels = nullptr;
-	if (!hostBuffer(g, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback, pixels))
+	if (!hostBuffer(g, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gPresent ? 64 : (VkDeviceSize)gWidth * gHeight * 4, readback, pixels))
 		return 1;
+	if (gPresent)
+		return presentLoop(g, image, semaphores, readback, pixels, fromHelper, toHelper, pi);
 
 	// Each frame: wait for "ready" on the GPU, take the image, read it back,
 	// hand it back and signal "released".
@@ -679,15 +843,15 @@ static int clientMain()
 		gpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 
 		long long mismatched = 0;
-		for (uint32_t y = 0; y < kSize; y++)
-			for (uint32_t x = 0; x < kSize; x++)
-				mismatched += pixels[y * kSize + x] != pattern(x, y, frame);
+		for (uint32_t y = 0; y < gHeight; y++)
+			for (uint32_t x = 0; x < gWidth; x++)
+				mismatched += pixels[y * gWidth + x] != pattern(x, y, frame);
 		if (mismatched == 0)
 			good++;
 		else if (mismatched > worstMismatch)
 			worstMismatch = mismatched;
 		if (frame == 0 || mismatched)
-			say("frame %d: %lld of %u texels wrong%s", frame, mismatched, kSize * kSize,
+			say("frame %d: %lld of %u texels wrong%s", frame, mismatched, gWidth * gHeight,
 				mismatched ? "" : " - the helper's image arrived intact");
 		toHelper.writeLine("OK %d", frame);
 	}
@@ -708,7 +872,24 @@ static int clientMain()
 int main(int argc, char** argv)
 {
 	if (argc >= 4 && !std::strcmp(argv[1], "--helper"))
+	{
+		if (argc >= 7)
+		{
+			gWidth = (uint32_t)std::atoi(argv[4]);
+			gHeight = (uint32_t)std::atoi(argv[5]);
+			gPresent = std::atoi(argv[6]) != 0;
+		}
+		if (gPresent)
+			gFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 		return helperMain((DWORD)std::strtoul(argv[2], nullptr, 10), argv[3]);
+	}
+	if (argc >= 4 && !std::strcmp(argv[1], "--present"))
+	{
+		gPresent = true;
+		gWidth = (uint32_t)std::atoi(argv[2]);
+		gHeight = (uint32_t)std::atoi(argv[3]);
+		gFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+	}
 	std::printf("pointer size: %d bits\n\n", (int)(sizeof(void*) * 8));
 	return clientMain();
 }

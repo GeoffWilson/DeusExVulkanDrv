@@ -174,6 +174,25 @@ handoff costs:
 | 2048x2048    | 16 MB  | 5.7 ms      |
 
 What is representative is the sync floor at the small sizes, where the copy is
-nothing: about 0.2 ms. What a 1920x1440 target costs without the readback is
-the question this spike does not answer, and the one to answer before building
-a device around a helper.
+nothing: about 0.2 ms.
+
+### At a real render target's size
+
+`vkxshare.exe --present <w> <h>` answers what the copy hid. The helper fills an
+RGBA16F image of that size on the GPU each frame, as a trace would, and the
+game's side scales it into an 8-bit image of its own as presenting it would,
+reading back only a 4x4 block to check the right frame arrived. It then times
+the same scale from an unshared image of its own, which a device pays anyway,
+so the difference is what the sharing costs:
+
+| Environment         | Size      | Shared    | Own image | Sharing adds |
+| ------------------- | --------- | --------- | --------- | ------------ |
+| wine 11.18          | 1920x1440 | 0.121 ms  | 0.034 ms  | 0.088 ms     |
+| wine 11.18          | 3440x1440 | 0.136 ms  | 0.039 ms  | 0.097 ms     |
+| Proton Experimental | 1920x1440 | 0.128 ms  | 0.042 ms  | 0.086 ms     |
+| Proton Experimental | 3440x1440 | 0.137 ms  | 0.038 ms  | 0.099 ms     |
+| Windows             |           | not yet measured |    |              |
+
+About a tenth of a millisecond, whatever the size: the cost is the semaphore
+round trip and the ownership transfer, not the texels, which never leave the
+GPU. A frame in the Hong Kong market is 10 to 12 ms, so under one percent of it.
