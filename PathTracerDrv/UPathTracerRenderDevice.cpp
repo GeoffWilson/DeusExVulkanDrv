@@ -1374,6 +1374,20 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		int dstX = (windowWidth - dstWidth) / 2;
 		int dstY = (windowHeight - dstHeight) / 2;
 
+		// The bars are the swap chain image's own, taken in an undefined
+		// layout, and in practice they hold whatever was last presented from
+		// it - the edges of a wider mode, after the player picks a narrower one.
+		if (dstWidth != windowWidth || dstHeight != windowHeight)
+		{
+			VkClearColorValue black = {};
+			black.float32[3] = 1.0f;
+			VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+			commands->clearColorImage(SwapChain->GetImage(imageIndex)->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+			PipelineBarrier()
+				.AddImage(SwapChain->GetImage(imageIndex), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+				.Execute(commands.get(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		}
+
 		VkImageBlit blit = {};
 		blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		blit.srcSubresource.layerCount = 1;

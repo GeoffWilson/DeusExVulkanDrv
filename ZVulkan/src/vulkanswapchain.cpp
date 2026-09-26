@@ -186,6 +186,10 @@ bool VulkanSwapChain::CreateSwapchain(int width, int height, int imageCount, boo
 	swapChainCreateInfo.imageExtent = actualExtent;
 	swapChainCreateInfo.imageArrayLayers = 1;
 	swapChainCreateInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	// A device that presents by blitting into the image, and clears around
+	// what it blits, needs it as a transfer destination too.
+	if (caps.Capabilites.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+		swapChainCreateInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
 	uint32_t queueFamilyIndices[] = { (uint32_t)device->GraphicsFamily, (uint32_t)device->PresentFamily };
 	if (device->GraphicsFamily != device->PresentFamily)
