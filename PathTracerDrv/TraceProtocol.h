@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 4;
+	static const uint32_t Version = 5;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -166,6 +166,8 @@ namespace TraceProtocol
 	{
 		int32_t GeometryIndex;
 		uint32_t HasPrevious;
+		uint32_t Mask;
+		uint32_t Pad;
 		float Transform[12];
 		float PreviousTransform[12];
 		vec4 Ambient;
@@ -247,6 +249,6 @@ namespace TraceProtocol
 	static_assert(sizeof(TriangleAttributes) == 128 && sizeof(SceneLight) == 64, "scene records must match in both builds");
 	static_assert(offsetof(Header, ReadySemaphore) % 8 == 0 && offsetof(Header, OutputMemory) % 8 == 0, "64-bit fields must be aligned alike");
 	static_assert(sizeof(Header) % 8 == 0, "header must keep the command area aligned");
-	static_assert(sizeof(WireInstance) == 120, "instance record must match in both builds");
+	static_assert(sizeof(WireInstance) == 128, "instance record must match in both builds");
 	static_assert(sizeof(TraceCommand) % 8 == 0 && sizeof(GeometryCommand) % 8 == 0 && sizeof(TextureCommand) % 8 == 0, "commands keep 8 byte alignment");
 }

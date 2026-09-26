@@ -140,9 +140,25 @@ struct SceneGeometry
 
 // One placement of a geometry in the world, rebuilt every frame for anything
 // that moves.
+// Which rays see an instance: its Vulkan instance mask, against the cull mask
+// each kind of ray is traced with in Shaders.cpp.
+enum InstanceMask : uint32_t
+{
+	InstanceSeenByAll = 0xFF,
+	// The viewer's own body while the camera is inside it. The engine never
+	// draws it from there, but a mirror shows it, and so does anything else
+	// that bounces - everything except the view itself and shadows.
+	InstanceSeenReflected = 0x02,
+	// The weapon in the player's hands, which the engine draws over the view:
+	// seen by the view and throwing its shadows, but not floating at the
+	// player's eyes in a mirror.
+	InstanceSeenByView = 0x04,
+};
+
 struct SceneInstance
 {
 	int GeometryIndex = 0;
+	uint32_t Mask = InstanceSeenByAll;
 	uint32_t AttributeBase = 0;
 	float Transform[12] = {};   // 3x4, row major, as Vulkan wants it
 	// An actor carries its zone's ambient with it, because the same mesh is

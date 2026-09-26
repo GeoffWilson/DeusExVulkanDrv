@@ -1629,6 +1629,175 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 // and mesh actors follow, each with the transform the engine currently has them
 // at, so the top level structure is rebuilt every frame while the bottom level
 // ones are built once per distinct shape.
+// One actor's shape placed in the scene, if it has one to place: a mover's
+// brush, a mesh, or a sprite. mask says which rays see it (InstanceMask).
+// iterated is for what a render iterator hands out - one actor moved to each
+// of its items in turn - which has no placement of its own to remember.
+void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCounts& counts)
+{
+	int geometryIndex = -1;
+	FVector scale(1.0f, 1.0f, 1.0f);
+	const bool isCharacterActor = (actor->DrawType == DT_Mesh && actor->Mesh && actor->Mesh->AnimFrames > 1);
+
+	if (actor->DrawType == DT_Brush && actor->Brush)
+	{
+		counts.Brushes++;
+		// Movers. The engine keeps the brush in its own space and moves the
+		// actor, which is exactly the instancing an acceleration structure
+		// wants - the geometry is built once and only the transform moves.
+		geometryIndex = GeometryForBrush(actor->Brush);
+	}
+	else if (actor->DrawType == DT_Mesh && actor->Mesh)
+	{
+		// Vertex animation: the mesh holds every frame end to end, and
+		// AnimFrame picks one. Quantised into a fixed number of buckets
+		// rather than taken as it comes: a bottom level structure is built
+		// per distinct pose, and an animating character walks through a new
+		// one every frame, so the unquantised value builds structures
+		// without bound until the cache fills and actors start vanishing.
+		// AnimFrame is a fraction of the actor's CURRENT sequence, not of the
+		// mesh's whole frame list. Spreading it over every frame the mesh
+		// owns picks a pose out of whatever animation happens to live at that
+		// offset, which is why characters cycled through unrelated motions.
+		int frameA = 0, frameB = 0;
+		float alpha = 0.0f;
+		AnimationPose(actor->Mesh, actor->AnimSequence, actor->AnimFrame, frameA, frameB, alpha);
+
+		// MultiSkins is where a character's appearance lives. Deliberately
+		// NOT actor->Texture: on a pawn that is the editor's sprite icon -
+		// S_Pawn, a little green man - and letting it override the skins
+		// paints every character in the game the colour of an icon.
+		// The order UMesh::GetTexture uses: the actor's per-material skin
+		// first, then the mesh's own list, then the actor's single Skin
+		// override. Taking only MultiSkins left anything that uses Skin -
+		// the street signs among them - with no texture at all, falling
+		// back to one averaged colour.
+		//
+		// Deliberately not actor->Texture: on a pawn that is the editor's
+		// S_Pawn sprite icon.
+		UTexture* skins[8] = {};
+		for (int i = 0; i < 8; i++)
+		{
+			// GetSkin first, which is what UMesh::GetTexture does and what
+			// reading MultiSkins directly skips. It is virtual, so a class
+			// may answer differently from what the array holds.
+			if (actor->GetSkin(i))
+				skins[i] = actor->GetSkin(i);
+			else if (actor->MultiSkins[i])
+				skins[i] = actor->MultiSkins[i];
+			else if (i != 0 && i < actor->Mesh->Textures.Num() && actor->Mesh->Textures(i))
+				skins[i] = actor->Mesh->Textures(i);
+			else if (actor->Skin)
+				skins[i] = actor->Skin;
+			else if (i < actor->Mesh->Textures.Num())
+				skins[i] = actor->Mesh->Textures(i);
+		}
+
+		// Something that animates is rebuilt each frame at its exact pose;
+		// anything with a single frame is a shape that can be shared.
+		const float styleKind = KindFromStyle(actor->Style);
+		const FCoords toLocal = ActorToLocal(actor);
+
+		if (actor->Mesh->AnimFrames > 1)
+			geometryIndex = AnimatedGeometryFor(actor, actor->Mesh, frameA, frameB, alpha, skins, styleKind, &toLocal);
+		else
+			geometryIndex = GeometryForMesh(actor->Mesh, frameA, frameB, 0.0f, skins, -1, styleKind, nullptr, nullptr, actor);
+		if (geometryIndex < 0)
+			counts.Skipped++;
+		else
+		{
+			counts.Meshes++;
+			// More than one animation frame means something that moves:
+			// a person, rather than a chair.
+			if (actor->Mesh->AnimFrames > 1)
+				counts.Animated++;
+		}
+		const float s = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
+		scale = FVector(s, s, s);
+	}
+
+	float spriteTransform[12];
+	const bool isSprite = actor->DrawType == DT_Sprite || actor->DrawType == DT_SpriteAnimOnce;
+	if (isSprite && !PlaceSprite(actor, geometryIndex, spriteTransform))
+		return;
+
+	if (geometryIndex < 0)
+		return;
+
+	SceneInstance instance;
+	instance.GeometryIndex = geometryIndex;
+	// A brush and a mesh take the pre-pivot in opposite directions. For a
+	// brush it comes off the points before the rotation, the way
+	// ABrush::ToWorld spells out; for a mesh actor it offsets the drawn mesh
+	// instead. Measured both ways round: with one sign the seated characters
+	// sit correctly and the doors ride up, with the other the reverse.
+	const bool isBrush = (actor->DrawType == DT_Brush && actor->Brush);
+	const FVector prePivot = isBrush ? -actor->PrePivot : actor->PrePivot;
+	if (isSprite)
+		memcpy(instance.Transform, spriteTransform, sizeof(instance.Transform));
+	else
+		MakeTransform(actor->Location, actor->Rotation, scale, prePivot, instance.Transform);
+	// A sprite is lit by nothing, so its instance carries its glow where
+	// anything else carries the zone's ambient. The engine draws it at
+	// ScaleGlow brightness, which is how effects fade out. An unlit mesh
+	// carries its own brightness the same way: see UnlitMeshGlow.
+	const float glow = isSprite ? Clamp((float)actor->ScaleGlow, 0.0f, 4.0f) : UnlitMeshGlow(actor);
+	const vec3 ambient = (isSprite || actor->bUnlit) ? vec3(glow, glow, glow) : ZoneAmbient(actor->Region.Zone);
+
+	// Did this actor actually move or change shape since the last frame?
+	// The trace uses it to throw away the accumulated history of the pixels
+	// covering it. Judging that from the hit position alone needed a
+	// distance tolerance, and anything moving slower than the tolerance -
+	// a medical bot crossing a room - kept its history and smeared.
+	//
+	// Not for an iterator's items: the one proxy actor stands in for every
+	// particle in turn, so it has no single last placement to compare.
+	bool moved = true;
+	if (!iterated)
+	{
+		PlacedPose pose;
+		pose.GeometryIndex = geometryIndex;
+		memcpy(pose.Transform, instance.Transform, sizeof(pose.Transform));
+		auto previous = PreviousPoses.find(actor);
+		moved = (previous == PreviousPoses.end()) || previous->second != pose;
+		CurrentPoses[actor] = pose;
+
+		if (previous != PreviousPoses.end())
+		{
+			instance.HasPrevious = true;
+			memcpy(instance.PreviousTransform, previous->second.Transform, sizeof(instance.PreviousTransform));
+		}
+	}
+
+	instance.Mask = mask;
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, (moved || isSprite) ? 1.0f : 0.0f);
+	Instances.push_back(instance);
+}
+
+// A render iterator's items, each placed as the actor it hands out. The
+// engine's own loop: Init with the viewer, then First, IsDone, Next, and
+// CurrentItem for each - which for Deus Ex's particles moves the one proxy
+// actor to the particle and sets its size and glow, and for a dead particle
+// hands back the generator, which draws nothing.
+void LevelScene::PlaceIterated(AActor* actor, uint32_t mask, PlaceCounts& counts)
+{
+	URenderIterator* iterator = actor->RenderInterface;
+	APlayerPawn* camera = Cast<APlayerPawn>(ViewActor);
+	if (!camera)
+		return;
+
+	iterator->Init(camera);
+	int items = 0;
+	for (iterator->First(); !iterator->IsDone() && items < MaxIteratedItems; iterator->Next(), items++)
+	{
+		AActor* item = iterator->CurrentItem();
+		// A generator turns its particles off by hiding the proxy.
+		if (!item || item == actor || item->bHidden)
+			continue;
+		PlaceActor(item, mask, true, counts);
+	}
+}
+
 void LevelScene::CollectDynamic(ULevel* level)
 {
 	guard(LevelScene::CollectDynamic);
@@ -1676,7 +1845,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 	// Counted so the log can say what kind of thing is actually being placed.
 	// "403 instances" never distinguished a room full of furniture from a room
 	// full of people, which is the whole question here.
-	int brushCount = 0, meshCount = 0, animatedCount = 0, skippedMesh = 0, hiddenCount = 0;
+	PlaceCounts counts;
+	int hiddenCount = 0;
 
 	for (int g = 0; g < StaticGeometries; g++)
 	{
@@ -1714,144 +1884,30 @@ void LevelScene::CollectDynamic(ULevel* level)
 		// drawing it fills the screen with the inside of JC's chest - flat brown
 		// standing still, an arm sweeping past when the run animation plays. The
 		// mesh is the right size; a first person camera is simply inside it,
-		// which is why the engine never draws your own pawn.
-		if (actor == ViewActor)
-			continue;
+		// which is why the engine never draws your own pawn - unless the view is
+		// from behind, as a third person conversation's is. Skipping it outright
+		// left JC out of every cutscene and every mirror. A mirror, and anything
+		// else that bounces, still sees him; only the view itself and shadows
+		// do not, the second because the light augmentation shines from inside
+		// him. What only the owner may not see is the same.
+		uint32_t mask = InstanceSeenByAll;
+		if (actor == ViewActor && !ViewFromBehind)
+			mask = InstanceSeenReflected;
 		if (actor->bOwnerNoSee && actor->Owner == ViewActor)
-			continue;
+			mask = InstanceSeenReflected;
 		if (actor->bOnlyOwnerSee && actor->Owner != ViewActor)
 			continue;
 
-		int geometryIndex = -1;
-		FVector scale(1.0f, 1.0f, 1.0f);
-		const bool isCharacterActor = (actor->DrawType == DT_Mesh && actor->Mesh && actor->Mesh->AnimFrames > 1);
+		// Particles. A render iterator hands out one actor moved and scaled in
+		// turn to each of its items, the way the engine draws them, and the
+		// actor carrying it is drawn as well as whatever it lists. Deus Ex's
+		// steam, smoke and sparks come this way, and so do its laser beams.
+		// Left out, the engine's own sprite for each particle was all there
+		// was, pasted over the picture with nothing in front of it.
+		if (actor->RenderInterface)
+			PlaceIterated(actor, mask, counts);
 
-		if (actor->DrawType == DT_Brush && actor->Brush)
-		{
-			brushCount++;
-			// Movers. The engine keeps the brush in its own space and moves the
-			// actor, which is exactly the instancing an acceleration structure
-			// wants - the geometry is built once and only the transform moves.
-			geometryIndex = GeometryForBrush(actor->Brush);
-		}
-		else if (actor->DrawType == DT_Mesh && actor->Mesh)
-		{
-			// Vertex animation: the mesh holds every frame end to end, and
-			// AnimFrame picks one. Quantised into a fixed number of buckets
-			// rather than taken as it comes: a bottom level structure is built
-			// per distinct pose, and an animating character walks through a new
-			// one every frame, so the unquantised value builds structures
-			// without bound until the cache fills and actors start vanishing.
-			// AnimFrame is a fraction of the actor's CURRENT sequence, not of the
-			// mesh's whole frame list. Spreading it over every frame the mesh
-			// owns picks a pose out of whatever animation happens to live at that
-			// offset, which is why characters cycled through unrelated motions.
-			int frameA = 0, frameB = 0;
-			float alpha = 0.0f;
-			AnimationPose(actor->Mesh, actor->AnimSequence, actor->AnimFrame, frameA, frameB, alpha);
-
-			// MultiSkins is where a character's appearance lives. Deliberately
-			// NOT actor->Texture: on a pawn that is the editor's sprite icon -
-			// S_Pawn, a little green man - and letting it override the skins
-			// paints every character in the game the colour of an icon.
-			// The order UMesh::GetTexture uses: the actor's per-material skin
-			// first, then the mesh's own list, then the actor's single Skin
-			// override. Taking only MultiSkins left anything that uses Skin -
-			// the street signs among them - with no texture at all, falling
-			// back to one averaged colour.
-			//
-			// Deliberately not actor->Texture: on a pawn that is the editor's
-			// S_Pawn sprite icon.
-			UTexture* skins[8] = {};
-			for (int i = 0; i < 8; i++)
-			{
-				// GetSkin first, which is what UMesh::GetTexture does and what
-				// reading MultiSkins directly skips. It is virtual, so a class
-				// may answer differently from what the array holds.
-				if (actor->GetSkin(i))
-					skins[i] = actor->GetSkin(i);
-				else if (actor->MultiSkins[i])
-					skins[i] = actor->MultiSkins[i];
-				else if (i != 0 && i < actor->Mesh->Textures.Num() && actor->Mesh->Textures(i))
-					skins[i] = actor->Mesh->Textures(i);
-				else if (actor->Skin)
-					skins[i] = actor->Skin;
-				else if (i < actor->Mesh->Textures.Num())
-					skins[i] = actor->Mesh->Textures(i);
-			}
-
-			// Something that animates is rebuilt each frame at its exact pose;
-			// anything with a single frame is a shape that can be shared.
-			const float styleKind = KindFromStyle(actor->Style);
-			const FCoords toLocal = ActorToLocal(actor);
-
-			if (actor->Mesh->AnimFrames > 1)
-				geometryIndex = AnimatedGeometryFor(actor, actor->Mesh, frameA, frameB, alpha, skins, styleKind, &toLocal);
-			else
-				geometryIndex = GeometryForMesh(actor->Mesh, frameA, frameB, 0.0f, skins, -1, styleKind, nullptr, nullptr, actor);
-			if (geometryIndex < 0)
-				skippedMesh++;
-			else
-			{
-				meshCount++;
-				// More than one animation frame means something that moves:
-				// a person, rather than a chair.
-				if (actor->Mesh->AnimFrames > 1)
-					animatedCount++;
-			}
-			const float s = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
-			scale = FVector(s, s, s);
-		}
-
-		float spriteTransform[12];
-		const bool isSprite = actor->DrawType == DT_Sprite || actor->DrawType == DT_SpriteAnimOnce;
-		if (isSprite && !PlaceSprite(actor, geometryIndex, spriteTransform))
-			continue;
-
-		if (geometryIndex < 0)
-			continue;
-
-		SceneInstance instance;
-		instance.GeometryIndex = geometryIndex;
-		// A brush and a mesh take the pre-pivot in opposite directions. For a
-		// brush it comes off the points before the rotation, the way
-		// ABrush::ToWorld spells out; for a mesh actor it offsets the drawn mesh
-		// instead. Measured both ways round: with one sign the seated characters
-		// sit correctly and the doors ride up, with the other the reverse.
-		const bool isBrush = (actor->DrawType == DT_Brush && actor->Brush);
-		const FVector prePivot = isBrush ? -actor->PrePivot : actor->PrePivot;
-		if (isSprite)
-			memcpy(instance.Transform, spriteTransform, sizeof(instance.Transform));
-		else
-			MakeTransform(actor->Location, actor->Rotation, scale, prePivot, instance.Transform);
-		// A sprite is lit by nothing, so its instance carries its glow where
-		// anything else carries the zone's ambient. The engine draws it at
-		// ScaleGlow brightness, which is how effects fade out. An unlit mesh
-		// carries its own brightness the same way: see UnlitMeshGlow.
-		const float glow = isSprite ? Clamp((float)actor->ScaleGlow, 0.0f, 4.0f) : UnlitMeshGlow(actor);
-		const vec3 ambient = (isSprite || actor->bUnlit) ? vec3(glow, glow, glow) : ZoneAmbient(actor->Region.Zone);
-
-		// Did this actor actually move or change shape since the last frame?
-		// The trace uses it to throw away the accumulated history of the pixels
-		// covering it. Judging that from the hit position alone needed a
-		// distance tolerance, and anything moving slower than the tolerance -
-		// a medical bot crossing a room - kept its history and smeared.
-		PlacedPose pose;
-		pose.GeometryIndex = geometryIndex;
-		memcpy(pose.Transform, instance.Transform, sizeof(pose.Transform));
-		auto previous = PreviousPoses.find(actor);
-		const bool moved = (previous == PreviousPoses.end()) || previous->second != pose;
-		CurrentPoses[actor] = pose;
-
-		if (previous != PreviousPoses.end())
-		{
-			instance.HasPrevious = true;
-			memcpy(instance.PreviousTransform, previous->second.Transform, sizeof(instance.PreviousTransform));
-		}
-
-		instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, (moved || isSprite) ? 1.0f : 0.0f);
-		Instances.push_back(instance);
-
+		PlaceActor(actor, mask, false, counts);
 	}
 
 	CollectDecals(level);
@@ -1871,7 +1927,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 	{
 		SummaryLogged = true;
 		debugf(TEXT("PathTracer placed: %d movers, %d meshes (%d animated), %d meshes skipped, %d hidden"),
-			brushCount, meshCount, animatedCount, skippedMesh, hiddenCount);
+			counts.Brushes, counts.Meshes, counts.Animated, counts.Skipped, hiddenCount);
 	}
 
 	unguard;
@@ -1890,8 +1946,9 @@ void LevelScene::AddViewModel()
 {
 	guard(LevelScene::AddViewModel);
 
+	// Seen from behind, the view is not from the eyes it would be drawn at.
 	APawn* pawn = Cast<APawn>(ViewActor);
-	if (!pawn || !pawn->Weapon)
+	if (!pawn || !pawn->Weapon || ViewFromBehind)
 		return;
 
 	AInventory* item = pawn->Weapon;
@@ -1951,6 +2008,7 @@ void LevelScene::AddViewModel()
 
 	SceneInstance instance;
 	instance.GeometryIndex = geometryIndex;
+	instance.Mask = InstanceSeenByView;
 	for (int col = 0; col < 3; col++)
 	{
 		instance.Transform[0 * 4 + col] = axes[col].X * scale;

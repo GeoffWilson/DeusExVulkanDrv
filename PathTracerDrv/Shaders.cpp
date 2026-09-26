@@ -110,6 +110,14 @@ std::string Shaders::Trace()
 
 		#define GlossBounces (Counts.z >> 8u)
 
+		// Which instances each kind of ray sees, against SceneInstance::Mask.
+		// The view's own rays and shadows miss the viewer's body while the
+		// camera is inside it (0x02); whatever has bounced - a mirror's view
+		// among them - misses the first person weapon (0x04).
+		const uint ViewRays = 0xFDu;
+		const uint BouncedRays = 0xFBu;
+		const uint ShadowRays = 0xFDu;
+
 		// Does this point on the triangle actually exist? UE1 masked art keys
 		// transparency to palette index zero, which the upload turns into an
 		// alpha of zero. Rendering those texels rather than seeing through them
@@ -489,7 +497,7 @@ std::string Shaders::Trace()
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, topLevel,
 				gl_RayFlagsTerminateOnFirstHitEXT | ((Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : 0u),
-				0xFF, origin, Params.z, dir, dist);
+				ShadowRays, origin, Params.z, dir, dist);
 			// A hole in a grate lets light through, so a candidate only counts
 			// as occluding once its texel is known to be there.
 			// Light passes through glass and through the holes in a grate, so a
@@ -970,7 +978,10 @@ std::string Shaders::Trace()
 						passedCount = 0u;
 					passingThrough = false;
 					rayQueryEXT rq;
-					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, 0xFF, origin, rayMin, direction, 100000.0);
+					// The view's own ray until it first bounces: passing through
+					// glass or into the sky zone keeps it at bounce zero.
+					uint cullMask = (lobePass == 0 && bounce == 0u) ? ViewRays : BouncedRays;
+					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, cullMask, origin, rayMin, direction, 100000.0);
 					while (rayQueryProceedEXT(rq))
 					{
 						// Only geometry holding masked or translucent art is

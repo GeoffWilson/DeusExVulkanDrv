@@ -460,7 +460,7 @@ void AccelStructure::WriteInstances(const SceneData& scene, FrameUploads& upload
 		// The custom index is how the trace shader finds this instance's
 		// shading data: it is the offset of its geometry's attributes.
 		dst.instanceCustomIndex = Bottom[src.GeometryIndex].AttributeBase;
-		dst.mask = (HideStatic && src.GeometryIndex < scene.StaticGeometries) ? 0x00 : 0xFF;
+		dst.mask = (HideStatic && src.GeometryIndex < scene.StaticGeometries) ? 0x00 : (src.Mask & 0xFF);
 		dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 		// A shape with no triangles has no structure, and is placed with a
 		// null one, which traces as nothing.

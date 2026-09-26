@@ -592,6 +592,7 @@ bool Helper::Batch()
 				memcpy(instance.Transform, w.Transform, sizeof(w.Transform));
 				memcpy(instance.PreviousTransform, w.PreviousTransform, sizeof(w.PreviousTransform));
 				instance.HasPrevious = w.HasPrevious != 0;
+				instance.Mask = w.Mask;
 				instance.Ambient = w.Ambient;
 			}
 			break;

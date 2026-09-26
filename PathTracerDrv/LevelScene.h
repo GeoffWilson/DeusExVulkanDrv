@@ -45,6 +45,17 @@ private:
 	int GeometryForSprite(UTexture* texture, float kind);
 	bool PlaceSprite(AActor* actor, int& geometryIndex, float transform[12]);
 
+	// What was placed, for the log.
+	struct PlaceCounts
+	{
+		int Brushes = 0, Meshes = 0, Animated = 0, Skipped = 0;
+	};
+	void PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCounts& counts);
+	void PlaceIterated(AActor* actor, uint32_t mask, PlaceCounts& counts);
+	// A particle generator holds 64; this is only a guard against an iterator
+	// that never says it is done.
+	static const int MaxIteratedItems = 1024;
+
 	// Decals - bullet holes, blood, scorch marks - which the engine attaches to
 	// level surfaces while the game runs, so a world built once at load never
 	// had them. Gathered into one geometry, rebuilt when the set changes.
@@ -125,6 +136,10 @@ public:
 	// Whose eyes this is being traced from. Set each frame from the scene node's
 	// viewport, and used to apply the engine's owner visibility rules.
 	AActor* ViewActor = nullptr;
+	// The view is from behind the viewer rather than from its eyes - a third
+	// person conversation - so its own body is drawn like anyone else's and
+	// its first person weapon is not.
+	bool ViewFromBehind = false;
 
 	// The view's own basis, as world space directions: X right, Y down,
 	// Z forward, which is how the engine orients a scene node. Needed to place

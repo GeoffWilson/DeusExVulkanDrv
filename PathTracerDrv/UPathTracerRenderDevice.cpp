@@ -908,6 +908,8 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// Whose view this is, so the actor collection can skip the player's own body
 	// and honour the owner-only visibility flags.
 	Scene.ViewActor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
+	APlayerPawn* viewer = Cast<APlayerPawn>(Scene.ViewActor);
+	Scene.ViewFromBehind = viewer && viewer->bBehindView;
 
 	// The view's basis, kept for placing the first person weapon.
 	Scene.ViewOrigin = Frame->Coords.Origin;
@@ -1841,6 +1843,23 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 
 	if (!Textures || TraceWidth <= 0 || TraceHeight <= 0)
 		return;
+
+	// A sprite in the level - a sprite actor, or one of a particle system's
+	// particles - which the engine draws here with the span buffer it found
+	// it visible through. The trace has these already, placed where walls hide
+	// them; drawn here too they were pasted over the picture, the steam from a
+	// vent showing through the side of a building. What the canvas draws - the
+	// HUD, the menus, the effects over the weapon - comes without a span.
+	if (Span)
+	{
+		if (!LoggedWorldSprite)
+		{
+			debugf(TEXT("PathTracer: the engine's sprites in the level are left to the trace (first: %s at depth %.1f)"),
+				Info.Texture ? Info.Texture->GetFullName() : TEXT("no texture"), Z);
+			LoggedWorldSprite = true;
+		}
+		return;
+	}
 
 	// A texture can carry PF_Masked itself rather than the caller passing it.
 	// Modulated art is excluded: its transparency is carried by the grey level

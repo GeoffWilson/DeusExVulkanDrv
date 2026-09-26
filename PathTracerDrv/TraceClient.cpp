@@ -240,6 +240,7 @@ void TraceClient::Instances(const std::vector<SceneInstance>& instances, int sta
 		WireInstance w = {};
 		w.GeometryIndex = instances[i].GeometryIndex;
 		w.HasPrevious = instances[i].HasPrevious ? 1 : 0;
+		w.Mask = instances[i].Mask;
 		memcpy(w.Transform, instances[i].Transform, sizeof(w.Transform));
 		memcpy(w.PreviousTransform, instances[i].PreviousTransform, sizeof(w.PreviousTransform));
 		w.Ambient = instances[i].Ambient;

@@ -182,6 +182,9 @@ private:
 	std::vector<uint32_t> Pixels;
 	int TextureFailuresLogged = 0;
 	bool TracerLost = false;
+	// Said once in the log, so it can be seen that the engine's own sprites
+	// in the level are arriving and being left to the trace: see DrawTile.
+	bool LoggedWorldSprite = false;
 
 	// PT DENOISE, PT DLSS and PT MATERIALS, for the session; the helper
 	// follows.

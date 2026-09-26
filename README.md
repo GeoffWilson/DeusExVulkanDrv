@@ -103,9 +103,13 @@ straight out of `UModel` and the actor list:
   facial animation and attachments come out as the game draws them, and shaded
   with normals smoothed across their faces the way the engine smooths them, so
   a low polygon mesh looks as rounded as it does in the original;
-- sprites, decals, environment mapped meshes, the first person weapon, and
-  animated and procedural textures (fire, water, and the "wet" textures that
-  ripple another texture);
+- sprites, particles (steam, smoke and sparks, and the laser beams, which the
+  engine draws through a render iterator), decals, environment mapped meshes,
+  the first person weapon, and animated and procedural textures (fire, water,
+  and the "wet" textures that ripple another texture);
+- the player: left out of the view from their own eyes, as the engine leaves
+  it out, but seen in mirrors and anything else that reflects, and drawn in
+  full when a conversation's camera looks on from outside;
 - the skybox, seen through the sky zone's own viewpoint as the engine draws it.
 
 The static world is built into a bottom level acceleration structure once per
