@@ -996,30 +996,51 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 
 	EnsureSceneBuilt(Frame->Level);
 
-	// The engine projects a point as X * Proj.Z / Z, so Proj.Z carries the field
-	// of view this node is actually rendered with - including the cinematic
-	// cameras, which do not use the player's FovAngle.
-	float halfWidth;
-	if (Frame->Proj.Z > 0.0f)
-		halfWidth = Frame->FX / (2.0f * Frame->Proj.Z);
-	else
-		halfWidth = 1.0f;
-	float halfHeight = halfWidth * Frame->FY / Frame->FX;
-
-	// That field of view is horizontal: FovAngle across the screen, whatever
-	// the screen's shape. On one wider than 4:3 the engine keeps the width and
-	// crops the top and bottom - at 21:9 its 75 degrees shows under 60% of the
-	// height it does at 4:3, and the conversations and cinematics, framed for
-	// 4:3, lose heads and feet. The raster devices can do nothing about it:
-	// they draw what the engine has already projected, and it projects only
-	// what fits its own view. The trace builds the view from the level itself,
-	// so it can keep the height the same FovAngle gives at 4:3 and widen the
-	// view to fill the screen instead. A screen 4:3 or narrower is left as the
-	// engine has it.
-	if (WidescreenFovEnabled && Frame->FX * 3.0f > Frame->FY * 4.0f)
+	// The engine projects a point as X * Proj.Z / Z: Proj.Z is the focal
+	// length in pixels, and carries the field of view this node is actually
+	// rendered with - including the cinematic cameras', which do not use the
+	// player's FovAngle. That field of view spans the frame's width.
+	//
+	// The camera is built from it over the whole trace rather than from the
+	// frame's size. The frame can be a strip of the screen - a conversation
+	// narrows it to the space between its black bars - and the trace can be
+	// wider than the engine's view, when the UI is pinned. Either way the view
+	// stays centred, and one focal length describes all of it.
+	float halfWidth = 1.0f;
+	float halfHeight = (float)TraceHeight / (float)TraceWidth;
+	if (Frame->Proj.Z > 0.0f && Frame->FX > 0.0f && Viewport && Viewport->SizeY > 0)
 	{
-		halfHeight = halfWidth * 0.75f;
-		halfWidth = halfHeight * Frame->FX / Frame->FY;
+		float focal = Frame->Proj.Z;
+		const float tanHalfFov = Frame->FX / (2.0f * focal);
+		const float screenX = (float)Viewport->SizeX, screenY = (float)Viewport->SizeY;
+
+		// That field of view is horizontal: FovAngle across the screen, whatever
+		// the screen's shape. On one wider than 4:3 the engine keeps the width and
+		// crops the top and bottom - at 21:9 its 75 degrees shows under 60% of the
+		// height it does at 4:3, and the conversations and cinematics, framed for
+		// 4:3, lose heads and feet. The raster devices can do nothing about it:
+		// they draw what the engine has already projected, and it projects only
+		// what fits its own view. The trace builds the view from the level itself,
+		// so it can keep the height the same FovAngle gives at 4:3 and widen the
+		// view to fill the screen instead. A screen 4:3 or narrower is left as the
+		// engine has it.
+		if (WidescreenFovEnabled && screenX * 3.0f > screenY * 4.0f)
+			focal = Min(screenY * 0.5f / (0.75f * tanHalfFov), focal);
+
+		halfWidth = (float)TraceWidth * 0.5f / focal;
+		halfHeight = (float)TraceHeight * 0.5f / focal;
+
+		// The HUD projects the world through this frame too. The brackets
+		// around what the player can use and the augmentations' target boxes
+		// are placed by XRootWindow::ConvertVectorToCoordinates, from a copy
+		// of this node taken as the HUD is drawn, at Proj.Z. Given the trace's
+		// focal length they land on what the trace shows rather than where
+		// the engine's narrower view would have had it. The engine's own world
+		// pass runs on with it too, but everything that draws is thrown away,
+		// and the focal length only ever shortens here, drawing its points
+		// nearer the middle rather than off the edge.
+		Frame->Proj.Z = focal;
+		Frame->RProj.Z = 1.0f / focal;
 	}
 
 	// Coords, not Uncoords. FCoords transforms by dotting against its axes, so
