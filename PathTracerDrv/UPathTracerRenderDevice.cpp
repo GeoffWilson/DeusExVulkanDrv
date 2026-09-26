@@ -1297,9 +1297,17 @@ bool UPathTracerRenderDevice::SendScene()
 	// since a script can give a texture an animation chain after it was first
 	// seen. One frame of an animation shown on its own - a sprite that plays
 	// once chooses it - stays that frame: advancing it would loop it.
-	if (Viewport && Viewport->Actor && Viewport->Actor->Level)
+	//
+	// On the viewport's clock, the one the engine locks its textures with, not
+	// the level's. The engine's own world pass still runs under this device
+	// and advances every texture it draws with that clock; given the level's
+	// as well, a texture was advanced twice a frame between two different
+	// times - a chain stepping at double speed, a paced one lurching - and on
+	// the level's clock alone the animations stopped behind the pause menu,
+	// where the other devices keep them going.
+	if (Viewport)
 	{
-		const double time = Viewport->Actor->Level->TimeSeconds;
+		const double time = Viewport->CurrentTime;
 		for (size_t i = 0; i < SentTextures.size(); i++)
 		{
 			SentTexture& sent = SentTextures[i];
