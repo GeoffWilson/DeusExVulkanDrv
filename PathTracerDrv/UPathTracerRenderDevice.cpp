@@ -995,6 +995,12 @@ bool UPathTracerRenderDevice::StartTracer()
 	debugf(TEXT("PathTracer: tracing in PathTracerHelper.exe on %s%s"), *Widen(status.DeviceName),
 		status.CanSampleTextures ? TEXT("") : TEXT(", which cannot index textures: surfaces will use one averaged colour each"));
 	PathTracerEvent("helper started on %s", status.DeviceName);
+	if (LogTimings)
+	{
+		char line[256];
+		snprintf(line, sizeof(line), "PathTracer session: device built %s %s, helper on %s", __DATE__, __TIME__, status.DeviceName);
+		WriteTimingLine(line);
+	}
 	SceneReset = true;
 	TracerLost = false;
 	return true;
@@ -1082,6 +1088,15 @@ bool UPathTracerRenderDevice::SendScene()
 void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 {
 	guard(UPathTracerRenderDevice::Unlock);
+
+	// The frame as the player sees it, whatever it was spent on. A pause of a
+	// second or more - a level loading - is not a frame.
+	{
+		const double now = NowMs();
+		if (LastUnlockMs > 0.0 && now - LastUnlockMs < 1000.0)
+			FrameIntervals.push_back((float)(now - LastUnlockMs));
+		LastUnlockMs = now;
+	}
 
 	// Deliberately not conditional on HaveCamera. A frame that draws no world -
 	// a menu, or a conversation - never calls SetSceneNode, and returning here
@@ -1355,6 +1370,21 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 					Timings.Wait / n, (Timings.Total - Timings.Limit) / n, Timings.Limit / n,
 					(int)Scene.Instances.size(), (int)Scene.Textures.size(), Scene.MeshBuilds);
 				WriteTimingLine(line);
+				if (!FrameIntervals.empty())
+				{
+					// The 1% low is the frame rate the slowest one frame in a
+					// hundred ran at: the 99th percentile frame.
+					std::vector<float> sorted = FrameIntervals;
+					std::sort(sorted.begin(), sorted.end());
+					double sum = 0.0;
+					for (float f : sorted)
+						sum += f;
+					const double average = sum / sorted.size();
+					const float slow = sorted[std::min(sorted.size() - 1, (size_t)(sorted.size() * 0.99))];
+					snprintf(line, sizeof(line), "PathTracer frames: %.2f ms average, %.1f fps, 1%% low %.1f fps (%.2f ms), over %d frames",
+						average, 1000.0 / average, 1000.0 / slow, slow, (int)sorted.size());
+					WriteTimingLine(line);
+				}
 				if (Timings.GpuFrames > 0 && Tracer)
 				{
 					const double g = Timings.GpuFrames;
@@ -1368,6 +1398,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			}
 			const int logged = Timings.Logged;
 			Timings = FrameTimings();
+			FrameIntervals.clear();
 			Timings.Logged = logged;
 		}
 

@@ -232,6 +232,10 @@ private:
 		int GpuFrames = 0;
 		int Logged = 0;
 	} Timings;
+	// Every frame's length, Unlock to Unlock, for the frame rate and the
+	// slowest frames in the timings log.
+	std::vector<float> FrameIntervals;
+	double LastUnlockMs = 0.0;
 	uint32_t FrameIndex = 0;
 
 	bool HaveCamera = false;
