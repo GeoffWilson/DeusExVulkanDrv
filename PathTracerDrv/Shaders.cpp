@@ -641,6 +641,7 @@ std::string Shaders::Trace()
 			float chosenWeight = 0.0;
 			vec3 chosenDir = vec3(0.0);
 			float chosenDistance = 0.0;
+			bool chosenBehind = false;
 			vec3 chosenValue = vec3(0.0);
 			vec3 chosenBase = vec3(0.0);
 
@@ -676,13 +677,16 @@ std::string Shaders::Trace()
 
 				vec3 dir = toLight / distance;
 				float cosTheta = dot(normal, dir);
-				if (cosTheta <= 0.0)
+				// A mesh takes light from behind it too: the engine's sheen
+				// needs no more than the light lying along the surface.
+				bool mesh = meshGlow >= 0.0;
+				if (cosTheta <= 0.0 && !mesh)
 					continue;
 				// Non incidence: as bright on a surface edge on as face on.
 				if (light.Flags.x > 0.5)
 					cosTheta = 1.0;
 				// A mesh as the engine lights one; see meshResponse.
-				float response = meshGlow >= 0.0 ? meshResponse(cosTheta, dir, normal, viewDir) * meshGlow : cosTheta;
+				float response = mesh ? meshResponse(cosTheta, dir, normal, viewDir) * meshGlow : cosTheta;
 				if (response <= 0.0)
 					continue;
 
@@ -767,7 +771,11 @@ std::string Shaders::Trace()
 
 				float falloff = 1.0 - reach / radius;
 
-				vec3 base = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * spot * disco);
+				// A mesh's light is summed as the engine sums it, in the colours
+				// as displayed - the engine's lighting arithmetic is all done on
+				// them - and made linear once the sum is clamped: see the end.
+				vec3 colour = mesh ? pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) : light.ColorBrightness.rgb;
+				vec3 base = colour * (light.ColorBrightness.a * falloff * spot * disco);
 				vec3 value = base * response;
 				float weight = luminance(value);
 				if (weight <= 0.0)
@@ -785,6 +793,7 @@ std::string Shaders::Trace()
 					chosenWeight = weight;
 					chosenDir = dir;
 					chosenDistance = distance;
+					chosenBehind = cosTheta <= 0.0;
 					chosenValue = value;
 					chosenBase = base;
 				}
@@ -795,8 +804,9 @@ std::string Shaders::Trace()
 				if (anyChanging)
 					litByChangingLight = true;
 				// The engine clamps a mesh's light at each vertex to one: a lit
-				// mesh is never drawn brighter than its texture.
-				return meshGlow >= 0.0 ? min(total, vec3(1.0)) : total;
+				// mesh is never drawn brighter than its texture. Then linear,
+				// like every other colour the engine gives.
+				return meshGlow >= 0.0 ? pow(min(total, vec3(1.0)), vec3(2.2)) : total;
 			}
 
 			if (chosen < 0 || chosenWeight <= 0.0)
@@ -826,7 +836,11 @@ std::string Shaders::Trace()
 				shadowDistance = length(toTarget);
 				shadowDir = toTarget / shadowDistance;
 			}
-			if (occluded(position, shadowDir, shadowDistance - Params.z * 2.0))
+			// A light behind a mesh reaches it only as the engine's sheen, which
+			// a shadow ray could not show: it would start into the mesh itself.
+			// The engine never shadows a mesh at all, so that part is left
+			// unshadowed.
+			if (!chosenBehind && occluded(position, shadowDir, shadowDistance - Params.z * 2.0))
 				return vec3(0.0);
 
 			// Divide by the probability it was chosen with, which is its share
@@ -836,11 +850,11 @@ std::string Shaders::Trace()
 			float scale = weightSum / chosenWeight;
 			lightDirection = chosenDir;
 			lightBase = chosenBase * scale;
-			// Clamped for a mesh as the engine clamps it. The estimate is the
-			// total in proportion, sampled by its weight, so clamping it clamps
-			// the total near enough.
+			// For a mesh, clamped as the engine clamps it and then made linear.
+			// The estimate is the total in proportion, sampled by its weight,
+			// so clamping it clamps the total near enough.
 			vec3 direct = chosenValue * scale;
-			return meshGlow >= 0.0 ? min(direct, vec3(1.0)) : direct;
+			return meshGlow >= 0.0 ? pow(min(direct, vec3(1.0)), vec3(2.2)) : direct;
 		}
 	)";
 

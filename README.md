@@ -169,9 +169,12 @@ source and was read by disassembly:
 - lit meshes as the engine lights them, not as a flat surface is: by
   (N.L + 1)^2 - 1.5 rather than N.L, which leaves a character brighter and
   flatter under a lamp and falling into shadow more sharply, with a sheen
-  where a light lies along the surface beyond it, scaled by 1.4 times the
-  actor's ScaleGlow and clamped so a mesh is never lit past its texture.
-  `PT MESHLIGHT` lights them as flat surfaces instead, to compare.
+  where a light lies along the surface beyond it - from behind the surface
+  too - scaled by 1.4 times the actor's ScaleGlow. Summed in the colours as
+  displayed, as the engine does its arithmetic, clamped so a mesh is never
+  lit past its texture, then made linear. Unlike the engine's, the meshes
+  keep their shadows from the lights in front of them. `PT MESHLIGHT` lights
+  them as flat surfaces instead, to compare.
 
 Each shaded point samples one light, chosen in proportion to its contribution
 from the lights listed for its cell of a uniform grid over the level, and fires
