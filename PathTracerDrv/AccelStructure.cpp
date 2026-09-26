@@ -138,6 +138,7 @@ void AccelStructure::SyncGeometry(const SceneData& scene, FrameUploads& uploads)
 			level.AttributeBase = (uint32_t)AllAttributes.size();
 
 			const SceneGeometry& geometry = scene.Geometries[i];
+			level.AttributeSlots = geometry.Attributes.size();
 			AllAttributes.insert(AllAttributes.end(), geometry.Attributes.begin(), geometry.Attributes.end());
 
 			if (geometry.Dynamic)
@@ -631,6 +632,7 @@ void AccelStructure::WriteDynamicGeometry(const SceneData& scene, FrameUploads& 
 	if (!haveDynamic)
 		return;
 
+	bool attributesGrew = false;
 	const size_t count = std::min(Bottom.size(), scene.Geometries.size());
 	for (size_t i = 0; i < count; i++)
 	{
@@ -657,10 +659,20 @@ void AccelStructure::WriteDynamicGeometry(const SceneData& scene, FrameUploads& 
 		level.TriangleCount = (int)(geometry.Positions.size() / 3);
 		uploads.Upload(level.Vertices.get(), 0, geometry.Positions.data(), geometry.Positions.size() * sizeof(vec3));
 
+		// More triangles than its slot holds: a new slot at the end, with room
+		// to grow again. The old one is left unused until the level changes;
+		// writing past it would overwrite the shape after it.
+		if (geometry.Attributes.size() > level.AttributeSlots)
+		{
+			level.AttributeSlots = std::max<size_t>(geometry.Attributes.size() * 2, 64);
+			level.AttributeBase = (uint32_t)AllAttributes.size();
+			AllAttributes.resize(AllAttributes.size() + level.AttributeSlots);
+			attributesGrew |= EnsureAttributeCapacity(AllAttributes.size(), uploads);
+		}
+
 		// The normals moved with the pose, so this actor's slice of the shading
 		// data is stale too.
-		const size_t attributeCount = std::min(geometry.Attributes.size(),
-			AllAttributes.size() - level.AttributeBase);
+		const size_t attributeCount = geometry.Attributes.size();
 		if (attributeCount > 0 && AttributeBuffer)
 		{
 			memcpy(&AllAttributes[level.AttributeBase], geometry.Attributes.data(),
@@ -669,6 +681,10 @@ void AccelStructure::WriteDynamicGeometry(const SceneData& scene, FrameUploads& 
 				geometry.Attributes.data(), attributeCount * sizeof(TriangleAttributes));
 		}
 	}
+
+	// A buffer made bigger starts empty, and holds everything once filled.
+	if (attributesGrew && AttributeBuffer)
+		uploads.Upload(AttributeBuffer.get(), 0, AllAttributes.data(), AllAttributes.size() * sizeof(TriangleAttributes));
 
 	unguard;
 }

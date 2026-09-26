@@ -171,7 +171,9 @@ int main(int argc, char** argv)
 			}
 
 		// Geometry 2 is a small cube, placed three hundred times at once
-		// around the edge of the floor, with a dim light over each.
+		// around the edge of the floor, with a dim light over each. Both arrive
+		// after geometry 1, so its growing later has to move its shading data
+		// rather than write over theirs.
 		SceneGeometry cube;
 		AddBox(cube, vec3(-6, -6, 0), vec3(6, 6, 12), vec3(0.9f, 0.8f, 0.2f));
 		std::vector<SceneInstance> ring;

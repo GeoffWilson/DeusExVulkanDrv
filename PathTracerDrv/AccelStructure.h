@@ -71,6 +71,10 @@ private:
 		std::unique_ptr<VulkanAccelerationStructure> Structure;
 		std::unique_ptr<VulkanBuffer> Scratch;
 		uint32_t AttributeBase = 0;
+		// How many triangles' attributes that slot holds. A dynamic shape that
+		// grows past it - decals being added, a character changing its skin -
+		// moves to a bigger slot at the end rather than writing over the next.
+		size_t AttributeSlots = 0;
 		int TriangleCount = 0;
 		// Rebuilt whenever its pose changes rather than built once and
 		// instanced. An animated character's shape genuinely changes.
