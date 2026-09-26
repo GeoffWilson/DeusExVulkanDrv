@@ -166,6 +166,7 @@ private:
 	void CreateTilePipeline();
 	void RenderTiles(VulkanCommandBuffer* commands);
 	void CreateBrightnessPipeline();
+	void DescribeLightingOf(AActor* target);
 	void ApplyBrightness(VulkanCommandBuffer* commands);
 	void EnsureSceneBuilt(ULevel* level);
 	// Whether the engine has collected garbage since last asked, told by a

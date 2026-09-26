@@ -395,7 +395,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   crosshair, is drawn - its style, glow, skins, and every material's flags and
   texture, including what is in the texture and what it counts as being made
   of. For the level itself, `PT LOOK` names the surface's texture, its group and
-  its material.
+  its material. For an actor it also lists the lights in its reach, with their
+  own values and the trace's, and what a surface of it facing them would get.
 - `PT VIEW NORMALS | DEPTH | MOTION | DIFFUSE | SPECULAR | EMISSION | ALBEDO |
   HITDIST | HISTORY | MATERIAL`: shows one of the denoiser's inputs, how many
   frames each pixel has averaged, or each surface's material (red roughness,

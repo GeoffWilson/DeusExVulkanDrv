@@ -490,6 +490,58 @@ static void DescribeActor(AActor* actor, UMesh* mesh)
 	}
 }
 
+// What lights an actor, for comparing the trace's lighting of a mesh with
+// the engine's. Each light actor in reach with the values its author set,
+// then the trace's own record of each light in reach and what the shader
+// makes of a surface of the actor facing it square on: the engine's mesh
+// response there is 2.5, scaled by 1.4 times the actor's ScaleGlow, summed
+// in the colours as displayed, clamped to one and then made linear.
+// Measured at the actor's origin, and without shadows.
+void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
+{
+	ULevel* level = target->XLevel;
+	if (!level)
+		return;
+	debugf(TEXT("PT: lighting of %s at %.0f %.0f %.0f, ScaleGlow %.2f, AmbientGlow %d"), target->GetName(),
+		target->Location.X, target->Location.Y, target->Location.Z, (float)target->ScaleGlow, (int)target->AmbientGlow);
+	for (INT i = 0; i < level->Actors.Num(); i++)
+	{
+		AActor* light = level->Actors(i);
+		if (!light || light->bDeleteMe || light->LightType == LT_None)
+			continue;
+		const float radius = light->LightRadius * 25.0f;
+		const float distance = (light->Location - target->Location).Size();
+		if (distance >= radius)
+			continue;
+		debugf(TEXT("  light %s (%s): type %d effect %d brightness %d hue %d saturation %d LightRadius %d (%.0f) distance %.0f falloff %.3f special %d"),
+			light->GetName(), light->GetClass()->GetName(), (int)light->LightType, (int)light->LightEffect, (int)light->LightBrightness,
+			(int)light->LightHue, (int)light->LightSaturation, (int)light->LightRadius, radius, distance, 1.0f - distance / radius,
+			(int)light->bSpecialLit);
+	}
+	const float meshScale = 1.4f * (float)target->ScaleGlow;
+	float total[3] = {};
+	for (size_t i = 0; i < Scene.Lights.size(); i++)
+	{
+		const SceneLight& light = Scene.Lights[i];
+		const FVector position(light.PositionRadius.x, light.PositionRadius.y, light.PositionRadius.z);
+		const float radius = fabs(light.PositionRadius.w);
+		const float distance = (position - target->Location).Size();
+		if (distance >= radius)
+			continue;
+		const float falloff = 1.0f - distance / radius;
+		const float scale = light.ColorBrightness.w * falloff * 2.5f * meshScale;
+		const float facing[3] = { powf(light.ColorBrightness.x, 1.0f / 2.2f) * scale, powf(light.ColorBrightness.y, 1.0f / 2.2f) * scale,
+			powf(light.ColorBrightness.z, 1.0f / 2.2f) * scale };
+		for (int c = 0; c < 3; c++)
+			total[c] += facing[c];
+		debugf(TEXT("  traced light %d: colour %.3f %.3f %.3f brightness %.3f radius %.0f distance %.0f falloff %.3f pattern %.0f -> facing %.3f %.3f %.3f"),
+			(int)i, light.ColorBrightness.x, light.ColorBrightness.y, light.ColorBrightness.z, light.ColorBrightness.w,
+			radius, distance, falloff, light.Flags.w, facing[0], facing[1], facing[2]);
+	}
+	debugf(TEXT("  facing every light: %.3f %.3f %.3f as displayed, clamped and made linear %.3f %.3f %.3f"), total[0], total[1], total[2],
+		powf(Min(total[0], 1.0f), 2.2f), powf(Min(total[1], 1.0f), 2.2f), powf(Min(total[2], 1.0f), 2.2f));
+}
+
 VulkanDescriptorSet* UPathTracerRenderDevice::TileSet(CachedTexture* texture, int mode)
 {
 	std::unique_ptr<VulkanDescriptorSet>& set = texture->Sets[mode];
@@ -1910,7 +1962,10 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			FCheckResult hit;
 			player->XLevel->SingleLineCheck(hit, player, end, start, TRACE_AllColliding);
 			if (hit.Actor && hit.Actor != player->Level)
+			{
 				DescribeActor(hit.Actor, hit.Actor->Mesh);
+				DescribeLightingOf(hit.Actor);
+			}
 			// The level's own surface: its texture and what it counts as being
 			// made of, which is the name to use for an override in the ini.
 			UModel* model = player->XLevel->Model;
