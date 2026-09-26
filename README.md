@@ -93,13 +93,13 @@ crash, flushed as they happen.
 
 ### New in 1.2
 
-- **DLSS Ray Reconstruction**, NVIDIA's denoiser and upscaler, on an RTX GPU
-  (`DLSS`, `PT DLSS`); see Noise below.
+- **DLSS Ray Reconstruction**, NVIDIA's denoiser and upscaler, on an RTX GPU,
+  and the default there at Quality (`DLSS`, `PT DLSS`); see Noise below.
 - **Faster frames.** The CPU gathers and records the next frame while the GPU
   traces the last: 106 frames a second became 146 in the Hong Kong market.
 - **Wide screens.** A Hor+ field of view, cinematics and conversations framed
-  whole at any aspect, the HUD's markers on what they mark, and a HUD that can
-  be pinned to a 16:9 or 4:3 box in the middle of the screen; see Wide
+  whole on a wide screen, the HUD's markers on what they mark, and the HUD pinned
+  to a 4:3 box in the middle of the screen by default, or 16:9; see Wide
   screens below.
 - **Shadows from lights with size**, sharp where they start and softer with
   distance (`LightSize`).
@@ -204,21 +204,21 @@ what it counts as.
 
 **Noise.** One of two denoisers takes it out:
 
-- **NRD's ReLAX denoiser**, on by default. The trace splits each pixel into the
-  first solid surface it sees - through any glass or decals - and records that
-  surface's normal, depth and motion, its lighting apart from its colour, what
-  the ray picked up before reaching it, and the colours that put it back
-  together. ReLAX denoises the lighting and a final pass puts the picture back
-  together, with fog and the screen flash over it. What a mirror shows is
-  treated as a surface in its own right, where it appears to be behind the glass,
-  and denoised by a second ReLAX pass: ReLAX will not blur a perfect mirror
-  itself. Glossy reflections go through ReLAX's specular half alongside the
-  diffuse lighting. With it, **per pixel accumulation** while the view is
+- **NRD's ReLAX denoiser**, wherever DLSS cannot run. The trace splits each
+  pixel into the first solid surface it sees - through any glass or decals - and
+  records that surface's normal, depth and motion, its lighting apart from its
+  colour, what the ray picked up before reaching it, and the colours that put it
+  back together. ReLAX denoises the lighting and a final pass puts the picture
+  back together, with fog and the screen flash over it. What a mirror shows is
+  treated as a surface in its own right, where it appears to be behind the
+  glass, and denoised by a second ReLAX pass: ReLAX will not blur a perfect
+  mirror itself. Glossy reflections go through ReLAX's specular half alongside
+  the diffuse lighting. With it, **per pixel accumulation** while the view is
   still: each pixel checks that it is looking at the same instance in the same
   place as last frame, and keeps a short history where a moving shadow or an
   animated light crosses it.
 - **DLSS Ray Reconstruction**, NVIDIA's network that denoises and upscales in
-  one pass, on an RTX GPU when `DLSS` is on. It wants the noisy picture as it
+  one pass, by default at Quality, on an RTX GPU. It wants the noisy picture as it
   was traced, not the lighting split from its colour, and works the lighting
   back out from the albedos, normals, roughness, depth and motion it is given
   with it; the trace writes that set in place of NRD's. The primary rays are
@@ -292,7 +292,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	MaxAccumulatedFrames=256
 	LightScale=100
 	Denoise=True
-	DLSS=False
+	DLSS=True
 	DLSSQuality=1
 	UseVSync=True
 	VkDeviceIndex=0
@@ -303,7 +303,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	Materials=False
 	GlossBounces=1
 	WidescreenFOV=True
-	PinnedUI=0.000000
+	PinnedUI=1.333333
 	LightSize=4
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
@@ -314,9 +314,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `Denoise`: denoising from the start. `PT DENOISE` switches it for the
   session.
 - `DLSS`: denoise with DLSS Ray Reconstruction rather than NRD, where it can
-  run. `DLSSQuality` is how far it upscales: 0 DLAA (not at all), 1 Quality,
-  2 Balanced, 3 Performance, 4 Ultra Performance. `PT DLSS` switches it for the
-  session.
+  run; on by default, at Quality. `DLSSQuality` is how far it upscales: 0 DLAA
+  (not at all), 1 Quality, 2 Balanced, 3 Performance, 4 Ultra Performance.
+  `PT DLSS` switches it for the session.
 - `LogTimings`: logs where each frame's time goes, averaged every few hundred
   frames: the CPU's side and the helper's, the GPU's own time on the scene
   build, the trace, the denoiser and the pass that puts the picture back
@@ -344,7 +344,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PinnedUI`: in fullscreen, keep the HUD, menus and conversations inside a
   box of this aspect ratio in the middle of the screen, rather than spread to
   the edges of a 21:9 or 32:9 one, with the traced world still filling the
-  whole screen: 1.777778 for 16:9, 1.333333 for 4:3, 0 (the default) for the
+  whole screen: 1.333333 for 4:3 (the default), 1.777778 for 16:9, 0 for the
   whole width. The game is given a mode of that shape at the height chosen,
   so the resolution it lists is the narrower one, but the ini keeps the one
   chosen. Choosing a mode narrower still narrows the box further; with it off,

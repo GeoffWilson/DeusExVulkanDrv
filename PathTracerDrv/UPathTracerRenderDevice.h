@@ -131,11 +131,11 @@ public:
 	// as shiny as glass). PT MATERIALS switches it for the session.
 	BITFIELD UseMaterials;
 	// Denoise with NVIDIA's DLSS Ray Reconstruction rather than NRD ("DLSS"
-	// in the ini), wherever it can run - an RTX GPU, and under wine the
-	// pieces Proton provides - and with NRD wherever it cannot. It upscales
-	// as it denoises: DLSSQuality is 0 DLAA (no upscaling), 1 quality,
-	// 2 balanced, 3 performance, 4 ultra performance. PT DLSS switches it for
-	// the session and sets the quality.
+	// in the ini, on by default at Quality), wherever it can run - an RTX
+	// GPU, and under wine the pieces Proton provides - and with NRD wherever
+	// it cannot. It upscales as it denoises: DLSSQuality is 0 DLAA (no
+	// upscaling), 1 quality, 2 balanced, 3 performance, 4 ultra performance.
+	// PT DLSS switches it for the session and sets the quality.
 	BITFIELD UseDLSS;
 	INT DLSSQuality;
 	// On a screen wider than 4:3, keep the height of view the game's field of
@@ -146,9 +146,10 @@ public:
 	// In fullscreen, lay the game's own 2D - the HUD, menus, conversations and
 	// the pointer - out in a box no wider than this aspect ratio, centred, with
 	// the traced world filling the screen either side ("PinnedUI" in the ini:
-	// 1.777778 for 16:9, 1.333333 for 4:3, 0 to use the whole width). Picking a
-	// narrower mode narrows the box further; with it off, a narrower mode is
-	// letterboxed. See SetRes. PT PINNEDUI switches it for the session.
+	// 1.333333 for 4:3, the default, 1.777778 for 16:9, 0 to use the whole
+	// width). Picking a narrower mode narrows the box further; with it off, a
+	// narrower mode is letterboxed. See SetRes. PT PINNEDUI switches it for
+	// the session.
 	FLOAT PinnedUI;
 	// How big a light is, for its shadows: the radius, in world units, of the
 	// disc around each light that shadows are cast from. 0 casts them from a
@@ -218,11 +219,11 @@ private:
 	// PT DENOISE, PT DLSS, PT MATERIALS, PT WIDESCREEN and PT PINNEDUI, for
 	// the session; the helper follows.
 	bool DenoiseEnabled = false;
-	bool DlssEnabled = false;
+	bool DlssEnabled = true;
 	int DlssQualityNow = 1;
 	bool MaterialsEnabled = true;
 	bool WidescreenFovEnabled = true;
-	float PinnedAspect = 0.0f;
+	float PinnedAspect = 4.0f / 3.0f;
 	int LightSizeNow = 4;
 	bool DenoiseRestart = true;
 	// Which part of the picture PT VIEW shows in its place, as the trace

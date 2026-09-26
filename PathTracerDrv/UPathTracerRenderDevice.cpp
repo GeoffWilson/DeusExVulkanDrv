@@ -301,9 +301,9 @@ void UPathTracerRenderDevice::StaticConstructor()
 	GlossBounces = 1;
 	UseMaterials = 0;
 	UseWidescreenFOV = 1;
-	PinnedUI = 0.0f;
+	PinnedUI = 4.0f / 3.0f;
 	LightSize = 4;
-	UseDLSS = 0;
+	UseDLSS = 1;
 	DLSSQuality = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
