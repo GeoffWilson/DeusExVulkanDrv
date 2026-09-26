@@ -26,6 +26,8 @@ are not described further here.
 Copy the device's `.dll` and `.int` into the game's `System` folder, then set
 `GameRenderDevice` in the `[Engine.Engine]` section of the ini to
 `PathTracerDrv.PathTracerRenderDevice` or `VulkanDrv.VulkanRenderDevice`.
+PathTracerDrv also needs `PathTracerHelper.exe` beside it: the tracing happens
+there (see below), and the device will not start without it.
 
 UE1 names its ini after the executable: `DeusEx.exe` reads `DeusEx.ini` and the
 retail `DeusExRetail.exe` reads `DeusExRetail.ini`. Change the one the game you
@@ -40,36 +42,43 @@ cmake/deploy-deusex.sh "" pathtracer      # or vulkan, d3d11, d3d12
 
 ### Running it
 
-It needs `VK_KHR_ray_query` and `VK_KHR_acceleration_structure` **in a 32 bit
-process**, which is a property of the environment rather than of the GPU. No
-Proton build tested passes them through to a 32 bit client; upstream wine does.
-So on Linux it runs under the distribution's wine, with the retail `DeusEx.exe`
-from the 1112fm patch rather than Steam's launcher:
+It needs hardware ray tracing - `VK_KHR_ray_query` and
+`VK_KHR_acceleration_structure` - and Deus Ex is a 32 bit process, which almost
+nothing offers them to. No Proton build passes them through to a 32 bit client,
+and NVIDIA's own 32 bit Windows driver does not offer them at all: on an RTX
+4090 on driver 32.0.16.1692 a 32 bit client is offered 270 device extensions
+and none of the four ray tracing ones, while a 64 bit client on the same driver
+is offered 289 including all of them. Every environment offers them to a 64
+bit process.
 
-```sh
-cmake/run-deusex-wine.sh
-```
+So the tracing runs in one. `PathTracerDrv.dll` keeps the engine's side in the
+game's process, and starts `PathTracerHelper.exe`, a 64 bit program beside it,
+on the same GPU. The helper has the ray tracing; the two share the traced frame
+on the GPU, so it never crosses to the CPU. Everything else - the level, the
+actors, the textures, the HUD, the window, the `PT` commands - stays in the
+DLL. The helper writes `PathTracerHelper.log` beside the game's log, and exits
+with the game.
 
-`spike/README.md` has the measurements, and `spike/vkrtcheck` answers the
-question for any other setup.
+That makes it run:
 
-**Native Windows cannot run it, which is the opposite of what was expected.**
-Windows has no translation layer in the way, so the driver is asked directly -
-and NVIDIA's 32 bit Windows ICD does not offer the ray tracing extensions at
-all. Measured on an RTX 4090 on driver 32.0.16.1692: a 32 bit client is offered
-270 device extensions and none of the four ray tracing ones, while a 64 bit
-client on the same machine and the same driver is offered 289 including all of
-them. The driver builds and loads on Windows, says so in the log and hands the
-viewport back to the engine, which falls back as it would for any device that
-cannot be initialised. Until a 32 bit ICD offers them, wine is the only way to
-play it - the translation layer that looked like the obstacle is what makes it
-work, because winevulkan thunks a 32 bit client's calls to the 64 bit driver.
+- **from Steam, under Proton** - played with Proton-CachyOS, and the image
+  sharing it depends on was checked under Proton Experimental, GE-Proton and
+  DW-Proton too;
+- **under upstream wine**, with the retail `DeusEx.exe` from the 1112fm patch,
+  through `cmake/run-deusex-wine.sh`;
+- **on Windows**, as far as the sharing goes: `spike/vkxshare` showed NVIDIA's
+  32 and 64 bit drivers sharing an image and semaphores intact. The game itself
+  has not yet been played there with the helper.
+
+`spike/README.md` has the measurements. Handing the frame over costs about a
+tenth of a millisecond, whatever its size.
 
 It has been developed on an RTX 4090 with a 3440x1440 display and the game at
-1920x1440. The Hong Kong market, one of the heaviest scenes, runs at about 85
-frames a second with materials and 104 with `Materials=False`; smaller scenes
-reach the 120 the frame limiter holds them to. `LogTimings` says where a
-frame's time goes, the GPU's side included.
+1920x1440. The Hong Kong market, one of the heaviest scenes, ran at about 85
+frames a second with materials and 104 with `Materials=False` when the tracing
+was still inside the game's process; smaller scenes reach the 120 the frame
+limiter holds them to. `LogTimings` says where a frame's time goes, the GPU's
+side included.
 
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
@@ -250,8 +259,8 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
 
 ### What it does not do yet
 
-- **Windows builds but cannot run it**, for the driver reason above rather than
-  anything in this code. Everything else here was built and played under wine.
+- **Not yet played on native Windows** with the helper. Everything here was
+  built and played under wine and Proton.
 - Two mirrors facing each other show one reflection each rather than a corridor,
   while denoising.
 - A character's motion vectors follow the whole character, not its animation.
@@ -262,26 +271,32 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
 
 ### Building it on Windows
 
-The CMake project builds natively with MSVC, from an x86 developer prompt
-(`vcvarsall amd64_x86`); the Visual Studio solution has no PathTracerDrv project
-and is still Unreal Tournament's. The case-compat step is skipped on a Windows
-host, which resolves those include spellings itself, so python is not needed
-there.
+The CMake project builds natively with MSVC, twice: the DLL from an x86
+developer prompt (`vcvarsall amd64_x86`), and the helper from an x64 one
+(`vcvarsall amd64`), since a 64 bit configuration of the project builds only
+the helper. The Visual Studio solution has no PathTracerDrv project and is
+still Unreal Tournament's. The case-compat step is skipped on a Windows host,
+which resolves those include spellings itself, so python is not needed there.
 
 ```sh
-cmake -S . -B build-win32 -G Ninja
-cmake --build build-win32 --target PathTracerDrv vkrtcheck
+cmake -S . -B build-win32 -G Ninja -DCMAKE_BUILD_TYPE=Release    # x86 prompt
+cmake --build build-win32 --target PathTracerDrv
+cmake -S . -B build-win64 -G Ninja -DCMAKE_BUILD_TYPE=Release    # x64 prompt
+cmake --build build-win64 --target PathTracerHelper
 ```
 
-Copy `build-win32/PathTracerDrv.dll` and `PathTracerDrv.int` into `System`. It
-will load and then report that the device has no ray tracing; see above.
+Copy `build-win32/PathTracerDrv.dll`, `PathTracerDrv.int` and
+`build-win64/PathTracerHelper.exe` into `System`. So far both halves have been
+cross built from Linux, as in [cmake/README-crossbuild.md](cmake/README-crossbuild.md),
+rather than with MSVC.
 
 ### Building the denoiser
 
 NRD is not in this repository - its licence does not allow its source to be
 redistributed here - so `cmake/build-nrd.sh` fetches a pinned release and builds
-it as a 32 bit library. Without it the path tracer still builds and runs, just
-without the denoiser. See [cmake/README-crossbuild.md](cmake/README-crossbuild.md).
+it as a 64 bit library for the helper (and a 32 bit one as well). Without it
+the path tracer still builds and runs, just without the denoiser. See
+[cmake/README-crossbuild.md](cmake/README-crossbuild.md).
 
 ## VulkanDrv
 

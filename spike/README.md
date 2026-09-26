@@ -196,3 +196,7 @@ so the difference is what the sharing costs:
 About a tenth of a millisecond, whatever the size: the cost is the semaphore
 round trip and the ownership transfer, not the texels, which never leave the
 GPU. A frame in the Hong Kong market is 10 to 12 ms, so under one percent of it.
+
+PathTracerDrv now works this way: `PathTracerHelper.exe` is the 64-bit side,
+tracing into an RGBA16F image the device takes over each frame. See the main
+README.

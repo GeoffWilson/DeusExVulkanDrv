@@ -4,11 +4,10 @@
 #   run-deusex-wine.sh [SystemDir] [extra DeusEx.exe arguments...]
 #
 # Why this exists: Proton's winevulkan does not pass the ray tracing extensions
-# through to a 32 bit client - every Proton build on this machine reports
-# VK_KHR_ray_query as absent, while upstream wine reports it present on the same
-# GPU. PathTracerDrv therefore cannot start under Proton and can under wine.
-# Run cmake --build <dir> --target vkrtcheck and then this script's wine on the
-# result to see what any particular setup offers.
+# through to a 32 bit client, while upstream wine does, so PathTracerDrv used to
+# start only under wine. It now traces in a 64 bit helper, which gets ray
+# tracing under Proton too, so this is one way to play rather than the only
+# one - and a check that a problem is Proton's rather than the device's.
 #
 # The Steam copy of the game has no Steam DRM wrapper, so it runs standalone. It
 # shares its System folder, and therefore its DeusEx.ini, with the Proton copy:

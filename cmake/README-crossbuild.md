@@ -15,15 +15,16 @@ xwin --accept-license --arch x86 --cache-dir ../.xwin-cache splat --output ../.x
 ```
 
 `../.xwin` (next to the repository) is where the toolchain file looks by
-default; pass `-DXWIN_DIR=/some/path` to override. The 64-bit half of the
-`vkxshare` spike needs the x64 libraries as well, in a folder of their own that
+default; pass `-DXWIN_DIR=/some/path` to override. The path tracer's helper is
+64-bit, so it needs the x64 libraries as well, in a folder of their own that
 `xwin-clang-cl-x64.cmake` looks for:
 
 ```sh
 xwin --accept-license --arch x86_64 --cache-dir ../.xwin-cache splat --output ../.xwin-x64
 ```
- Also needed: `clang-cl`,
-`lld-link`, `llvm-lib`, `llvm-rc`, `cmake`, `ninja` and `python3`.
+
+Also needed: `clang-cl`, `lld-link`, `llvm-lib`, `llvm-rc`, `cmake`, `ninja`
+and `python3`.
 
 ## Building
 
@@ -37,14 +38,31 @@ cmake --build build-deusex -j8
 The result is `build-deusex/VulkanDrv.dll`, `PathTracerDrv.dll`, `D3D11Drv.dll`
 and `D3D12Drv.dll`, 32 bit DLLs linked against the Deus Ex 1112f import
 libraries in `Thirdparty/DeusEx`. PathTracerDrv has no Visual Studio project,
-so this is its only build. The Windows SDK that `xwin` fetches carries the Direct3D
+so this is its only build.
+
+PathTracerDrv traces in `PathTracerHelper.exe`, a 64-bit program it starts
+beside itself (see the main README for why). A 64-bit configuration of the same
+project builds that and nothing else:
+
+```sh
+cmake -S . -B build-x64 -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/xwin-clang-cl-x64.cmake \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build build-x64 --target PathTracerHelper
+```
+
+`cmake --build build-deusex --target PathTracerHelperTest` builds a 32-bit
+program that drives the helper with a made up scene, as the device would, and
+writes the frame it gets back to `helper-test.ppm`: a check of the helper and
+the channel to it without the game. Put it beside `PathTracerHelper.exe` and
+run `wine PathTracerHelperTest.exe [frames] [width] [height]`. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 
 ### The path tracer's denoiser
 
-`PathTracerDrv` denoises with NVIDIA's NRD when it is there to link. Build it
-once, before configuring:
+The path tracer's helper denoises with NVIDIA's NRD when it is there to link.
+Build it once, before configuring:
 
 ```sh
 cmake/build-nrd.sh          # into ../.nrd, beside .xwin
@@ -52,9 +70,10 @@ cmake/build-nrd.sh          # into ../.nrd, beside .xwin
 
 The script fetches a pinned NRD release (its licence keeps its source out of
 this repository), compiles NRD's HLSL shaders to SPIR-V with a DXC it downloads
-into `../.nrd`, and cross-builds a 32 bit `NRD.lib` with the same xwin CRT.
-Configure afterwards and CMake reports `denoising with NRD`; without it the
-path tracer builds as before and `PT DENOISE` says the denoiser is missing.
+into `../.nrd`, and cross-builds `x64/NRD.lib`, which the helper links, with the
+x64 xwin CRT (and `x86/NRD.lib` with the 32 bit one). Configure `build-x64`
+afterwards and CMake reports `PathTracerHelper: denoising with NRD`; without it
+the helper builds without the denoiser and `PT DENOISE` says it is missing.
 `Denoise=False` in the device's ini section turns it off at startup.
 
 ## Installing
@@ -64,7 +83,8 @@ cmake/deploy-deusex.sh /path/to/DeusEx/System [vulkan|pathtracer|d3d11|d3d12|non
 ```
 
 That copies every driver that was built, with its `.int`, into the game's System
-folder and points `GameRenderDevice` at the one named (Vulkan by default),
+folder - and `build-x64/PathTracerHelper.exe` beside PathTracerDrv, or from
+`HELPER_DIR` if set - and points `GameRenderDevice` at the one named (Vulkan by default),
 keeping the previous ini as `DeusEx.ini.prevulkan`. To switch afterwards without
 redeploying:
 
