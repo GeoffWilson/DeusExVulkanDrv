@@ -13,7 +13,8 @@ Two render devices for Deus Ex:
   real shadows, bounced light, mirrors that reflect, surfaces that shine or stay
   matte according to what they are made of, and the game's own lights, light
   effects and fog, denoised with NVIDIA's NRD or, on an RTX GPU, NVIDIA DLSS
-  Ray Reconstruction.
+  Ray Reconstruction. On a wide screen it shows more of the world rather than
+  less, and can keep the HUD to a 16:9 or 4:3 box in the middle.
 - **VulkanDrv** is a conventional rasteriser, the one to play the game on. It
   adds supersampling, HDR, anisotropic filtering and a frame limiter to what the
   game shipped with.
@@ -73,12 +74,13 @@ That makes it run:
 `spike/README.md` has the measurements. Handing the frame over costs about a
 tenth of a millisecond, whatever its size.
 
-It has been developed on an RTX 4090 with a 3440x1440 display and the game at
-1920x1440. The Hong Kong market, one of the heaviest scenes, runs at about 145
-frames a second uncapped with materials on and NRD, with a 1% low of about 130,
-and at about 190 with DLSS Ray Reconstruction at Quality, 1% low 160; the frame
-limiter holds it to 120 by default. `LogTimings` says where a frame's time
-goes, the GPU's side included, and what frame rate that came to.
+It has been developed on an RTX 4090 with a 3440x1440 display, first with the
+game at 1920x1440 and, since 1.2, at the display's own 3440x1440 with the HUD
+pinned. At 1920x1440 the Hong Kong market, one of the heaviest scenes, runs at
+about 145 frames a second uncapped with materials on and NRD, with a 1% low of
+about 130, and at about 190 with DLSS Ray Reconstruction at Quality, 1% low
+160; the frame limiter holds it to 120 by default. `LogTimings` says where a
+frame's time goes, the GPU's side included, and what frame rate that came to.
 
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
@@ -88,6 +90,31 @@ the restyle that follows took the focus away again, so the game could not be
 brought back at all. `PathTracerEvents.log`, beside the game's log, records the
 window's focus and size changes, mode switches, swap chain rebuilds and any
 crash, flushed as they happen.
+
+### New in 1.2
+
+- **DLSS Ray Reconstruction**, NVIDIA's denoiser and upscaler, on an RTX GPU
+  (`DLSS`, `PT DLSS`); see Noise below.
+- **Faster frames.** The CPU gathers and records the next frame while the GPU
+  traces the last: 106 frames a second became 146 in the Hong Kong market.
+- **Wide screens.** A Hor+ field of view, cinematics and conversations framed
+  whole at any aspect, the HUD's markers on what they mark, and a HUD that can
+  be pinned to a 16:9 or 4:3 box in the middle of the screen; see Wide
+  screens below.
+- **Shadows from lights with size**, sharp where they start and softer with
+  distance (`LightSize`).
+- **Rounded meshes.** Characters and objects are shaded with normals smoothed
+  across their faces, as the engine does, rather than showing every facet.
+- **The player in mirrors**, and in cutscenes whose camera looks on from
+  outside.
+- **Particles traced with the level** - steam, smoke, sparks - so walls hide
+  them, rather than drawn over the picture.
+- **A sharp HUD**, sampled the way the other devices sample it.
+- **Materials off by default** until they have been checked by hand.
+- **Fixes:** a crash loading a save of the map already being played; a crash
+  starting the game in a mode narrower than the screen under Proton's Wayland
+  driver, in every device here; and bars beside a narrower mode showing the
+  last picture shown there.
 
 ### How it works
 
@@ -133,8 +160,12 @@ source and was read by disassembly:
 
 Each shaded point samples one light, chosen in proportion to its contribution
 from the lights listed for its cell of a uniform grid over the level, and fires
-one shadow ray at it. Paths bounce off surfaces with cosine weighted directions,
-three bounces by default with Russian roulette after the second. Glass and water
+one shadow ray at it - at a random point on a disc around the light rather than
+its centre (`LightSize`, a small lamp's size by default), so a shadow starts sharp
+where something meets it and softens with distance, as a real one does. The
+engine's lights are points, and cast from one a shadow is hard all the way
+out. Paths bounce off surfaces with cosine weighted directions, three bounces
+by default with Russian roulette after the second. Glass and water
 are lit by every light at once and without shadows, so the layer they add never
 flickers.
 
@@ -194,11 +225,15 @@ what it counts as.
   jittered by one offset a frame, the one it is told, and the trace runs at
   the render size the network is trained for at the chosen quality - 1280x960
   for 1920x1440 at Quality - which it upscales. A last pass tonemaps what comes
-  back and puts the fog and the screen flash over it. NGX, which it runs on, is
-  64-bit only: it is possible because the tracing is in the helper. Where it
-  cannot run - another GPU, an old driver, wine without NVIDIA's NGX core,
-  dxvk-nvapi and DXVK, which Proton provides (see `spike/README.md`) - NRD
-  stands in and `PathTracerHelper.log` says why.
+  back and puts the fog and the screen flash over it. The jitter is told as
+  how far the picture moved, the opposite of the rays' own offset; told it the
+  other way round, as it was before 1.2, fine detail shimmered even at DLAA. It
+  also keeps what NRD softens: measured against the converged picture in the
+  test harness, its error across a shadow's edge is a half to two thirds of
+  NRD's. NGX, which it runs on, is 64-bit only: it is possible because the
+  tracing is in the helper. Where it cannot run - another GPU, an old driver,
+  wine without NVIDIA's NGX core, dxvk-nvapi and DXVK, which Proton provides
+  (see `spike/README.md`) - NRD stands in and `PathTracerHelper.log` says why.
 
   In the Hong Kong market on an RTX 4090 at 1920x1440: NRD takes 6.9 ms of GPU
   time a frame, Ray Reconstruction at Quality 3.8 (tracing 2.0, the network
@@ -215,7 +250,37 @@ second became 146 and the 1% low 78 became 118, and a frame now takes as long
 as the GPU does.
 
 **2D.** The HUD, menus and console are rasterised over the traced picture, so
-the game is fully playable.
+the game is fully playable. Each piece is sampled as the other devices sample
+it - nearest where its art asks for no smoothing, clamped at the edges of art
+that is not meant to repeat - so the HUD is as sharp as it is in D3D.
+
+**Wide screens.** The engine's field of view is horizontal: on a screen wider
+than 4:3 it keeps the width and crops the top and bottom, so at 21:9 the game's
+75 degrees shows under 60% of the height it does at 4:3, and conversations and
+cinematics framed for 4:3 lose heads and feet. The raster devices cannot help
+it, since they only draw what the engine has projected. The trace builds the
+view from the level, so it keeps the height the same field of view gives at 4:3
+and widens the view to fill the screen ("Hor+", `WidescreenFOV`). Everything
+that frames the view follows from that:
+
+- **Cinematics and conversations.** A cinematic camera's field of view is taken
+  from the frame the engine renders with, not the player's. A conversation
+  narrows the 3D view to the strip between its black bars; the trace builds
+  the view for the whole screen and the bars cover what is outside the strip,
+  rather than the strip's view being stretched over the whole screen, so they
+  keep their framing on a wide screen - the intro at 21:9 included, its
+  subtitles in their bar.
+- **What the HUD marks in the world** - the brackets around what can be used,
+  the augmentations' target boxes - is placed by the game through the same
+  view, so it lands on what the trace shows rather than where the engine's
+  narrower view would have put it.
+- **A pinned HUD** (`PinnedUI`, `PT PINNEDUI 16:9`). The game is given a 16:9 or
+  4:3 mode at the screen's height, lays its HUD, menus and conversations out in
+  it as it was designed to, and the trace fills the screen around them; what
+  spans the whole of the game's width - a conversation's bars, a fade - is
+  carried on to the screen's edges.
+- **A mode narrower than the screen** without the pin is letterboxed, with the
+  bars cleared rather than showing the last picture shown there.
 
 ### Settings
 
@@ -238,6 +303,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	Materials=False
 	GlossBounces=1
 	WidescreenFOV=True
+	PinnedUI=0.000000
+	LightSize=4
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Exposure`: overall brightness, a byte around a midpoint of 128.
@@ -271,7 +338,23 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   lose heads and feet; the raster devices cannot help that, since they only
   draw what the engine has projected, but the trace builds the view from the
   level. Keep the game's own field of view at its 4:3 value (75 by default).
+  The HUD's brackets around what can be used, and the augmentations' target
+  boxes, are placed with the same view, so they stay on what they mark.
   `PT WIDESCREEN` switches it for the session.
+- `PinnedUI`: in fullscreen, keep the HUD, menus and conversations inside a
+  box of this aspect ratio in the middle of the screen, rather than spread to
+  the edges of a 21:9 or 32:9 one, with the traced world still filling the
+  whole screen: 1.777778 for 16:9, 1.333333 for 4:3, 0 (the default) for the
+  whole width. The game is given a mode of that shape at the height chosen,
+  so the resolution it lists is the narrower one, but the ini keeps the one
+  chosen. Choosing a mode narrower still narrows the box further; with it off,
+  a narrower mode is letterboxed as on the other devices. `PT PINNEDUI 16:9`,
+  `PT PINNEDUI 4:3` and `PT PINNEDUI OFF` switch it for the session.
+- `LightSize`: the radius, in world units, of the disc around each light that
+  shadows are cast from; 4 by default, a small lamp's size. A shadow then
+  starts sharp where something meets it and softens with distance, as a real
+  one does. 0 casts from a point: hard all the way out, which NRD blurs
+  evenly and DLSS keeps. `PT LIGHTSIZE n` changes it for the session.
 - `GlossBounces`: how far a smooth surface's reflection is traced. 1 lights what
   it shows by the lights and the zone's ambient; more carries the reflection on
   bouncing, at a cost; 0 traces none and keeps only the highlights.
@@ -305,6 +388,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in.
 - `PT WIDESCREEN`: the widescreen field of view on or off.
+- `PT LIGHTSIZE n`: the size lights cast shadows from, as `LightSize`.
+- `PT PINNEDUI 16:9 | 4:3 | OFF`: the UI kept to a box of that shape in the
+  middle of the screen, or across all of it. Any ratio or number works.
 - `PT JITTERSIGN`: tells DLSS the sub-pixel jitter the other way round, the
   way it was told before 1.2, to compare: static fine detail should hold
   still with it off and shimmer with it on.
@@ -373,6 +459,11 @@ but had evidently never been built or run for it; the fixes that took were:
 - **Window and cursor handling.** Fullscreen state is captured before the
   viewport is resized, and the cursor clip follows the window. On Windows the
   stale clip read back as constant mouse movement, spinning the player left.
+- **The launcher's splash** is hidden before the first mode change. Under
+  Proton's Wayland driver, as Proton-GE and CachyOS patch it, the splash
+  becomes a popup of the game's window, and starting in a fullscreen mode
+  narrower than the monitor ended the process with the compositor's
+  "destroyed popup not top most popup". The same goes for every device here.
 
 And what was added:
 
