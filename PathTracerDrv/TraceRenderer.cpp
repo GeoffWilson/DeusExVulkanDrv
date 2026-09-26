@@ -754,7 +754,8 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	PushConstants.Disable = frame.DisableBits | ((frame.ViewMode || denoising) ? 64u : 0u) | (frame.Materials ? 0u : 128u) | (useRr ? 256u : 0u);
 	PushConstants.Counts[0] = frame.Frame;
 	PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
-	PushConstants.Counts[2] = std::min(std::max(frame.Bounces, 1u), 255u) | (std::min(frame.GlossBounces, 255u) << 8);
+	PushConstants.Counts[2] = std::min(std::max(frame.Bounces, 1u), 255u) | (std::min(frame.GlossBounces, 255u) << 8) |
+		(std::min(frame.LightSize, 255u) << 16);
 	PushConstants.Counts[3] = frame.AccumulatedFrames;
 	PushConstants.TextureCount = CanSampleTextures ? (uint32_t)BoundTextures : 0u;
 	PushConstants.MaxSamples = std::max(frame.MaxSamples, 1u);

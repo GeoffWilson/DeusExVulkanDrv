@@ -99,7 +99,7 @@ std::string Shaders::Trace()
 			vec4 CameraRight;     // xyz, already scaled by the horizontal half extent
 			vec4 CameraUp;        // xyz, already scaled by the vertical half extent
 			vec4 CameraForward;   // xyz unit vector down the middle of the view
-			uvec4 Counts;         // x frame, y light count, z bounces (and glossy bounces << 8), w accumulated frames
+			uvec4 Counts;         // x frame, y light count, z bounces (glossy bounces << 8, light radius << 16), w accumulated frames
 			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w debug mode
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
@@ -108,7 +108,8 @@ std::string Shaders::Trace()
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
-		#define GlossBounces (Counts.z >> 8u)
+		#define GlossBounces ((Counts.z >> 8u) & 255u)
+		#define LightRadius float((Counts.z >> 16u) & 255u)
 
 		// Which instances each kind of ray sees, against SceneInstance::Mask.
 		// The view's own rays and shadows miss the viewer's body while the
@@ -730,7 +731,28 @@ std::string Shaders::Trace()
 			if (lights[chosen].Flags.z > 0.5)
 				litByChangingLight = true;
 
-			if (occluded(position, chosenDir, chosenDistance - Params.z * 2.0))
+			// Shadowed as by a light the size of a lamp rather than a point. The
+			// shadow ray goes to a random point on a disc around the light,
+			// facing the surface, so a shadow is sharp where whatever casts it
+			// meets the surface and softens as the two part, as a real one
+			// does: the penumbra grows with the distance from the caster, and
+			// what is averaged over frames or denoised is that penumbra rather
+			// than an edge blurred evenly. Brightness and falloff stay the
+			// engine's, from the light's centre.
+			vec3 shadowDir = chosenDir;
+			float shadowDistance = chosenDistance;
+			if (LightRadius > 0.0)
+			{
+				vec3 across = normalize(cross(chosenDir, abs(chosenDir.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
+				vec3 along = cross(chosenDir, across);
+				// Kept well in front of a surface the light is close to.
+				float r = min(LightRadius, chosenDistance * 0.5) * sqrt(randomFloat());
+				float a = 6.2831853 * randomFloat();
+				vec3 toTarget = chosenDir * chosenDistance + (across * cos(a) + along * sin(a)) * r;
+				shadowDistance = length(toTarget);
+				shadowDir = toTarget / shadowDistance;
+			}
+			if (occluded(position, shadowDir, shadowDistance - Params.z * 2.0))
 				return vec3(0.0);
 
 			// Divide by the probability it was chosen with, which is its share

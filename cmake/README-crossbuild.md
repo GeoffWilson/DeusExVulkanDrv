@@ -60,7 +60,11 @@ to `--dlss 4` denoises with DLSS Ray Reconstruction at that quality instead of
 NRD, and `--still` holds the scene still and reports how much the picture
 changes from frame to frame - noise and shimmer, which a wrong sub-pixel
 jitter shows up as; `--jittersign` reports the jitter the old way round to
-compare. The Windows SDK that `xwin` fetches carries the Direct3D
+compare. `--reference` holds it still with no denoiser, so the frames
+average towards what the trace converges on - what a denoiser should arrive
+at - and `--backlight` puts the light behind the red box, so its shadow runs
+towards the camera; `--lightsize n` casts shadows from a light of that
+radius. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 

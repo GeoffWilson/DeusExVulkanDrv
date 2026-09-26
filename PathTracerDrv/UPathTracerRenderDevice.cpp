@@ -302,6 +302,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseMaterials = 0;
 	UseWidescreenFOV = 1;
 	PinnedUI = 0.0f;
+	LightSize = 4;
 	UseDLSS = 0;
 	DLSSQuality = 1;
 
@@ -319,6 +320,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("WidescreenFOV"), RF_Public) UBoolProperty(CPP_PROPERTY(UseWidescreenFOV), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("PinnedUI"), RF_Public) UFloatProperty(CPP_PROPERTY(PinnedUI), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("LightSize"), RF_Public) UIntProperty(CPP_PROPERTY(LightSize), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
@@ -338,6 +340,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	MaterialsEnabled = UseMaterials != 0;
 	WidescreenFovEnabled = UseWidescreenFOV != 0;
 	PinnedAspect = UsablePinnedAspect(PinnedUI);
+	LightSizeNow = Clamp(LightSize, 0, 255);
 
 	// Started afresh once per run: the engine can make a new device mid
 	// session, and what led up to that is the part worth keeping.
@@ -1421,6 +1424,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.DebugMode = (uint32_t)DebugMode;
 				frame.Denoise = !DenoiseEnabled ? TraceProtocol::DenoiseOff : (DlssEnabled ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd);
 				frame.DlssQuality = (uint32_t)DlssQualityNow;
+				frame.LightSize = (uint32_t)LightSizeNow;
 				frame.Materials = MaterialsEnabled ? 1 : 0;
 				frame.RestartDenoiser = DenoiseRestart ? 1 : 0;
 				frame.Timing = LogTimings ? 1 : 0;
@@ -1923,6 +1927,14 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			Ar.Logf(TEXT("PT: widescreen field of view %s"), WidescreenFovEnabled ? TEXT("on (Hor+)") : TEXT("off (the engine's own, cropped top and bottom)"));
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("LIGHTSIZE")))
+		{
+			LightSizeNow = Clamp(appAtoi(Cmd), 0, 255);
+			AccumulatedFrames = 0;
+			DenoiseRestart = true;
+			Ar.Logf(TEXT("PT: shadows cast from %s"), LightSizeNow > 0 ? *FString::Printf(TEXT("a light %d units across"), LightSizeNow * 2) : TEXT("a point, hard to their ends"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("PINNEDUI")))
 		{
 			while (*Cmd == ' ')
@@ -2007,7 +2019,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | JITTERSIGN | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | JITTERSIGN | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 5;
+	static const uint32_t Version = 6;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -236,6 +236,8 @@ namespace TraceProtocol
 		float Exposure;
 		float SkyIntensity;
 		uint32_t DlssQuality;       // 0 DLAA, 1 quality, 2 balanced, 3 performance, 4 ultra performance
+		uint32_t LightSize;         // radius shadows are cast from around each light, in world units; 0 a point
+		uint32_t Spare;
 		// Origin, right, up and forward, as the trace shader's push constants
 		// carry them - w holding the screen flash - and the same for last frame.
 		vec4 Camera[4];

@@ -8,6 +8,7 @@
 // textures - which only the game can.
 //
 //   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still] [--jittersign]
+//                            [--lightsize radius] [--reference] [--backlight]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -19,6 +20,13 @@
 // left is noise and shimmer, which is what a wrong jitter shows up as.
 // --jittersign tells DLSS the jitter the old way round (the game's
 // PT JITTERSIGN), to compare.
+//
+// --lightsize casts shadows from a disc of that radius around the light
+// rather than from its centre (the game's LightSize). --reference holds the
+// scene still and denoises nothing, so the frames average towards what the
+// trace converges on - the picture a denoiser is trying to reach.
+// --backlight puts the light behind the red box, so its shadow falls towards
+// the camera, from where the box stands to well beyond it.
 //
 // Frames are taken the way the render device takes them: the next is asked
 // for before the last is waited for, so the helper records one while the GPU
@@ -121,7 +129,8 @@ int main(int argc, char** argv)
 {
 	std::vector<const char*> args;
 	int dlss = -1;
-	bool still = false, jitterSign = false;
+	bool still = false, jitterSign = false, reference = false, backlight = false;
+	uint32_t lightSize = 0;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -130,6 +139,12 @@ int main(int argc, char** argv)
 			still = true;
 		else if (!strcmp(argv[i], "--jittersign"))
 			jitterSign = true;
+		else if (!strcmp(argv[i], "--lightsize") && i + 1 < argc)
+			lightSize = (uint32_t)atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--reference"))
+			reference = still = true;
+		else if (!strcmp(argv[i], "--backlight"))
+			backlight = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -231,7 +246,7 @@ int main(int argc, char** argv)
 		}
 
 		SceneLight light = {};
-		light.PositionRadius = vec4(-200, -250, 350, 1400);
+		light.PositionRadius = backlight ? vec4(40, 260, 300, 1400) : vec4(-200, -250, 350, 1400);
 		light.ColorBrightness = vec4(1.0f, 0.9f, 0.8f, 2.5f);
 		light.DirectionCone = vec4(0, 0, 0, -1);
 		light.Flags = vec4(0, 0, 0, -1);
@@ -255,7 +270,8 @@ int main(int argc, char** argv)
 		frame.MaxSamples = 256;
 		frame.Bounces = 3;
 		frame.GlossBounces = 1;
-		frame.Denoise = dlss >= 0 ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd;
+		frame.Denoise = reference ? TraceProtocol::DenoiseOff : dlss >= 0 ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd;
+		frame.LightSize = lightSize;
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
 		frame.Timing = 1;

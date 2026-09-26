@@ -150,6 +150,12 @@ public:
 	// narrower mode narrows the box further; with it off, a narrower mode is
 	// letterboxed. See SetRes. PT PINNEDUI switches it for the session.
 	FLOAT PinnedUI;
+	// How big a light is, for its shadows: the radius, in world units, of the
+	// disc around each light that shadows are cast from. 0 casts them from a
+	// point, hard to their far ends; larger ones start sharp where something
+	// meets its shadow and soften with distance from it, as real ones do.
+	// PT LIGHTSIZE n changes it for the session.
+	INT LightSize;
 
 private:
 	FString DescribeDenoiser() const;
@@ -217,6 +223,7 @@ private:
 	bool MaterialsEnabled = true;
 	bool WidescreenFovEnabled = true;
 	float PinnedAspect = 0.0f;
+	int LightSizeNow = 4;
 	bool DenoiseRestart = true;
 	// Which part of the picture PT VIEW shows in its place, as the trace
 	// shader numbers them; 0 for the picture itself.
