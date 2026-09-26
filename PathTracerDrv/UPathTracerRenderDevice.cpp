@@ -1921,8 +1921,10 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	corners[2] = { vec2(x1 * sx - 1.0f, y1 * sy - 1.0f), vec2(u1, v1), colour };
 	corners[3] = { vec2(x0 * sx - 1.0f, y1 * sy - 1.0f), vec2(u0, v1), colour };
 
-	// Sampled the way the other devices sample it: see TileSamplers.
-	int samplerMode = (flags & PF_NoSmooth) ? 1 : 0;
+	// Sampled the way the other devices sample it: see TileSamplers. By the
+	// flags the tile was drawn with alone, as they and the original D3D
+	// driver take them, not with the texture's own added.
+	int samplerMode = (PolyFlags & PF_NoSmooth) ? 1 : 0;
 	if (Min(u0, u1) >= 0.0f && Max(u0, u1) <= 1.00001f && Min(v0, v1) >= 0.0f && Max(v0, v1) <= 1.00001f)
 		samplerMode |= 2;
 	if (!TileSet(texture, samplerMode))
