@@ -311,3 +311,18 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
 else()
 	set_target_properties(vkxshare PROPERTIES OUTPUT_NAME "vkxshare")
 endif()
+
+# Can the path tracer's 64-bit helper run DLSS Ray Reconstruction? 64-bit only,
+# since NGX is, and only once cmake/fetch-dlss.sh has fetched the SDK. The
+# Ray Reconstruction runtime is copied beside it, where NGX looks.
+#   cmake --build build-x64 --target ngxcheck
+set(PATHTRACER_DLSS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.dlss" CACHE PATH "Output of cmake/fetch-dlss.sh")
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND EXISTS "${PATHTRACER_DLSS_DIR}/x64/nvsdk_ngx_s.lib")
+	add_executable(ngxcheck EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/spike/ngxcheck.cpp")
+	target_include_directories(ngxcheck PRIVATE "${PATHTRACER_DLSS_DIR}/include")
+	target_compile_definitions(ngxcheck PRIVATE WIN32 NDEBUG _CONSOLE)
+	target_compile_options(ngxcheck PRIVATE /MT /EHsc)
+	target_link_libraries(ngxcheck PRIVATE zvulkan "${PATHTRACER_DLSS_DIR}/x64/nvsdk_ngx_s.lib" advapi32)
+	add_custom_command(TARGET ngxcheck POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PATHTRACER_DLSS_DIR}/nvngx_dlssd.dll" "$<TARGET_FILE_DIR:ngxcheck>")
+endif()

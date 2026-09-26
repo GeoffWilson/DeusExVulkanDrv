@@ -200,3 +200,74 @@ GPU. A frame in the Hong Kong market is 10 to 12 ms, so under one percent of it.
 PathTracerDrv now works this way: `PathTracerHelper.exe` is the 64-bit side,
 tracing into an RGBA16F image the device takes over each frame. See the main
 README.
+
+## ngxcheck
+
+Can the path tracer's 64-bit helper run DLSS Ray Reconstruction?
+
+NVIDIA's NGX, which DLSS runs on, is 64-bit only, so it was never an option in
+the game's own process; the helper makes it one. What was in doubt is the
+environment. NGX finds its core through the driver, and under wine or Proton
+that is a Windows DLL the translation layer has to provide.
+
+`ngxcheck.exe` asks what the helper would: which Vulkan extensions NGX needs,
+before the device exists; a device with those and the helper's own; NGX
+itself; whether the GPU and driver offer Ray Reconstruction; the render size at
+each quality for the game's 1920x1440; and then the feature made and run at
+each quality on a flat colour over a flat surface, timed on the GPU, with its
+output checked against the colour it was given.
+
+```sh
+cmake/fetch-dlss.sh                                 # the SDK, pinned, into ../.dlss
+cmake --build build-x64 --target ngxcheck           # nvngx_dlssd.dll is copied beside it
+wine ngxcheck.exe [width height] [--verbose]
+```
+
+`--verbose` passes NGX's own log through, which says where it looked for its
+core and what it loaded.
+
+Measured on an RTX 4090, driver 615.71.09, DLSS SDK v310.9.1, at 1920x1440:
+
+| Quality     | Render size | Proton-CachyOS | wine 11.18 | Output  |
+| ----------- | ----------- | -------------- | ---------- | ------- |
+| DLAA        | 1920x1440   | 2.57 ms        | 2.54 ms    | correct |
+| Quality     | 1280x960    | 1.32 ms        | 1.31 ms    | correct |
+| Balanced    | 1114x835    | 1.11 ms        | 1.09 ms    | correct |
+| Performance | 960x720     | 0.88 ms        | 0.87 ms    | correct |
+| Windows     |             | not yet measured |          |         |
+
+For scale, NRD takes about 1.9 ms of the path tracer's frame at 1920x1440.
+Winevulkan passes through the four device extensions NGX asks for
+(`VK_NVX_binary_import`, `VK_NVX_image_view_handle`,
+`VK_EXT_buffer_device_address`, `VK_KHR_push_descriptor`) everywhere.
+
+What NGX needs under wine, found one failure at a time:
+
+- **Its core**, `_nvngx.dll` and `nvngx.dll`, which the Linux driver ships for
+  exactly this in `/usr/lib/nvidia/wine`. NGX looks beside the program first,
+  then at the registry value `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore`
+  `FullPath`. Without it: `FeatureNotSupported`.
+- **NVAPI**, which the core asks for the GPU: dxvk-nvapi's `nvapi64.dll`, in
+  System32 - the core does not look beside the program - loaded native.
+- **DXVK's `dxgi.dll`**, which dxvk-nvapi finds the GPU through, with
+  `DXVK_ENABLE_NVAPI=1` so that DXVK owns up to it being NVIDIA's. Without these
+  two: `PlatformError`, with nothing in NGX's log to say why; dxvk-nvapi's own
+  log (`DXVK_NVAPI_LOG_LEVEL=info`) does.
+- **A real display.** Under wine's null display driver DXVK cannot create its
+  factory, and it is `PlatformError` again.
+
+Proton provides all of it. Launching a game with NVAPI enabled puts the
+driver's core and dxvk-nvapi in the prefix's System32 and sets the registry
+value - Deus Ex's prefix under Proton-CachyOS has all three - and sets the
+environment, which the helper should inherit from the game; that last part is
+to be confirmed in the game itself. Run by hand with Proton's `wine`, as here,
+the environment has to be given:
+
+```sh
+WINEPREFIX=~/.local/share/Steam/steamapps/compatdata/6910/pfx \
+WINEDLLOVERRIDES="nvapi64,nvapi,dxgi,d3d11,d3d10core,d3d9=n" DXVK_ENABLE_NVAPI=1 \
+    "<proton>/files/bin/wine" ngxcheck.exe
+```
+
+Upstream wine needs the same pieces installed by hand: DXVK and dxvk-nvapi in
+the prefix, the driver's two NGX DLLs, and the same two environment variables.
