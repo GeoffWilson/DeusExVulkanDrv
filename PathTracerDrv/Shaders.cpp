@@ -104,7 +104,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -518,7 +518,7 @@ std::string Shaders::Trace()
 			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
 				return false;
 			int blocker = rayQueryGetIntersectionInstanceIdEXT(rq, true);
-			if (blocker > 0 && instanceAmbient[blocker].w > 0.5)
+			if (blocker > 0 && instanceAmbient[blocker].w < 0.0)
 				shadowedByMover = true;
 			return true;
 		}
@@ -604,7 +604,27 @@ std::string Shaders::Trace()
 			return 0.6 + 0.4 * s;
 		}
 
-		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, out vec3 lightDirection, out vec3 lightBase)
+		// How Render.dll lights a mesh, at its vertices (FLightManager::Light),
+		// where a flat surface's lightmap takes plain N.L: by (N.L + 1)^2 - 1.5,
+		// which is nothing below an N.L of about 0.22 and 2.5 facing the light,
+		// so a lit character comes out brighter and flatter and falls into
+		// shadow more sharply. Plus a sheen where the light lies along the
+		// surface, away from the viewer - six times the square of how far the
+		// light's direction along the surface points down the view - which is
+		// the rim a character gets from a light behind them.
+		float meshResponse(float c, vec3 dir, vec3 normal, vec3 viewDir)
+		{
+			float response = max((c + 1.0) * (c + 1.0) - 1.5, 0.0);
+			float rim = dot(viewDir, dir - normal * dot(normal, dir));
+			if (rim > 0.0)
+				response += 6.0 * rim * rim;
+			return response;
+		}
+
+		// meshGlow is 1.4 times the actor's ScaleGlow for a point on a mesh,
+		// which the engine scales its mesh lighting by, and negative anywhere
+		// else; viewDir is the way the ray that found the point was going.
+		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, out vec3 lightDirection, out vec3 lightBase)
 		{
 			lightDirection = normal;
 			lightBase = vec3(0.0);
@@ -661,6 +681,10 @@ std::string Shaders::Trace()
 				// Non incidence: as bright on a surface edge on as face on.
 				if (light.Flags.x > 0.5)
 					cosTheta = 1.0;
+				// A mesh as the engine lights one; see meshResponse.
+				float response = meshGlow >= 0.0 ? meshResponse(cosTheta, dir, normal, viewDir) * meshGlow : cosTheta;
+				if (response <= 0.0)
+					continue;
 
 				// A spotlight, bright along its axis and fading to nothing at
 				// the cone's edge, with the engine's squared falloff.
@@ -744,7 +768,7 @@ std::string Shaders::Trace()
 				float falloff = 1.0 - reach / radius;
 
 				vec3 base = light.ColorBrightness.rgb * (light.ColorBrightness.a * falloff * spot * disco);
-				vec3 value = base * cosTheta;
+				vec3 value = base * response;
 				float weight = luminance(value);
 				if (weight <= 0.0)
 					continue;
@@ -770,7 +794,9 @@ std::string Shaders::Trace()
 			{
 				if (anyChanging)
 					litByChangingLight = true;
-				return total;
+				// The engine clamps a mesh's light at each vertex to one: a lit
+				// mesh is never drawn brighter than its texture.
+				return meshGlow >= 0.0 ? min(total, vec3(1.0)) : total;
 			}
 
 			if (chosen < 0 || chosenWeight <= 0.0)
@@ -810,7 +836,11 @@ std::string Shaders::Trace()
 			float scale = weightSum / chosenWeight;
 			lightDirection = chosenDir;
 			lightBase = chosenBase * scale;
-			return chosenValue * scale;
+			// Clamped for a mesh as the engine clamps it. The estimate is the
+			// total in proportion, sampled by its weight, so clamping it clamps
+			// the total near enough.
+			vec3 direct = chosenValue * scale;
+			return meshGlow >= 0.0 ? min(direct, vec3(1.0)) : direct;
 		}
 	)";
 
@@ -1181,7 +1211,7 @@ std::string Shaders::Trace()
 						// The pixel records the surface behind this one as what it
 						// sees, so this one appearing would otherwise go unnoticed
 						// and fade in over many frames.
-						if (bounce == 0u && instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w > 0.5)
+						if (bounce == 0u && instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w < 0.0)
 							primaryChanged = true;
 	)";
 
@@ -1219,7 +1249,7 @@ std::string Shaders::Trace()
 							{
 								vec3 surroundings = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
 								vec3 unusedDirection, unusedBase;
-								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, unusedDirection, unusedBase)
+								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, -1.0, direction, unusedDirection, unusedBase)
 									+ attr.Albedo.rgb * surroundings;
 							}
 							radiance += throughput * contribution;
@@ -1380,7 +1410,7 @@ std::string Shaders::Trace()
 						int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
 						if (instanceId > 0)
 						{
-							bool moved = instanceAmbient[instanceId].w > 0.5;
+							bool moved = instanceAmbient[instanceId].w < 0.0;
 							radiance = (moved ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 1.0)) * 4.0;
 							break;
 						}
@@ -1408,7 +1438,17 @@ std::string Shaders::Trace()
 					// on afterwards. Its glossy reflection likewise, gathered apart
 					// and divided by the colour it goes back on with.
 					vec3 lightDirection, lightBase;
-					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, lightDirection, lightBase);
+					// A mesh is lit as the engine lights one, at 1.4 times its
+					// ScaleGlow (the instance's w, 1 + ScaleGlow, signed by
+					// whether it moved), unless PT MESHLIGHT has it lit as a
+					// flat surface is (Disable bit 1024).
+					float meshGlow = -1.0;
+					if (attr.CornerNormals.w != 0u && (Disable & 1024u) == 0u)
+					{
+						float flags = abs(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w);
+						meshGlow = 1.4 * (flags > 0.5 ? flags - 1.0 : 1.0);
+					}
+					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, meshGlow, direction, lightDirection, lightBase);
 
 					// What it is made of, only now the light loop is done with.
 					// A surface seen in a mirror is captured as matte, since its
@@ -1711,7 +1751,7 @@ std::string Shaders::Trace()
 				// A different object is under this pixel than last frame.
 				samples = 0.0;
 			}
-			else if (primaryInstance >= 0.0 && instanceAmbient[int(primaryInstance)].w > 0.5)
+			else if (primaryInstance >= 0.0 && instanceAmbient[int(primaryInstance)].w < 0.0)
 			{
 				// The scene says this instance moved or changed shape since the
 				// last frame, so nothing accumulated for it still describes it.

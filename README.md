@@ -113,6 +113,8 @@ crash, flushed as they happen.
 - **The game's Brightness setting**, applied over the finished picture as
   VulkanDrv applies it; it did nothing before.
 - **Torch and fire waver and watery shimmer**, which lit as steady lights.
+- **Characters and objects lit as the engine lights them**, brighter and
+  flatter than a wall under the same lamp, with a rim from a light behind.
 - **Animated textures on the engine's clock** - fire, water, screens - which
   could run at the wrong speed, and stopped behind the pause menu.
 - **Materials off by default** until they have been checked by hand.
@@ -163,7 +165,13 @@ source and was read by disassembly:
 - special lighting, zone ambient light, and volumetric fog lights in fog zones,
   integrated per pixel along the view ray;
 - unlit meshes at the engine's own brightness, and the screen flash for damage
-  and water.
+  and water;
+- lit meshes as the engine lights them, not as a flat surface is: by
+  (N.L + 1)^2 - 1.5 rather than N.L, which leaves a character brighter and
+  flatter under a lamp and falling into shadow more sharply, with a sheen
+  where a light lies along the surface beyond it, scaled by 1.4 times the
+  actor's ScaleGlow and clamped so a mesh is never lit past its texture.
+  `PT MESHLIGHT` lights them as flat surfaces instead, to compare.
 
 Each shaded point samples one light, chosen in proportion to its contribution
 from the lights listed for its cell of a uniform grid over the level, and fires
@@ -397,6 +405,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE]`: DLSS
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in.
+- `PT MESHLIGHT`: meshes lit as the engine lights them, or as flat surfaces are.
 - `PT WIDESCREEN`: the widescreen field of view on or off.
 - `PT LIGHTSIZE n`: the size lights cast shadows from, as `LightSize`.
 - `PT PINNEDUI 16:9 | 4:3 | OFF`: the UI kept to a box of that shape in the

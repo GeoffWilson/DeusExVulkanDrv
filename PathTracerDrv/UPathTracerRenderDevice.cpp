@@ -1995,6 +1995,15 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			MaterialsEnabled = !MaterialsEnabled;
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("MESHLIGHT")))
+		{
+			DisableBits ^= 1024u;
+			AccumulatedFrames = 0;
+			Ar.Logf(TEXT("PT: meshes lit %s"), (DisableBits & 1024u)
+				? TEXT("as flat surfaces are, by N.L")
+				: TEXT("as the engine lights them, brighter and flatter, with its rim"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("WIDESCREEN")))
 		{
 			WidescreenFovEnabled = !WidescreenFovEnabled;
@@ -2093,7 +2102,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | MESHLIGHT | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

@@ -241,6 +241,16 @@ bool LevelScene::BuildStatic(ULevel* level)
 // Does this texture change by itself? Either it regenerates in place, or it is
 // a link in an animation chain. A surface wearing one cannot reuse what was
 // accumulated for it on earlier frames.
+// An instance's Ambient.w: its magnitude one more than the actor's
+// ScaleGlow, which the engine scales a lit mesh's lighting by, and negative
+// when it moved or changed since the last frame, which throws away the
+// history of the pixels it covers.
+static float InstanceFlags(bool moved, float scaleGlow)
+{
+	const float magnitude = 1.0f + Clamp(scaleGlow, 0.0f, 16.0f);
+	return moved ? -magnitude : magnitude;
+}
+
 static bool TextureAnimates(UTexture* texture)
 {
 	// Judged when the geometry is built. A texture that only gains its
@@ -1055,7 +1065,7 @@ void LevelScene::CollectDecals(ULevel* level)
 	MakeIdentity(instance.Transform);
 	// Flagged as changed on the frame a decal arrives or goes, so the pixels
 	// under it drop what they had accumulated of the bare wall.
-	instance.Ambient = vec4(0.0f, 0.0f, 0.0f, changed ? 1.0f : 0.0f);
+	instance.Ambient = vec4(0.0f, 0.0f, 0.0f, InstanceFlags(changed, 1.0f));
 	Instances.push_back(instance);
 }
 
@@ -1775,7 +1785,7 @@ void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCo
 	}
 
 	instance.Mask = mask;
-	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, (moved || isSprite) ? 1.0f : 0.0f);
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved || isSprite, actor->ScaleGlow));
 	Instances.push_back(instance);
 }
 
@@ -2028,7 +2038,7 @@ void LevelScene::AddViewModel()
 	const vec3 ambient = item->bUnlit ? vec3(glow, glow, glow) : ZoneAmbient(ViewActor->Region.Zone);
 	// Always counted as having moved: it rides the camera, and it bobs even
 	// when the camera does not.
-	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, 1.0f);
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(true, item->ScaleGlow));
 	if (HaveViewModelTransform)
 	{
 		instance.HasPrevious = true;
