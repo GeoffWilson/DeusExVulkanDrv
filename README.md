@@ -73,11 +73,10 @@ That makes it run:
 tenth of a millisecond, whatever its size.
 
 It has been developed on an RTX 4090 with a 3440x1440 display and the game at
-1920x1440. The Hong Kong market, one of the heaviest scenes, ran at about 85
-frames a second with materials and 104 with `Materials=False` when the tracing
-was still inside the game's process; smaller scenes reach the 120 the frame
-limiter holds them to. `LogTimings` says where a frame's time goes, the GPU's
-side included.
+1920x1440. The Hong Kong market, one of the heaviest scenes, runs at about 145
+frames a second uncapped with materials on, with a 1% low of about 118; the
+frame limiter holds it to 120 by default. `LogTimings` says where a frame's
+time goes, the GPU's side included, and what frame rate that came to.
 
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
@@ -179,7 +178,13 @@ what it counts as.
   short history where a moving shadow or an animated light crosses it.
 
 **The CPU overlaps the GPU.** Gathering the next frame's actors runs while the
-previous frame is still tracing; only the upload waits for it.
+previous frame is still tracing, and the helper records the next frame while
+the GPU traces the last, then queues it behind it. Everything a frame writes
+for the GPU is staged per frame and copied in on the GPU, so the frame still
+in flight is never written under. Measured against v1.1, which recorded a
+frame only once the last was done, in the Hong Kong market: 106 frames a
+second became 146 and the 1% low 78 became 118, and a frame now takes as long
+as the GPU does.
 
 **2D.** The HUD, menus and console are rasterised over the traced picture, so
 the game is fully playable.
@@ -210,15 +215,16 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `LightScale`: a percentage applied to every light's brightness.
 - `Denoise`: NRD from the start. `PT DENOISE` switches it for the session.
 - `LogTimings`: logs where each frame's time goes, averaged every few hundred
-  frames: the CPU's side, and the GPU's own time on the scene build, the trace,
-  the denoiser, the pass that puts the picture back together and the 2D, from
-  timestamps. Written to `PathTracerTimings.log` as well as the game's log,
-  which loses its last few lines when the game closes under wine.
+  frames: the CPU's side and the helper's, the GPU's own time on the scene
+  build, the trace, the denoiser and the pass that puts the picture back
+  together, from timestamps, and the frame rate and 1% low all that came to.
+  Written to `PathTracerTimings.log` as well as the game's log, which loses its
+  last few lines when the game closes under wine.
 - `DebugMode`: 1 shows only what moves, 2 shows plain albedo with no lighting.
 - `Materials`: surfaces made of something, as above. Off, everything is matte
   and the frame costs what it did before materials: in the Hong Kong market on
-  an RTX 4090 at 1920x1440 they add about 2 ms of GPU time a frame, 104 frames a
-  second against 85. Half a millisecond of that is the denoiser's specular half,
+  an RTX 4090 at 1920x1440 they add about 2 ms of GPU time a frame. Half a
+  millisecond of that is the denoiser's specular half,
   which is only built with materials on. `PT NOMATERIALS` switches them for the
   session.
 - `GlossBounces`: how far a smooth surface's reflection is traced. 1 lights what
