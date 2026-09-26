@@ -263,3 +263,17 @@ add_executable(vkrtcheck EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/spike/vkr
 target_include_directories(vkrtcheck PRIVATE "${ZVULKAN_DIR}/include")
 target_compile_options(vkrtcheck PRIVATE /MT /EHsc)
 set_target_properties(vkrtcheck PROPERTIES OUTPUT_NAME "vkrtcheck")
+
+# Can a 32-bit process show what a 64-bit one ray traced? Built once 32-bit
+# (vkxshare.exe, the game's side) and once 64-bit (vkxshare64.exe, the helper
+# it starts), from the same file; see spike/README.md.
+#   cmake --build build-deusex --target vkxshare
+#   cmake --build build-x64 --target vkxshare      # configured with xwin-clang-cl-x64.cmake
+add_executable(vkxshare EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/spike/vkxshare.cpp")
+target_include_directories(vkxshare PRIVATE "${ZVULKAN_DIR}/include")
+target_compile_options(vkxshare PRIVATE /MT /EHsc)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+	set_target_properties(vkxshare PROPERTIES OUTPUT_NAME "vkxshare64")
+else()
+	set_target_properties(vkxshare PROPERTIES OUTPUT_NAME "vkxshare")
+endif()

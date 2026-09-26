@@ -8,5 +8,6 @@
 /D3D11Drv/*.user
 /D3D12Drv/*.user
 /build-deusex
+/build-x64
 /.xwin
 /.xwin-cache

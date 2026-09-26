@@ -102,3 +102,53 @@ cmake -S . -B build-win64-spike -G Ninja      # from an x64 developer prompt
 cmake --build build-win64-spike --target vkrtcheck
 build-win64-spike/vkrtcheck.exe
 ```
+
+## vkxshare
+
+Can a 32-bit process show what a 64-bit process ray traced, frame after frame,
+without copying it through the CPU?
+
+The table above says where ray tracing is offered: to 64-bit clients everywhere,
+to 32-bit ones only under upstream wine. A path traced render device could
+keep reading the level in the game's 32-bit process and hand the tracing to a
+64-bit helper - if the two can share an image on the GPU and tell each other
+when it is ready. That takes `VK_KHR_external_memory_win32` and
+`VK_KHR_external_semaphore_win32` on both sides, on the same GPU.
+
+One source, built twice. `vkxshare.exe` (32-bit) is the game's side: it reports
+what its own driver offers, starts `vkxshare64.exe` beside it as the helper on
+the GPU with the same UUID, and imports the image and two semaphores the helper
+exports. Then for 60 frames the helper writes a different pattern into the
+image and signals "ready"; the game's side waits for that on the GPU, reads the
+image back and checks every texel, and signals "released" for the next frame.
+The image is RGBA8 with storage, sampled and transfer usage, as a render target
+shared this way would be.
+
+```sh
+cmake --build build-deusex --target vkxshare          # 32-bit, the usual build
+cmake -S . -B build-x64 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/xwin-clang-cl-x64.cmake
+cmake --build build-x64 --target vkxshare             # 64-bit helper
+# both .exe files in one folder, then:
+wine vkxshare.exe
+```
+
+Measured on an RTX 4090, driver 615.71.09, each Proton in a fresh prefix:
+
+| Environment         | 32-bit ray tracing | 64-bit ray tracing | shared, 60 frames | GPU side per handoff |
+| ------------------- | ------------------ | ------------------ | ----------------- | -------------------- |
+| wine 11.18          | yes                | yes                | intact            | 0.117 ms             |
+| Proton Experimental | no                 | yes                | intact            | 0.121 ms             |
+| GE-Proton 11-6      | no                 | yes                | intact            | 0.116 ms             |
+| Proton-CachyOS      | no                 | yes                | intact            | 0.115 ms             |
+| DW-Proton           | no                 | yes                | intact            | 0.117 ms             |
+| Windows             | no                 | yes                | not yet measured  |                      |
+
+So under every Proton a 64-bit helper gets the ray tracing the 32-bit game
+does not, and the two share an image with nothing lost, on the same GPU (UUID
+and LUID agree). That makes a helper process the way to run the path tracer
+from Steam, not only under upstream wine - and on Windows too, if NVIDIA's
+32-bit ICD imports the 64-bit one's memory as winevulkan does. The per handoff
+figure is the whole of the game's submission - waiting on the helper's
+semaphore, taking ownership, copying 256 KB back and returning it - from submit
+to fence.

@@ -15,7 +15,14 @@ xwin --accept-license --arch x86 --cache-dir ../.xwin-cache splat --output ../.x
 ```
 
 `../.xwin` (next to the repository) is where the toolchain file looks by
-default; pass `-DXWIN_DIR=/some/path` to override. Also needed: `clang-cl`,
+default; pass `-DXWIN_DIR=/some/path` to override. The 64-bit half of the
+`vkxshare` spike needs the x64 libraries as well, in a folder of their own that
+`xwin-clang-cl-x64.cmake` looks for:
+
+```sh
+xwin --accept-license --arch x86_64 --cache-dir ../.xwin-cache splat --output ../.xwin-x64
+```
+ Also needed: `clang-cl`,
 `lld-link`, `llvm-lib`, `llvm-rc`, `cmake`, `ninja` and `python3`.
 
 ## Building
