@@ -2,6 +2,7 @@
 #include "UPathTracerRenderDevice.h"
 #include "Shaders.h"
 #include "Materials.h"
+#include "TraceProtocol.h"
 #include <stdexcept>
 #include <chrono>
 #include <thread>
@@ -276,41 +277,15 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 			.Win32Window((HWND)Viewport->GetWindow())
 			.Create(Instance);
 
+		// This device only presents: the tracing is the helper's. What it does
+		// need is to take the helper's frame over on the GPU, which is two
+		// extensions every driver tested offers a 32-bit client.
 		auto deviceBuilder = VulkanDeviceBuilder();
 		deviceBuilder.Surface(Surface);
-		// Asked for rather than required. Requiring them makes device selection
-		// fail with "no device meets the minimum requirements", which says
-		// nothing about which requirement or why - and the usual reason here is
-		// not the GPU at all but what the translation layer chose to pass on.
-		deviceBuilder.OptionalRayQuery();
-		// Needed to index the texture array by what the ray happened to hit,
-		// which differs between neighbouring invocations. Optional: without it
-		// the trace falls back to one averaged colour per surface.
-		deviceBuilder.OptionalDescriptorIndexing();
+		deviceBuilder.RequireExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+		deviceBuilder.RequireExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
 		deviceBuilder.SelectDevice(VkDeviceIndex);
 		Device = deviceBuilder.Create(Instance);
-
-		// Texturing needs to index the array by whatever each ray hit, which is
-		// not uniform across a workgroup. Without it the trace still runs.
-		CanSampleTextures =
-			Device->EnabledFeatures.DescriptorIndexing.runtimeDescriptorArray &&
-			Device->EnabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing;
-		if (!CanSampleTextures)
-			debugf(TEXT("PathTracer: no descriptor indexing, surfaces will use one averaged colour each."));
-
-		if (!Device->EnabledFeatures.RayQuery.rayQuery || !Device->EnabledFeatures.AccelerationStructure.accelerationStructure)
-		{
-			debugf(TEXT("PathTracerDrv needs VK_KHR_ray_query and VK_KHR_acceleration_structure, which this device did not offer."));
-			debugf(TEXT("The GPU almost certainly supports them. Whether a 32 bit client is told about them is a separate question:"));
-			debugf(TEXT("  - Proton does not pass them through to 32 bit clients (every build tested, as of 2026-09)."));
-			debugf(TEXT("  - Upstream wine 11.17 does."));
-			debugf(TEXT("  - Native Windows asks the driver directly, and NVIDIA's 32 bit ICD does not offer them"));
-			debugf(TEXT("    at all: measured on an RTX 4090, driver 32.0.16.1692, where the same machine's 64 bit"));
-			debugf(TEXT("    client is offered all of them."));
-			debugf(TEXT("spike/vkrtcheck.cpp reports what any given environment actually offers."));
-			Exit();
-			return 0;
-		}
 
 		const auto& props = Device->PhysicalDevice.Properties.Properties;
 		debugf(TEXT("PathTracer device: %s"), appFromAnsi(props.deviceName));
@@ -326,12 +301,14 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 		ImageAvailableSemaphore = SemaphoreBuilder().DebugName("PathTracerImageAvailable").Create(Device.get());
 		RenderFinishedSemaphore = SemaphoreBuilder().DebugName("PathTracerRenderFinished").Create(Device.get());
 
-		Accel.reset(new AccelStructure(this));
 		Textures.reset(new TextureCache(this));
-
-		CreateTracePipeline();
 		CreateTilePipeline();
-		CreateCompositePipeline();
+
+		if (!StartTracer())
+		{
+			Exit();
+			return 0;
+		}
 
 		// Says the shaders compiled and the pipelines exist. Without it a
 		// failure and a successful start that simply never rendered a level
@@ -355,93 +332,10 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	unguard;
 }
 
-void UPathTracerRenderDevice::CreateTracePipeline()
-{
-	DescriptorLayout = DescriptorSetLayoutBuilder()
-		.AddBinding(0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.DebugName("PathTracerSetLayout")
-		.Create(Device.get());
-
-	DescriptorPool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 + GuideImageCount)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LevelScene::MaxTextures)
-		.MaxSets(1)
-		.DebugName("PathTracerDescriptorPool")
-		.Create(Device.get());
-
-	DescriptorSetOwner = DescriptorPool->allocate(DescriptorLayout.get());
-	DescriptorSet = DescriptorSetOwner.get();
-
-	// Every slot matte until the scene says otherwise, which is how every
-	// surface was shaded before there were materials.
-	MaterialBuffer = BufferBuilder()
-		.Size(LevelScene::MaxTextures * sizeof(vec4))
-		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
-		.DebugName("PathTracerMaterials")
-		.Create(Device.get());
-	{
-		auto* mapped = (vec4*)MaterialBuffer->Map(0, LevelScene::MaxTextures * sizeof(vec4));
-		for (int i = 0; i < LevelScene::MaxTextures; i++)
-			mapped[i] = Materials::Matte();
-		MaterialBuffer->Unmap();
-	}
-	WrittenMaterials = 0;
-	WriteDescriptors()
-		.AddBuffer(DescriptorSet, 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaterialBuffer.get())
-		.Execute(Device.get());
-
-	PipelineLayout = PipelineLayoutBuilder()
-		.AddSetLayout(DescriptorLayout.get())
-		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants))
-		.DebugName("PathTracerPipelineLayout")
-		.Create(Device.get());
-
-	const char* prologue =
-		"#version 460\r\n"
-		"#extension GL_EXT_ray_query : enable\r\n";
-
-	TraceShader = ShaderBuilder()
-		.Type(ShaderType::Compute)
-		.AddSource("shaders/Trace.comp", Shaders::Trace())
-		.DebugName("PathTracerTrace")
-		.Create("PathTracerTrace", Device.get());
-	(void)prologue;
-
-	TracePipeline = ComputePipelineBuilder()
-		.Layout(PipelineLayout.get())
-		.ComputeShader(TraceShader.get())
-		.DebugName("PathTracerTracePipeline")
-		.Create(Device.get());
-}
-
 // Everything about how an actor is drawn, for when one draws wrongly: its
 // flags, glow and skins, then each of its mesh's materials with the texture,
-// what is in it, and what the texture cache holds for it. PT WEAPON and PT LOOK.
-static void DescribeActor(AActor* actor, UMesh* mesh, TextureCache* textures)
+// and what is in it. PT WEAPON and PT LOOK.
+static void DescribeActor(AActor* actor, UMesh* mesh)
 {
 	auto nameOf = [](UObject* o) { return o ? o->GetName() : TEXT("none"); };
 	auto classOf = [](UObject* o) { return o ? o->GetClass()->GetName() : TEXT("-"); };
@@ -499,105 +393,7 @@ static void DescribeActor(AActor* actor, UMesh* mesh, TextureCache* textures)
 		for (TFieldIterator<UObjectProperty> it(texture->GetClass()); it; ++it)
 			if (!appStricmp(it->GetName(), TEXT("SourceTexture")))
 				describe(*(UTexture**)((BYTE*)texture + it->Offset), TEXT("source"));
-		for (int masked = 0; masked < 2; masked++)
-		{
-			CachedTexture* cached = textures ? textures->FindForScene(texture, masked != 0) : nullptr;
-			if (cached)
-				debugf(TEXT("    cached (masked %d): %dx%d realtime %d source %s last frame %s"),
-					masked, cached->Width, cached->Height, (int)cached->Realtime,
-					cached->Source ? cached->Source->GetName() : TEXT("none"),
-					cached->LastFrame ? cached->LastFrame->GetName() : TEXT("none"));
-		}
 	}
-}
-
-// Made the first time it is wanted, so a game that never denoises neither
-// builds NRD's pipelines nor risks them failing. A failure switches denoising
-// off rather than taking the device down with it.
-void UPathTracerRenderDevice::EnsureDenoiser()
-{
-	// Materials switched since it was made: its first signal is the wrong
-	// shape, so it is made again. Nothing may still be using the old one.
-	if (Denoise && Denoise->HasSpecular() != MaterialsEnabled)
-	{
-		WaitForPreviousFrame();
-		vkDeviceWaitIdle(Device->device);
-		Denoise.reset();
-		DenoiseRestart = true;
-		DescriptorsDirty = true;
-	}
-
-	if (!DenoiseEnabled || Denoise || !Device || !TraceWidth)
-		return;
-
-	try
-	{
-		Denoise.reset(new Denoiser(Device.get(), MaterialsEnabled));
-		Denoise->Resize(TraceWidth, TraceHeight);
-	}
-	catch (const std::exception& e)
-	{
-		debugf(TEXT("PathTracer denoiser failed: %s"), *Widen(e.what()));
-		Denoise.reset();
-		DenoiseEnabled = false;
-	}
-	DescriptorsDirty = true;
-	if (Denoise)
-		debugf(TEXT("PathTracer denoiser: %s"), *Widen(Denoise->Problem()));
-}
-
-// The pass after the denoiser: the trace's emission and surface colours, NRD's
-// lighting and the fog, into the output image.
-void UPathTracerRenderDevice::CreateCompositePipeline()
-{
-	DescriptorSetLayoutBuilder layout;
-	for (int i = 0; i < 9; i++)
-		layout.AddBinding(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
-	CompositeLayout = layout.DebugName("PathTracerCompositeSetLayout").Create(Device.get());
-
-	CompositePool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9)
-		.MaxSets(1)
-		.DebugName("PathTracerCompositePool")
-		.Create(Device.get());
-	CompositeSet = CompositePool->allocate(CompositeLayout.get());
-
-	CompositePipelineLayout = PipelineLayoutBuilder()
-		.AddSetLayout(CompositeLayout.get())
-		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vec4) * 2)
-		.DebugName("PathTracerCompositePipelineLayout")
-		.Create(Device.get());
-
-	CompositeShader = ShaderBuilder()
-		.Type(ShaderType::Compute)
-		.AddSource("shaders/Composite.comp", Shaders::Composite())
-		.DebugName("PathTracerComposite")
-		.Create("PathTracerComposite", Device.get());
-
-	CompositePipeline = ComputePipelineBuilder()
-		.Layout(CompositePipelineLayout.get())
-		.ComputeShader(CompositeShader.get())
-		.DebugName("PathTracerCompositePipeline")
-		.Create(Device.get());
-}
-
-void UPathTracerRenderDevice::WriteCompositeDescriptors()
-{
-	if (!CompositeSet || !OutputView || !Denoise || !Denoise->Available() || !Denoise->Output(0))
-		return;
-
-	WriteDescriptors()
-		.AddStorageImage(CompositeSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 1, GuideViews[4].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 2, GuideViews[5].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 3, GuideViews[6].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 4, Denoise->Output(0), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 5, Denoise->Output(1), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 6, GuideViews[7].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 7, GuideViews[11].get(), VK_IMAGE_LAYOUT_GENERAL)
-		// Never read without materials, but a descriptor still has to be valid.
-		.AddStorageImage(CompositeSet.get(), 8, Denoise->SpecularOutput() ? Denoise->SpecularOutput() : GuideViews[10].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.Execute(Device.get());
 }
 
 std::unique_ptr<VulkanDescriptorSet> UPathTracerRenderDevice::AllocateTileDescriptorSet(VulkanImageView* view)
@@ -611,13 +407,6 @@ std::unique_ptr<VulkanDescriptorSet> UPathTracerRenderDevice::AllocateTileDescri
 
 void UPathTracerRenderDevice::CreateTilePipeline()
 {
-	SceneSampler = SamplerBuilder()
-		.MinFilter(VK_FILTER_LINEAR)
-		.MagFilter(VK_FILTER_LINEAR)
-		.AddressMode(VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT)
-		.DebugName("PathTracerSceneSampler")
-		.Create(Device.get());
-
 	TileSampler = SamplerBuilder()
 		.MinFilter(VK_FILTER_LINEAR)
 		.MagFilter(VK_FILTER_LINEAR)
@@ -753,11 +542,12 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 	memcpy(mapped, TileVertices.data(), byteSize);
 	TileVertexBuffer->Unmap();
 
-	// The trace wrote this image; the tiles are about to read and blend over it.
-	// The layout does not change - only the ordering and visibility do.
+	// The helper's frame was copied into this image; the tiles are about to
+	// read and blend over it. The layout does not change - only the ordering
+	// and visibility do.
 	PipelineBarrier()
-		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
-		.Execute(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
 	RenderPassBegin()
 		.RenderPass(TileRenderPass.get())
@@ -799,8 +589,8 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 	commands->endRenderPass();
 
 	PipelineBarrier()
-		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT)
-		.Execute(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 }
 
 // Keep the engine's cursor clip on the window we actually have.
@@ -939,103 +729,27 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 {
 	// Sized to the viewport rather than the window: the result is blitted, so
 	// the two need not agree and the trace should cost what the game asked for.
+	// The helper follows whatever size the frames are asked for at.
 	int width = Max((int)Viewport->SizeX, 1);
 	int height = Max((int)Viewport->SizeY, 1);
 
-	if (AccumImage && width == TraceWidth && height == TraceHeight)
+	if (OutputImage && width == TraceWidth && height == TraceHeight)
 		return;
 	PathTracerEvent("trace buffers %dx%d -> %dx%d", TraceWidth, TraceHeight, width, height);
 
 	vkDeviceWaitIdle(Device->device);
 
 	TileFramebuffer.reset();
-	AccumView.reset();
-	AccumImage.reset();
-	HistoryView.reset();
-	HistoryImage.reset();
 	OutputView.reset();
 	OutputImage.reset();
-	MotionView.reset();
-	ReflectionMotionView.reset();
-	for (int i = 0; i < GuideImageCount; i++)
-	{
-		GuideViews[i].reset();
-		GuideImages[i].reset();
-	}
-
-	AccumImage = ImageBuilder()
-		.Format(VK_FORMAT_R32G32B32A32_SFLOAT)
-		.Size(width, height)
-		.Usage(VK_IMAGE_USAGE_STORAGE_BIT)
-		.DebugName("PathTracerAccum")
-		.Create(Device.get());
-	AccumView = ImageViewBuilder().Image(AccumImage.get(), VK_FORMAT_R32G32B32A32_SFLOAT).DebugName("PathTracerAccumView").Create(Device.get());
-
-	// What each pixel was looking at last frame: the world position it hit and
-	// which instance owned it. Compared against this frame to decide whether the
-	// pixel's accumulated history still describes the same thing.
-	HistoryImage = ImageBuilder()
-		.Size(width, height)
-		.Format(VK_FORMAT_R32G32B32A32_SFLOAT)
-		.Usage(VK_IMAGE_USAGE_STORAGE_BIT)
-		.DebugName("PathTracerHistory")
-		.Create(Device.get());
-	HistoryView = ImageViewBuilder().Image(HistoryImage.get(), VK_FORMAT_R32G32B32A32_SFLOAT).DebugName("PathTracerHistoryView").Create(Device.get());
 
 	OutputImage = ImageBuilder()
 		.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
 		.Size(width, height)
-		.Usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+		.Usage(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
 		.DebugName("PathTracerOutput")
 		.Create(Device.get());
 	OutputView = ImageViewBuilder().Image(OutputImage.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName("PathTracerOutputView").Create(Device.get());
-
-	// In the trace shader's binding order. Depth and motion want the full
-	// precision; the rest are colours and normals.
-	for (int i = 0; i < GuideImageCount; i++)
-	{
-		const VkFormat format = GuideIsDepth(i) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-		GuideImages[i] = ImageBuilder()
-			.Format(format)
-			.Size(width, height)
-			.Usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
-			.DebugName("PathTracerGuide")
-			.Create(Device.get());
-		GuideViews[i] = ImageViewBuilder().Image(GuideImages[i].get(), format).DebugName("PathTracerGuideView").Create(Device.get());
-	}
-
-	// NRD reads motion from x and y, where the trace keeps the depth; a view
-	// of the same image with its channels moved along says it without
-	// another image or another pass.
-	auto motionView = [&](VulkanImage* image)
-	{
-		VkImageViewCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-		info.image = image->image;
-		info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-		info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-		info.components = { VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE };
-		info.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-		VkImageView view = VK_NULL_HANDLE;
-		vkCreateImageView(Device->device, &info, nullptr, &view);
-		return std::unique_ptr<VulkanImageView>(new VulkanImageView(Device.get(), view));
-	};
-	MotionView = motionView(GuideImages[1].get());
-	ReflectionMotionView = motionView(GuideImages[9].get());
-
-	if (Denoise)
-	{
-		try
-		{
-			Denoise->Resize(width, height);
-		}
-		catch (const std::exception& e)
-		{
-			debugf(TEXT("PathTracer denoiser failed: %s"), *Widen(e.what()));
-			Denoise.reset();
-			DenoiseEnabled = false;
-		}
-	}
-	DenoiseRestart = true;
 
 	// The tile pass draws into the traced image, so its framebuffer follows the
 	// image rather than the window.
@@ -1052,19 +766,23 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	TraceWidth = width;
 	TraceHeight = height;
 	AccumulatedFrames = 0;
-	DescriptorsDirty = true;
+	DenoiseRestart = true;
 
-	// Both images start undefined and the trace shader writes them as GENERAL.
-	ExecuteImmediate([this](VulkanCommandBuffer* cmd)
+	// Black until the helper's first frame arrives, and in the GENERAL layout
+	// the frame keeps it in throughout.
+	VulkanImage* image = OutputImage.get();
+	ExecuteImmediate([image](VulkanCommandBuffer* cmd)
 	{
-		PipelineBarrier barrier;
-		barrier
-			.AddImage(AccumImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
-			.AddImage(HistoryImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
-			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
-		for (int i = 0; i < GuideImageCount; i++)
-			barrier.AddImage(GuideImages[i].get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
-		barrier.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		PipelineBarrier()
+			.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
+			.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkClearColorValue black = {};
+		black.float32[3] = 1.0f;
+		VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		vkCmdClearColorImage(cmd->buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+		PipelineBarrier()
+			.AddImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+			.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 	});
 
 	debugf(TEXT("PathTracer buffers: %dx%d"), width, height);
@@ -1072,152 +790,6 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 
 void UPathTracerRenderDevice::ReleaseSwapChainResources()
 {
-}
-
-// Bind whatever textures the scene has registered since the last frame.
-//
-// Written incrementally: the registry only ever grows within a level, and
-// rewriting a thousand descriptors every frame to add one is wasteful.
-void UPathTracerRenderDevice::UpdateSceneTextures()
-{
-	guard(UPathTracerRenderDevice::UpdateSceneTextures);
-
-	// Materials first: they mean something even where textures cannot be
-	// sampled, since a surface's texture index is still what it is made of.
-	WriteMaterials();
-
-	if (!CanSampleTextures || !DescriptorSet || !Textures || !SceneSampler)
-		return;
-
-	CachedTexture* white = Textures->White();
-	if (!white || !white->View)
-		return;
-
-	// Every slot starts valid. A descriptor that is never read still has to be
-	// something, and filling the array once is cheaper than tracking which
-	// slots the shader might reach.
-	if (!SceneTexturesInitialised)
-	{
-		SceneTexturesInitialised = true;
-		WriteDescriptors writes;
-		for (int i = 0; i < LevelScene::MaxTextures; i++)
-			writes.AddCombinedImageSampler(DescriptorSet, 6, i, white->View.get(), SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-		writes.Execute(Device.get());
-	}
-
-	// A new level empties the registry, so what is already bound can outnumber
-	// what the scene now wants. Start again rather than leave stale slots.
-	if (Scene.Textures.size() < BoundSceneTextures)
-		BoundSceneTextures = 0;
-
-	const size_t wanted = std::min<size_t>(Scene.Textures.size(), LevelScene::MaxTextures);
-	if (wanted <= BoundSceneTextures)
-		return;
-
-	WriteDescriptors writes;
-	for (size_t i = BoundSceneTextures; i < wanted; i++)
-	{
-		UTexture* texture = Scene.Textures[i];
-		CachedTexture* cached = Textures->GetForScene(texture, Scene.TextureMasked[i]);
-		VulkanImageView* view = (cached && cached->View) ? cached->View.get() : white->View.get();
-
-		// Named, so a texture that comes out wrong on screen can be identified
-		// rather than guessed at.
-		if (!cached && TextureFailuresLogged < 24)
-		{
-			TextureFailuresLogged++;
-			debugf(TEXT("PathTracer texture %d '%s' (%s) %dx%d could not be uploaded"),
-				(int)i, texture->GetName(),
-				texture->GetClass() ? texture->GetClass()->GetName() : TEXT("?"),
-				(int)texture->USize, (int)texture->VSize);
-		}
-		writes.AddCombinedImageSampler(DescriptorSet, 6, (int)i, view, SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-	}
-	writes.Execute(Device.get());
-	BoundSceneTextures = wanted;
-
-	unguard;
-}
-
-// The materials of whatever textures the scene has registered since the last
-// frame, into the slots the texture array gives them. Only ever called once
-// the previous frame is finished with the buffer.
-void UPathTracerRenderDevice::WriteMaterials()
-{
-	if (!MaterialBuffer)
-		return;
-
-	// A new level starts the registry again.
-	if (Scene.TextureMaterials.size() < WrittenMaterials)
-		WrittenMaterials = 0;
-	const size_t wanted = std::min<size_t>(Scene.TextureMaterials.size(), LevelScene::MaxTextures);
-	if (wanted <= WrittenMaterials)
-		return;
-
-	auto* mapped = (vec4*)MaterialBuffer->Map(0, LevelScene::MaxTextures * sizeof(vec4));
-	for (size_t i = WrittenMaterials; i < wanted; i++)
-		mapped[i] = Scene.TextureMaterials[i];
-	MaterialBuffer->Unmap();
-	WrittenMaterials = wanted;
-}
-
-void UPathTracerRenderDevice::UpdateDescriptors()
-{
-	if (!DescriptorsDirty || !Accel || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !MotionBuffer)
-		return;
-
-	WriteDescriptors writes;
-	for (int i = 0; i < GuideImageCount; i++)
-		writes.AddStorageImage(DescriptorSet, GuideBinding(i), GuideViews[i].get(), VK_IMAGE_LAYOUT_GENERAL);
-	writes.AddBuffer(DescriptorSet, 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MotionBuffer.get());
-	writes
-		.AddAccelerationStructure(DescriptorSet, 0, Accel->GetTopLevel())
-		.AddStorageImage(DescriptorSet, 1, AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(DescriptorSet, 2, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(DescriptorSet, 7, HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddBuffer(DescriptorSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
-		.AddBuffer(DescriptorSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
-		.AddBuffer(DescriptorSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
-		.AddBuffer(DescriptorSet, 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightGridBuffer())
-		.Execute(Device.get());
-	WriteCompositeDescriptors();
-
-	DescriptorsDirty = false;
-}
-
-// Last frame's camera, then each instance's last placement as three rows, in
-// the order the top level structure numbers them. An instance with no last
-// placement - new this frame, or one that never moves - is given its current
-// one, which reads as not having moved.
-void UPathTracerRenderDevice::WriteMotion(const TracePushConstants& previousCamera)
-{
-	const size_t count = Scene.Instances.size();
-	const size_t wanted = 4 + std::max<size_t>(count, 1) * 3;
-	if (!MotionBuffer || wanted > MotionCapacity)
-	{
-		MotionCapacity = std::max<size_t>(wanted * 2, 4 + 256 * 3);
-		MotionBuffer = BufferBuilder()
-			.Size(MotionCapacity * sizeof(vec4))
-			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
-			.MinAlignment(256)
-			.DebugName("PathTracerMotion")
-			.Create(Device.get());
-		DescriptorsDirty = true;
-	}
-
-	auto* mapped = (vec4*)MotionBuffer->Map(0, wanted * sizeof(vec4));
-	mapped[0] = previousCamera.CameraOrigin;
-	mapped[1] = previousCamera.CameraRight;
-	mapped[2] = previousCamera.CameraUp;
-	mapped[3] = previousCamera.CameraForward;
-	for (size_t i = 0; i < count; i++)
-	{
-		const SceneInstance& instance = Scene.Instances[i];
-		const float* m = instance.HasPrevious ? instance.PreviousTransform : instance.Transform;
-		for (int r = 0; r < 3; r++)
-			mapped[4 + i * 3 + r] = vec4(m[r * 4 + 0], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
-	}
-	MotionBuffer->Unmap();
 }
 
 void UPathTracerRenderDevice::ExecuteImmediate(const std::function<void(VulkanCommandBuffer*)>& fn)
@@ -1250,11 +822,9 @@ void UPathTracerRenderDevice::WaitForPreviousFrame()
 		Timings.Wait += NowMs() - waitStart;
 		vkResetFences(Device->device, 1, &handle);
 	}
-	ReadTimestamps();
 
 	// The submission is done with them now.
 	PendingCommands.reset();
-	RealtimeStaging.clear();
 }
 
 // A timing line to the game's log, and to PathTracerTimings.log beside it. The
@@ -1270,24 +840,6 @@ void UPathTracerRenderDevice::WriteTimingLine(const char* line)
 	}
 }
 
-void UPathTracerRenderDevice::ReadTimestamps()
-{
-	if (!TimestampsPending || !Timestamps)
-		return;
-	TimestampsPending = false;
-
-	uint64_t t[TimestampCount] = {};
-	if (!Timestamps->getResults(0, TimestampCount, sizeof(t), t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT))
-		return;
-	auto ms = [&](int a, int b) { return t[b] > t[a] ? (double)(t[b] - t[a]) * TimestampPeriodMs : 0.0; };
-	Timings.GpuBuild += ms(0, 1);
-	Timings.GpuTrace += ms(1, 2);
-	Timings.GpuDenoise += ms(2, 3);
-	Timings.GpuComposite += ms(3, 4);
-	Timings.GpuTiles += ms(4, 5);
-	Timings.GpuFrames++;
-}
-
 void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 {
 	if (!level || !level->Model)
@@ -1301,10 +853,10 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	{
 		debugf(TEXT("PathTracer: building the scene"));
 
-		// Everything the last frame used is about to be destroyed.
+		// Everything the last frame used is about to be destroyed, and the
+		// helper starts again with the new level.
 		WaitForPreviousFrame();
-
-		Accel->Reset();
+		SceneReset = true;
 		DenoiseRestart = true;
 		if (!Scene.BuildStatic(level))
 		{
@@ -1317,21 +869,16 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 			Scene.MirroredCount());
 	}
 
-	// Every frame: where the movers and the mesh actors are now. New shapes get
-	// a bottom level structure the first time they are seen.
+	// Every frame: where the movers and the mesh actors are now. New shapes are
+	// sent to the helper when the frame is.
 	const size_t geometriesBefore = Scene.Geometries.size();
 	Scene.LightScale = Max(LightScale, 1) / 100.0f;
 	Scene.HighlightSpecialLights = (DisableBits & 16u) != 0;
-	// Gathering is CPU only, so it runs while the GPU is still tracing the
-	// last frame. Uploading is not: the buffers it writes are the ones that
-	// trace is reading.
+	// Gathering is CPU only, so it runs while the GPU is still presenting the
+	// last frame.
 	const double collectStart = NowMs();
 	Scene.CollectDynamic(level);
-	WaitForPreviousFrame();
-	const double syncStart = NowMs();
-	Accel->SyncGeometry(Scene);
-	Timings.Collect += syncStart - collectStart;
-	Timings.Sync += NowMs() - syncStart;
+	Timings.Collect += NowMs() - collectStart;
 
 	// Only when something new appeared, so this says what is being traced
 	// without filling the log every frame.
@@ -1339,12 +886,6 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	{
 		debugf(TEXT("PathTracer: %d shapes, %d instances this frame"),
 			(int)Scene.Geometries.size(), (int)Scene.Instances.size());
-	}
-
-	if (Accel->AttributesChanged())
-	{
-		Accel->ClearAttributesChanged();
-		DescriptorsDirty = true;
 	}
 }
 
@@ -1393,10 +934,10 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// the down-pointing Y axis is used as it stands.
 	const FCoords& c = Frame->Coords;
 
-	PushConstants.CameraOrigin = vec4(c.Origin.X, c.Origin.Y, c.Origin.Z, 0.0f);
-	PushConstants.CameraRight = vec4(c.XAxis.X, c.XAxis.Y, c.XAxis.Z, 0.0f) * halfWidth;
-	PushConstants.CameraUp = vec4(c.YAxis.X, c.YAxis.Y, c.YAxis.Z, 0.0f) * (halfWidth * aspect);
-	PushConstants.CameraForward = vec4(c.ZAxis.X, c.ZAxis.Y, c.ZAxis.Z, 0.0f);
+	Camera.Origin = vec4(c.Origin.X, c.Origin.Y, c.Origin.Z, 0.0f);
+	Camera.Right = vec4(c.XAxis.X, c.XAxis.Y, c.XAxis.Z, 0.0f) * halfWidth;
+	Camera.Up = vec4(c.YAxis.X, c.YAxis.Y, c.YAxis.Z, 0.0f) * (halfWidth * aspect);
+	Camera.Forward = vec4(c.ZAxis.X, c.ZAxis.Y, c.ZAxis.Z, 0.0f);
 
 	HaveCamera = true;
 
@@ -1427,6 +968,117 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 	unguard;
 }
 
+// Starts the helper that traces, from beside this DLL, on this device's GPU.
+bool UPathTracerRenderDevice::StartTracer()
+{
+	HMODULE module = nullptr;
+	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&PathTracerEvent, &module);
+	char path[MAX_PATH] = {};
+	GetModuleFileNameA(module, path, MAX_PATH);
+	std::string directory = path;
+	directory = directory.substr(0, directory.find_last_of("\\/"));
+	const std::string helper = directory + "\\PathTracerHelper.exe";
+
+	Tracer.reset(new TraceClient());
+	if (!Tracer->Start(Device.get(), helper, directory, VkDebug != 0))
+	{
+		const std::string why = Tracer->Error();
+		PathTracerEvent("helper did not start: %s", why.c_str());
+		debugf(TEXT("PathTracerDrv traces in PathTracerHelper.exe, which did not start: %s"), *Widen(why.c_str()));
+		debugf(TEXT("It must be beside PathTracerDrv.dll (%s), and the GPU must offer a 64-bit program ray tracing:"), *Widen(helper.c_str()));
+		debugf(TEXT("VK_KHR_ray_query and VK_KHR_acceleration_structure. Its own log, PathTracerHelper.log, is beside it."));
+		Tracer.reset();
+		return false;
+	}
+
+	const TraceProtocol::Header& status = Tracer->Status();
+	debugf(TEXT("PathTracer: tracing in PathTracerHelper.exe on %s%s"), *Widen(status.DeviceName),
+		status.CanSampleTextures ? TEXT("") : TEXT(", which cannot index textures: surfaces will use one averaged colour each"));
+	PathTracerEvent("helper started on %s", status.DeviceName);
+	SceneReset = true;
+	TracerLost = false;
+	return true;
+}
+
+// Whatever of the scene the helper does not have yet, and what changes every
+// frame: new and rebuilt shapes, new textures with what their surfaces are
+// made of, the next frame of any that animate, and every placement and light.
+bool UPathTracerRenderDevice::SendScene()
+{
+	guard(UPathTracerRenderDevice::SendScene);
+
+	if (SceneReset)
+	{
+		Tracer->ResetScene();
+		SentVersions.clear();
+		SentTextures.clear();
+		SceneReset = false;
+	}
+
+	// Shapes are sent once, and those that are rebuilt - an animating
+	// character, the decals - again whenever they change.
+	for (size_t i = 0; i < Scene.Geometries.size(); i++)
+	{
+		const SceneGeometry& geometry = Scene.Geometries[i];
+		if (i >= SentVersions.size())
+			SentVersions.push_back(geometry.Version);
+		else if (!geometry.Dynamic || SentVersions[i] == geometry.Version)
+			continue;
+		SentVersions[i] = geometry.Version;
+		Tracer->Geometry((uint32_t)i, geometry);
+	}
+
+	const double texturesStart = NowMs();
+	for (size_t i = SentTextures.size(); i < Scene.Textures.size(); i++)
+	{
+		SentTexture sent;
+		sent.Source = Scene.Textures[i];
+		sent.Masked = Scene.TextureMasked[i];
+		int width = 0, height = 0;
+		const bool converted = TextureCache::ScenePixels(sent.Source, sent.Masked, Pixels, width, height);
+		// Named, so a texture that comes out wrong on screen can be identified
+		// rather than guessed at.
+		if (!converted && TextureFailuresLogged < 24)
+		{
+			TextureFailuresLogged++;
+			debugf(TEXT("PathTracer texture %d '%s' (%s) %dx%d could not be converted"),
+				(int)i, sent.Source->GetName(),
+				sent.Source->GetClass() ? sent.Source->GetClass()->GetName() : TEXT("?"),
+				(int)sent.Source->USize, (int)sent.Source->VSize);
+		}
+		sent.Width = converted ? width : 0;
+		sent.Height = converted ? height : 0;
+		sent.Animated = TextureCache::Animates(sent.Source);
+		Tracer->Texture((uint32_t)i, (uint32_t)sent.Width, (uint32_t)sent.Height, converted ? Pixels.data() : nullptr,
+			Scene.TextureMaterials[i], sent.Animated);
+		SentTextures.push_back(sent);
+	}
+
+	// Asked afresh every frame rather than remembered from the first sending,
+	// since a script can give a texture an animation chain after it was first
+	// seen. One frame of an animation shown on its own - a sprite that plays
+	// once chooses it - stays that frame: advancing it would loop it.
+	if (Viewport && Viewport->Actor && Viewport->Actor->Level)
+	{
+		const double time = Viewport->Actor->Level->TimeSeconds;
+		for (size_t i = 0; i < SentTextures.size(); i++)
+		{
+			SentTexture& sent = SentTextures[i];
+			if (!sent.Width || Scene.FixedFrames.count(sent.Source) || !TextureCache::Animates(sent.Source))
+				continue;
+			if (TextureCache::AnimatedPixels(sent.Source, sent.Masked, time, sent.Width, sent.Height, sent.LastFrame, Pixels))
+				Tracer->TexturePixels((uint32_t)i, (uint32_t)sent.Width, (uint32_t)sent.Height, Pixels.data());
+		}
+	}
+	Timings.Textures += NowMs() - texturesStart;
+
+	Tracer->Instances(Scene.Instances, Scene.StaticGeometries);
+	Tracer->Lights(Scene.Lights, Scene.FogLights);
+	return Tracer->Alive();
+
+	unguard;
+}
+
 void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 {
 	guard(UPathTracerRenderDevice::Unlock);
@@ -1436,26 +1088,28 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	// left an acquired swap chain image unpresented, which the compositor shows
 	// as black. Whether the world can be traced and whether the frame must be
 	// presented are different questions.
-	// A frame that drew no world never reached the wait in SetSceneNode.
 	WaitForPreviousFrame();
 
-	if (!Blit || !Accel || !AccumImage)
+	if (!Blit || !OutputImage)
 		return;
 
 	const double frameStart = NowMs();
+
+	// Set once the helper has traced a frame for this one. From then on this
+	// frame owes it: its submission must wait on Ready and signal Released,
+	// or the helper's next frame waits for ever.
+	bool owed = false;
 
 	try
 	{
 		// Accumulate only while the view is still. Any movement and the samples
 		// behind it describe a different picture, so start again.
-		// Compared without w, which carries the screen flash rather than any
-		// part of the view.
 		auto sameXyz = [](const vec4& a, const vec4& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
 		const bool cameraMoved =
-			!sameXyz(PushConstants.CameraOrigin, LastCamera.CameraOrigin) ||
-			!sameXyz(PushConstants.CameraRight, LastCamera.CameraRight) ||
-			!sameXyz(PushConstants.CameraUp, LastCamera.CameraUp) ||
-			!sameXyz(PushConstants.CameraForward, LastCamera.CameraForward);
+			!sameXyz(Camera.Origin, LastCamera.Origin) ||
+			!sameXyz(Camera.Right, LastCamera.Right) ||
+			!sameXyz(Camera.Up, LastCamera.Up) ||
+			!sameXyz(Camera.Forward, LastCamera.Forward);
 		// A door swinging past is as much a change as the camera turning, and
 		// the instance count is a cheap proxy for the scene having moved. It
 		// misses an actor that moves while the count holds, which is why the
@@ -1466,38 +1120,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			AccumulatedFrames = 0;
 		// Where the camera was, for the motion vectors: last frame's, or this
 		// one's on the first frame there is.
-		const bool haveLastCamera = LastCamera.CameraForward.x != 0.0f || LastCamera.CameraForward.y != 0.0f || LastCamera.CameraForward.z != 0.0f;
-		const TracePushConstants previousCamera = haveLastCamera ? LastCamera : PushConstants;
-		LastCamera = PushConstants;
-
-		// The screen flash, as the other devices blend it: the picture times
-		// min(2 * scale, 1), plus the flash colour. Neutral is a scale of one
-		// half and no colour.
-		PushConstants.CameraOrigin.w = Min(FlashScale.X * 2.0f, 1.0f);
-		PushConstants.CameraRight.w = FlashFog.X;
-		PushConstants.CameraUp.w = FlashFog.Y;
-		PushConstants.CameraForward.w = FlashFog.Z;
-
-		// A view of the denoiser's inputs needs them written, and so does the
-		// denoiser.
-		EnsureDenoiser();
-		const bool denoising = DenoiseEnabled && Denoise && Denoise->Available() && ViewMode == 0;
-		PushConstants.Disable = DisableBits | ((ViewMode || denoising) ? 64u : 0u) | (MaterialsEnabled ? 0u : 128u);
-		PushConstants.Counts[0] = FrameIndex++;
-		PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
-		PushConstants.Counts[2] = (uint32_t)Clamp(Bounces, 1, 255) | ((uint32_t)Clamp(GlossBounces, 0, 255) << 8);
-		PushConstants.Counts[3] = AccumulatedFrames;
-		UpdateSceneTextures();
-		PushConstants.TextureCount = (uint32_t)BoundSceneTextures;
-		PushConstants.MaxSamples = (uint32_t)Max(MaxAccumulatedFrames, 1);
-		PushConstants.Time = (Viewport && Viewport->Actor && Viewport->Actor->Level)
-			? (float)fmod((double)Viewport->Actor->Level->TimeSeconds, 1000.0) : 0.0f;
-		PushConstants.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
-		PushConstants.Params = vec4(
-			0.2f + Exposure * (2.0f / 255.0f),
-			SkyIntensity * (2.0f / 255.0f),
-			0.5f,     // ray epsilon, in world units: these levels are big
-			(float)(ViewMode ? ViewMode : DebugMode));
+		const bool haveLastCamera = LastCamera.Forward.x != 0.0f || LastCamera.Forward.y != 0.0f || LastCamera.Forward.z != 0.0f;
+		const TraceCamera previousCamera = haveLastCamera ? LastCamera : Camera;
+		LastCamera = Camera;
 
 		int windowWidth = 0, windowHeight = 0;
 		RECT box = {};
@@ -1522,129 +1147,135 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			return;
 		}
 
+		// The frame is traced only once it is certain to be presented, since a
+		// traced frame has to be taken. Without one the output image keeps the
+		// last traced world, which is what the engine expects behind a menu or
+		// a conversation.
+		if (HaveCamera && Tracer && Tracer->Alive() && !Scene.IsEmpty())
+		{
+			const double sendStart = NowMs();
+			if (SendScene())
+			{
+				TraceProtocol::TraceCommand frame = {};
+				frame.Width = (uint32_t)TraceWidth;
+				frame.Height = (uint32_t)TraceHeight;
+				frame.Frame = FrameIndex++;
+				frame.AccumulatedFrames = AccumulatedFrames;
+				frame.MaxSamples = (uint32_t)Max(MaxAccumulatedFrames, 1);
+				frame.Bounces = (uint32_t)Clamp(Bounces, 1, 255);
+				frame.GlossBounces = (uint32_t)Clamp(GlossBounces, 0, 255);
+				frame.DisableBits = DisableBits;
+				frame.ViewMode = (uint32_t)ViewMode;
+				frame.DebugMode = (uint32_t)DebugMode;
+				frame.Denoise = DenoiseEnabled ? 1 : 0;
+				frame.Materials = MaterialsEnabled ? 1 : 0;
+				frame.RestartDenoiser = DenoiseRestart ? 1 : 0;
+				frame.Timing = LogTimings ? 1 : 0;
+				frame.Time = (Viewport && Viewport->Actor && Viewport->Actor->Level)
+					? (float)fmod((double)Viewport->Actor->Level->TimeSeconds, 1000.0) : 0.0f;
+				frame.Exposure = 0.2f + Exposure * (2.0f / 255.0f);
+				frame.SkyIntensity = SkyIntensity * (2.0f / 255.0f);
+				// The screen flash, as the other devices blend it - the picture
+				// times min(2 * scale, 1), plus the flash colour - carried in
+				// the camera vectors' spare w. Neutral is a scale of one half
+				// and no colour.
+				frame.Camera[0] = Camera.Origin;
+				frame.Camera[1] = Camera.Right;
+				frame.Camera[2] = Camera.Up;
+				frame.Camera[3] = Camera.Forward;
+				frame.Camera[0].w = Min(FlashScale.X * 2.0f, 1.0f);
+				frame.Camera[1].w = FlashFog.X;
+				frame.Camera[2].w = FlashFog.Y;
+				frame.Camera[3].w = FlashFog.Z;
+				frame.PreviousCamera[0] = previousCamera.Origin;
+				frame.PreviousCamera[1] = previousCamera.Right;
+				frame.PreviousCamera[2] = previousCamera.Up;
+				frame.PreviousCamera[3] = previousCamera.Forward;
+				frame.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
+				owed = Tracer->Trace(frame);
+				if (owed)
+				{
+					DenoiseRestart = false;
+					const TraceProtocol::Header& status = Tracer->Status();
+					if (status.GpuTimed)
+					{
+						Timings.GpuBuild += status.GpuBuildMs;
+						Timings.GpuTrace += status.GpuTraceMs;
+						Timings.GpuDenoise += status.GpuDenoiseMs;
+						Timings.GpuComposite += status.GpuCompositeMs;
+						Timings.GpuFrames++;
+					}
+				}
+			}
+			Timings.Send += NowMs() - sendStart;
+
+			if (!Tracer->Alive() && !TracerLost)
+			{
+				TracerLost = true;
+				PathTracerEvent("helper lost: %s", Tracer->Error().c_str());
+				debugf(TEXT("PathTracer: the helper has stopped (%s); PathTracerHelper.log says more. The world will not be traced again this session."),
+					*Widen(Tracer->Error().c_str()));
+			}
+		}
+
 		auto commands = CommandPool->createBuffer();
 		commands->begin();
 
-		// Made on first use, and only where the queue can time anything.
-		if (!Timestamps && LogTimings)
+		// The helper's frame, taken over from its queue as a transfer from
+		// VK_QUEUE_FAMILY_EXTERNAL, copied into the output image and handed
+		// back the same way.
+		if (owed)
 		{
-			const auto& props = Device->PhysicalDevice.Properties.Properties;
-			if (props.limits.timestampComputeAndGraphics && props.limits.timestampPeriod > 0.0f)
+			const uint32_t family = (uint32_t)Device->GraphicsFamily;
+			VkImageMemoryBarrier barriers[2] = {};
+			for (auto& b : barriers)
 			{
-				Timestamps = QueryPoolBuilder()
-					.QueryType(VK_QUERY_TYPE_TIMESTAMP, TimestampCount)
-					.DebugName("PathTracerTimestamps")
-					.Create(Device.get());
-				TimestampPeriodMs = props.limits.timestampPeriod * 1.0e-6;
+				b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+				b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+				b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 			}
-		}
-		const bool timing = Timestamps && LogTimings;
-		auto stamp = [&](uint32_t index)
-		{
-			if (timing)
-				commands->writeTimestamp(index ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, Timestamps.get(), index);
-		};
-		if (timing)
-			commands->resetQueryPool(Timestamps.get(), 0, TimestampCount);
-		stamp(0);
+			barriers[0].image = Tracer->Output();
+			barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+			barriers[0].dstQueueFamilyIndex = family;
+			barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			barriers[1].image = OutputImage->image;
+			barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
 
-		// Textures that generate themselves get a chance to advance before the
-		// trace reads them, recorded into this frame's command buffer rather
-		// than submitted one at a time.
-		const double refreshStart = NowMs();
-		if (Textures && Viewport && Viewport->Actor && Viewport->Actor->Level)
-			Textures->RefreshRealtime(Viewport->Actor->Level->TimeSeconds, commands.get(), RealtimeStaging, Scene.FixedFrames);
-		Timings.Refresh += NowMs() - refreshStart;
+			VkImageCopy copy = {};
+			copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+			copy.dstSubresource = copy.srcSubresource;
+			copy.extent = { (uint32_t)Min(TraceWidth, (int)Tracer->OutputWidth()), (uint32_t)Min(TraceHeight, (int)Tracer->OutputHeight()), 1 };
+			vkCmdCopyImage(commands->buffer, Tracer->Output(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, OutputImage->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
-		// The top level structure is rebuilt every frame, because the movers and
-		// the actors have all moved since the last one.
-		bool traceThisFrame = HaveCamera;
-		if (traceThisFrame)
-		{
-			Accel->HideStatic = (DebugMode == 1);
-			const double topStart = NowMs();
-			Accel->BuildTopLevel(Scene, commands.get());
-			Timings.TopLevel += NowMs() - topStart;
-			traceThisFrame = Accel->IsReady();
-		}
-		stamp(1);
-
-		// One line per frame for the first few seconds: the black frames are
-		// intermittent, so the pattern is the evidence. Guessing at this from a
-		// screenshot has been wrong twice.
-		// Without a trace the output image keeps the last traced world, which is
-		// what the engine expects behind a menu or a conversation.
-		if (traceThisFrame)
-		{
-			WriteMotion(previousCamera);
-			UpdateDescriptors();
-
-			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
-			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet);
-			commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
-			commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
-			stamp(2);
-
-			// Denoised: NRD over the trace's split lighting, then the picture
-			// rebuilt from it over the one the trace wrote.
-			if (denoising)
-			{
-				VkMemoryBarrier memory = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-				memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-				memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
-
-				auto cameraOf = [](const TracePushConstants& p)
-				{
-					Denoiser::Camera c;
-					c.Origin = vec3(p.CameraOrigin.x, p.CameraOrigin.y, p.CameraOrigin.z);
-					c.Right = vec3(p.CameraRight.x, p.CameraRight.y, p.CameraRight.z);
-					c.Up = vec3(p.CameraUp.x, p.CameraUp.y, p.CameraUp.z);
-					c.Forward = vec3(p.CameraForward.x, p.CameraForward.y, p.CameraForward.z);
-					return c;
-				};
-				Denoiser::Inputs inputs[Denoiser::SignalCount];
-				inputs[0].NormalRoughness = GuideViews[0].get();
-				inputs[0].ViewZ = GuideViews[1].get();
-				inputs[0].Motion = MotionView.get();
-				inputs[0].Diffuse = GuideViews[2].get();
-				inputs[0].Specular = Denoise->HasSpecular() ? GuideViews[10].get() : nullptr;
-				inputs[1].NormalRoughness = GuideViews[8].get();
-				inputs[1].ViewZ = GuideViews[9].get();
-				inputs[1].Motion = ReflectionMotionView.get();
-				inputs[1].Diffuse = GuideViews[3].get();
-				Denoise->Denoise(commands.get(), inputs, cameraOf(PushConstants), cameraOf(previousCamera), DenoiseRestart);
-				DenoiseRestart = false;
-				stamp(3);
-
-				struct { vec4 Flash; vec4 Exposure; } finish;
-				finish.Flash = vec4(PushConstants.CameraOrigin.w, PushConstants.CameraRight.w, PushConstants.CameraUp.w, PushConstants.CameraForward.w);
-				finish.Exposure = vec4(PushConstants.Params.x, Denoise->HasSpecular() ? 1.0f : 0.0f, 0.0f, 0.0f);
-				commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
-				commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, CompositeSet.get());
-				commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
-				commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
-			}
-			else
-			{
-				stamp(3);
-			}
-			stamp(4);
+			barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barriers[0].srcQueueFamilyIndex = family;
+			barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+			barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			barriers[0].dstAccessMask = 0;
+			barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				0, 0, nullptr, 0, nullptr, 2, barriers);
 		}
 
 		// HUD, menus and console on top of the traced world.
 		RenderTiles(commands.get());
-		stamp(5);
-		// Only a traced frame has every timestamp written.
-		TimestampsPending = timing && traceThisFrame;
 
-		// The trace writes the output image; the blit reads it.
-		// Waits on the tile pass as well as the trace: the HUD is drawn as a
-		// colour attachment write, which the compute stage alone does not cover.
+		// The copy and the tiles write the output image; the blit reads it.
 		PipelineBarrier()
-			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
 			.AddImage(SwapChain->GetImage(imageIndex), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
-			.Execute(commands.get(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+			.Execute(commands.get(), VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
 		// Letterbox: keep the traced image's aspect inside the window rather
 		// than stretching it, the same as the other devices here.
@@ -1669,24 +1300,35 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			1, &blit, VK_FILTER_LINEAR);
 
 		PipelineBarrier()
-			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT)
+			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
 			.AddImage(SwapChain->GetImage(imageIndex), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0)
-			.Execute(commands.get(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			.Execute(commands.get(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
 		commands->end();
 
-		QueueSubmit()
-			.AddCommandBuffer(commands.get())
-			.AddWait(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, ImageAvailableSemaphore.get())
-			.AddSignal(RenderFinishedSemaphore.get())
-			.Execute(Device.get(), Device->GraphicsQueue, RenderFinishedFence.get());
+		// Waits for the swap chain image before the tiles, and for the helper's
+		// frame before the copy; signals the present, and the helper's go-ahead.
+		VkSemaphore waits[2] = { ImageAvailableSemaphore->semaphore, owed ? Tracer->Ready() : VK_NULL_HANDLE };
+		VkPipelineStageFlags waitStages[2] = { VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT };
+		VkSemaphore signals[2] = { RenderFinishedSemaphore->semaphore, owed ? Tracer->Released() : VK_NULL_HANDLE };
+		VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+		submit.waitSemaphoreCount = owed ? 2 : 1;
+		submit.pWaitSemaphores = waits;
+		submit.pWaitDstStageMask = waitStages;
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers = &commands->buffer;
+		submit.signalSemaphoreCount = owed ? 2 : 1;
+		submit.pSignalSemaphores = signals;
+		if (vkQueueSubmit(Device->GraphicsQueue, 1, &submit, RenderFinishedFence->fence) != VK_SUCCESS)
+			throw std::runtime_error("vkQueueSubmit failed");
+		owed = false;
 
-		// Not waited for here. The command buffer and the staging copies have
-		// to outlive the submission, so they are kept until the wait - and
-		// kept before presenting, not after. A present that failed threw past
-		// this, which freed the command buffer the GPU was still running and
-		// left the fence signalled with nothing to wait on it, so the next
-		// frame submitted against a fence already set.
+		// Not waited for here. The command buffer has to outlive the
+		// submission, so it is kept until the wait - and kept before
+		// presenting, not after. A present that failed threw past this, which
+		// freed the command buffer the GPU was still running and left the
+		// fence signalled with nothing to wait on it, so the next frame
+		// submitted against a fence already set.
 		PendingCommands = std::move(commands);
 		FramePending = true;
 
@@ -1708,19 +1350,19 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				Timings.Logged++;
 				const double n = Timings.Frames;
 				char line[512];
-				snprintf(line, sizeof(line), "PathTracer ms/frame: collect %.2f sync %.2f refresh %.2f toplevel %.2f gpu-wait %.2f unlock %.2f limiter %.2f | %d instances, %d textures, %d realtime staged, %d poses rebuilt",
-					Timings.Collect / n, Timings.Sync / n, Timings.Refresh / n, Timings.TopLevel / n,
+				snprintf(line, sizeof(line), "PathTracer ms/frame: collect %.2f send %.2f (textures %.2f) gpu-wait %.2f unlock %.2f limiter %.2f | %d instances, %d textures, %d poses rebuilt",
+					Timings.Collect / n, Timings.Send / n, Timings.Textures / n,
 					Timings.Wait / n, (Timings.Total - Timings.Limit) / n, Timings.Limit / n,
-					(int)Scene.Instances.size(), (int)Scene.Textures.size(), (int)RealtimeStaging.size(), Scene.MeshBuilds);
+					(int)Scene.Instances.size(), (int)Scene.Textures.size(), Scene.MeshBuilds);
 				WriteTimingLine(line);
-				if (Timings.GpuFrames > 0)
+				if (Timings.GpuFrames > 0 && Tracer)
 				{
 					const double g = Timings.GpuFrames;
-					snprintf(line, sizeof(line), "PathTracer GPU ms/frame: build %.2f trace %.2f denoise %.2f composite %.2f 2d %.2f | total %.2f at %dx%d, bounces %d, glossy bounces %d, materials %s, denoiser %s",
-						Timings.GpuBuild / g, Timings.GpuTrace / g, Timings.GpuDenoise / g, Timings.GpuComposite / g, Timings.GpuTiles / g,
-						(Timings.GpuBuild + Timings.GpuTrace + Timings.GpuDenoise + Timings.GpuComposite + Timings.GpuTiles) / g,
+					snprintf(line, sizeof(line), "PathTracer GPU ms/frame (helper): build %.2f trace %.2f denoise %.2f composite %.2f | total %.2f at %dx%d, bounces %d, glossy bounces %d, materials %s, denoiser %s",
+						Timings.GpuBuild / g, Timings.GpuTrace / g, Timings.GpuDenoise / g, Timings.GpuComposite / g,
+						(Timings.GpuBuild + Timings.GpuTrace + Timings.GpuDenoise + Timings.GpuComposite) / g,
 						TraceWidth, TraceHeight, (int)Bounces, (int)GlossBounces,
-						MaterialsEnabled ? "on" : "off", (DenoiseEnabled && Denoise && Denoise->Available()) ? "on" : "off");
+						MaterialsEnabled ? "on" : "off", Tracer->Status().DenoiserActive ? "on" : "off");
 					WriteTimingLine(line);
 				}
 			}
@@ -1736,6 +1378,22 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	{
 		PathTracerEvent("frame failed: %s", e.what());
 		debugf(TEXT("PathTracer frame failed: %s"), *Widen(e.what()));
+		// A frame the helper traced is still taken, with nothing done to it:
+		// its Ready waited on and its Released signalled, so the next one can
+		// be traced at all.
+		if (owed && Tracer)
+		{
+			VkSemaphore ready = Tracer->Ready(), released = Tracer->Released();
+			VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+			VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+			submit.waitSemaphoreCount = 1;
+			submit.pWaitSemaphores = &ready;
+			submit.pWaitDstStageMask = &stage;
+			submit.signalSemaphoreCount = 1;
+			submit.pSignalSemaphores = &released;
+			vkQueueSubmit(Device->GraphicsQueue, 1, &submit, VK_NULL_HANDLE);
+			vkQueueWaitIdle(Device->GraphicsQueue);
+		}
 	}
 
 	unguard;
@@ -1803,14 +1461,9 @@ void UPathTracerRenderDevice::Flush(UBOOL AllowPrecache)
 	if (Textures)
 	{
 		if (Device) vkDeviceWaitIdle(Device->device);
+		// Only the 2D's textures: the scene's are the helper's, and a flush
+		// does not change the level.
 		Textures->Clear();
-
-		// Clearing the cache destroys the image views that the trace's texture
-		// array still points at, so those descriptors have to be rewritten
-		// before anything samples them again. Going fullscreen calls Flush, and
-		// the next dispatch read freed images.
-		BoundSceneTextures = 0;
-		SceneTexturesInitialised = false;
 	}
 	unguard;
 }
@@ -1834,7 +1487,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
 			AInventory* item = player ? player->Weapon : nullptr;
 			if (item)
-				DescribeActor(item, item->PlayerViewMesh ? item->PlayerViewMesh : item->Mesh, Textures.get());
+				DescribeActor(item, item->PlayerViewMesh ? item->PlayerViewMesh : item->Mesh);
 			Ar.Logf(TEXT("PT: weapon details written to the log"));
 			return 1;
 		}
@@ -1850,7 +1503,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			FCheckResult hit;
 			player->XLevel->SingleLineCheck(hit, player, end, start, TRACE_AllColliding);
 			if (hit.Actor && hit.Actor != player->Level)
-				DescribeActor(hit.Actor, hit.Actor->Mesh, Textures.get());
+				DescribeActor(hit.Actor, hit.Actor->Mesh);
 			// The level's own surface: its texture and what it counts as being
 			// made of, which is the name to use for an override in the ini.
 			UModel* model = player->XLevel->Model;
@@ -1950,9 +1603,8 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		{
 			DenoiseEnabled = !DenoiseEnabled;
 			DenoiseRestart = true;
-			EnsureDenoiser();
 			Ar.Logf(TEXT("PT: denoiser %s (%s)"), DenoiseEnabled ? TEXT("on") : TEXT("off"),
-				Denoise ? *Widen(Denoise->Problem()) : TEXT("no device"));
+				(Tracer && Tracer->Alive()) ? *Widen(Tracer->Status().DenoiserStatus) : TEXT("no helper"));
 			handled = true;
 		}
 		// One of the denoiser's inputs in place of the picture. Numbered as
@@ -2023,43 +1675,18 @@ void UPathTracerRenderDevice::Exit()
 	if (Device) vkDeviceWaitIdle(Device->device);
 	FramePending = false;
 	PendingCommands.reset();
-	RealtimeStaging.clear();
 
-	Accel.reset();
+	// Tells the helper to go, and frees what was imported from it, while the
+	// device it was imported into is still here.
+	Tracer.reset();
 	Scene.Clear();
-
-	CompositePipeline.reset();
-	CompositeShader.reset();
-	CompositePipelineLayout.reset();
-	CompositeSet.reset();
-	CompositePool.reset();
-	CompositeLayout.reset();
-	Denoise.reset();
-	MotionView.reset();
-	ReflectionMotionView.reset();
-	for (int i = 0; i < GuideImageCount; i++)
-	{
-		GuideViews[i].reset();
-		GuideImages[i].reset();
-	}
-	MotionBuffer.reset();
-	MotionCapacity = 0;
-	// Both released here rather than left to the member destructors, which
-	// run after the device is gone and destroyed them against a dead handle.
-	// Restoring the window from alt-tab makes the engine destroy this device
-	// and make a new one, and this is what crashed it.
-	MaterialBuffer.reset();
-	WrittenMaterials = 0;
-	Timestamps.reset();
-	TimestampsPending = false;
+	SceneReset = true;
+	SentVersions.clear();
+	SentTextures.clear();
 	NextFrameTime = {};
 
 	OutputView.reset();
 	OutputImage.reset();
-	AccumView.reset();
-	AccumImage.reset();
-	HistoryView.reset();
-	HistoryImage.reset();
 
 	TileFramebuffer.reset();
 	TileVertexBuffer.reset();
@@ -2071,26 +1698,15 @@ void UPathTracerRenderDevice::Exit()
 	Textures.reset();
 	TileDescriptorPool.reset();
 	TileSetLayout.reset();
+	// Released here with everything else. Left to the member destructors
+	// they outlive the device and destroy themselves against a dead handle,
+	// which crashed on exit - and when the engine replaces the device on
+	// restoring from alt-tab.
 	TileSampler.reset();
-	// Released here with everything else. Left to the member destructor it
-	// outlived the device and destroyed itself against a dead handle, which
-	// crashed on exit and brought up the safe mode prompt on the next launch.
-	SceneSampler.reset();
-	BoundSceneTextures = 0;
-	SceneTexturesInitialised = false;
-
-	TracePipeline.reset();
-	TraceShader.reset();
-	PipelineLayout.reset();
-	DescriptorSetOwner.reset();
-	DescriptorSet = nullptr;
-	DescriptorPool.reset();
-	DescriptorLayout.reset();
 
 	RenderFinishedSemaphore.reset();
 	ImageAvailableSemaphore.reset();
 	RenderFinishedFence.reset();
-	DrawCommands.reset();
 	CommandPool.reset();
 	SwapChain.reset();
 

@@ -3,9 +3,8 @@
 #include "vec.h"
 #include "mat.h"
 #include "LevelScene.h"
-#include "Denoiser.h"
-#include "AccelStructure.h"
 #include "TextureCache.h"
+#include "TraceClient.h"
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -27,27 +26,15 @@ struct TileBatch
 	int VertexCount = 0;
 };
 
-struct TracePushConstants
+// The view, as the trace shader takes it: the eye, and the right, up and
+// forward vectors scaled to the edges of the view, with "up" pointing down the
+// screen. w carries the screen flash, filled in as the frame is sent.
+struct TraceCamera
 {
-	vec4 CameraOrigin;
-	vec4 CameraRight;
-	vec4 CameraUp;
-	vec4 CameraForward;
-	uint32_t Counts[4];   // frame, light count, bounces, accumulated frames
-	vec4 Params;          // exposure, sky intensity, ray epsilon, debug mode
-	// How many slots of the texture array hold a real texture. Zero means the
-	// device could not offer descriptor indexing, and every surface falls back
-	// to the single averaged colour it carries.
-	uint32_t TextureCount;
-	// The ceiling on how many samples one pixel may average. Sent separately
-	// from the frame counter, which only says whether history is valid at all.
-	uint32_t MaxSamples;
-	// The level's clock in seconds, wrapped so it keeps its precision.
-	float Time;
-	// Diagnostic switches, set from the console with PT: see Exec.
-	uint32_t Disable;
-	// xyz where the sky zone is seen from; w is 1 when there is one.
-	vec4 SkyOrigin;
+	vec4 Origin;
+	vec4 Right;
+	vec4 Up;
+	vec4 Forward;
 };
 
 // A path traced render device for Deus Ex.
@@ -58,8 +45,12 @@ struct TracePushConstants
 // walls behind the camera. The scene is read out of UModel instead, once per
 // level, and everything after that is rays.
 //
-// What this costs: the engine's 2D drawing is not implemented yet, so there is
-// no HUD and no menus. See the README.
+// The rays are not traced here. This is a 32-bit process, and only 64-bit
+// ones are offered ray tracing outside upstream wine, so the scene goes to
+// PathTracerHelper.exe on the same GPU and the frame comes back through an
+// image the two share (TraceProtocol.h). What stays here is everything that
+// reads the engine - the level, the actors, the textures - and the engine's
+// 2D, drawn over the traced picture, with the window and the swap chain.
 class UPathTracerRenderDevice : public URenderDevice
 {
 public:
@@ -139,11 +130,9 @@ public:
 private:
 	void CreateSwapChainResources();
 	void ReleaseSwapChainResources();
-	void CreateTracePipeline();
 	void CreateTilePipeline();
 	void RenderTiles(VulkanCommandBuffer* commands);
 	void EnsureSceneBuilt(ULevel* level);
-	void UpdateDescriptors();
 
 	std::shared_ptr<VulkanInstance> Instance;
 	std::shared_ptr<VulkanSurface> Surface;
@@ -151,107 +140,51 @@ private:
 
 	std::shared_ptr<VulkanSwapChain> SwapChain;
 	std::unique_ptr<VulkanCommandPool> CommandPool;
-	std::unique_ptr<VulkanCommandBuffer> DrawCommands;
 	std::unique_ptr<VulkanFence> RenderFinishedFence;
 	std::unique_ptr<VulkanSemaphore> ImageAvailableSemaphore;
 	std::unique_ptr<VulkanSemaphore> RenderFinishedSemaphore;
 
-	std::unique_ptr<VulkanDescriptorSetLayout> DescriptorLayout;
-	std::unique_ptr<VulkanDescriptorPool> DescriptorPool;
-	VulkanDescriptorSet* DescriptorSet = nullptr;
-	std::unique_ptr<VulkanDescriptorSet> DescriptorSetOwner;
-	std::unique_ptr<VulkanPipelineLayout> PipelineLayout;
-	std::unique_ptr<VulkanPipeline> TracePipeline;
-	std::unique_ptr<VulkanShader> TraceShader;
-
-	std::unique_ptr<VulkanImage> AccumImage;
-	std::unique_ptr<VulkanImageView> AccumView;
-	std::unique_ptr<VulkanImage> HistoryImage;
-	std::unique_ptr<VulkanImageView> HistoryView;
+	// The picture, at the trace's size: the helper's frame copied in, the 2D
+	// drawn over it, then blitted to the window.
 	std::unique_ptr<VulkanImage> OutputImage;
 	std::unique_ptr<VulkanImageView> OutputView;
+	int TraceWidth = 0;
+	int TraceHeight = 0;
 
-	// A denoiser's inputs, written by the trace at bindings 9 to 15 when asked
-	// for, the fog at 17, what mirrors show at 18 and 19, and the glossy
-	// reflection off a surface and its colour at 21 and 22: see the trace
-	// shader.
-	static const int GuideImageCount = 12;
-	static int GuideBinding(int i) { return i < 7 ? 9 + i : (i < 10 ? 10 + i : 11 + i); }
-	static bool GuideIsDepth(int i) { return i == 1 || i == 9; }
-	std::unique_ptr<VulkanImage> GuideImages[GuideImageCount];
-	std::unique_ptr<VulkanImageView> GuideViews[GuideImageCount];
-	// The depth and motion images again, their motion moved to where NRD
-	// reads it: the surfaces seen, and those seen in mirrors.
-	std::unique_ptr<VulkanImageView> MotionView;
-	std::unique_ptr<VulkanImageView> ReflectionMotionView;
+	// The helper that traces, and what it has been sent so far: which
+	// geometries, at which versions, and which textures - with what is needed
+	// to send an animated one's next frame. See SendScene.
+	std::unique_ptr<TraceClient> Tracer;
+	bool StartTracer();
+	bool SendScene();
+	bool SceneReset = true;
+	std::vector<uint32_t> SentVersions;
+	struct SentTexture
+	{
+		UTexture* Source = nullptr;
+		bool Masked = false;
+		bool Animated = false;
+		int Width = 0, Height = 0;
+		UTexture* LastFrame = nullptr;
+	};
+	std::vector<SentTexture> SentTextures;
+	std::vector<uint32_t> Pixels;
+	int TextureFailuresLogged = 0;
+	bool TracerLost = false;
 
-	// NRD, and the pass that puts the picture back together from what it
-	// returns. PT DENOISE switches it on.
-	std::unique_ptr<Denoiser> Denoise;
+	// PT DENOISE and PT NOMATERIALS, for the session; the helper follows.
 	bool DenoiseEnabled = false;
 	bool MaterialsEnabled = true;
 	bool DenoiseRestart = true;
-	void EnsureDenoiser();
-	std::unique_ptr<VulkanDescriptorSetLayout> CompositeLayout;
-	std::unique_ptr<VulkanDescriptorPool> CompositePool;
-	std::unique_ptr<VulkanDescriptorSet> CompositeSet;
-	std::unique_ptr<VulkanPipelineLayout> CompositePipelineLayout;
-	std::unique_ptr<VulkanShader> CompositeShader;
-	std::unique_ptr<VulkanPipeline> CompositePipeline;
-	void CreateCompositePipeline();
-	void WriteCompositeDescriptors();
-	// Last frame's camera and each instance's last placement, for motion
-	// vectors. Rewritten every frame.
-	std::unique_ptr<VulkanBuffer> MotionBuffer;
-	size_t MotionCapacity = 0;
-	void WriteMotion(const TracePushConstants& previousCamera);
 	// Which part of the picture PT VIEW shows in its place, as the trace
 	// shader numbers them; 0 for the picture itself.
 	int ViewMode = 0;
-	int TraceWidth = 0;
-	int TraceHeight = 0;
 
 	// The 2D pass.
 	std::unique_ptr<TextureCache> Textures;
 	std::unique_ptr<VulkanDescriptorSetLayout> TileSetLayout;
 	std::unique_ptr<VulkanDescriptorPool> TileDescriptorPool;
 	std::unique_ptr<VulkanSampler> TileSampler;
-
-	// Textures the trace samples, in the order LevelScene registered them. The
-	// array binding is written as it grows; slots past what the scene uses hold
-	// a 1x1 white image so every descriptor is valid whether or not it is read.
-	std::unique_ptr<VulkanSampler> SceneSampler;
-	// What each of those textures is made of, one vec4 per slot, indexed the
-	// same way. Written as the texture array is; slots never written are matte.
-	std::unique_ptr<VulkanBuffer> MaterialBuffer;
-	size_t WrittenMaterials = 0;
-	void WriteMaterials();
-	// Staging for this frame's realtime texture uploads, released once the
-	// submission that reads them has completed.
-	std::vector<std::unique_ptr<VulkanBuffer>> RealtimeStaging;
-
-	// The last frame's submission, not yet known to be finished. Unlock does
-	// not wait for the GPU: the next frame's game logic and scene gathering
-	// run while it traces, and WaitForPreviousFrame blocks only when
-	// something is about to touch memory the GPU may still be reading.
-	std::unique_ptr<VulkanCommandBuffer> PendingCommands;
-	bool FramePending = false;
-	void WaitForPreviousFrame();
-	// Timestamps around each part of the frame, read back once it completes.
-	static const uint32_t TimestampCount = 6;
-	std::unique_ptr<VulkanQueryPool> Timestamps;
-	bool TimestampsPending = false;
-	double TimestampPeriodMs = 0.0;
-	void ReadTimestamps();
-	void WriteTimingLine(const char* line);
-	// Sleeps until the next frame is due under FPSLimit.
-	void LimitFrameRate();
-	std::chrono::steady_clock::time_point NextFrameTime;
-	size_t BoundSceneTextures = 0;
-	bool SceneTexturesInitialised = false;
-	int TextureFailuresLogged = 0;
-	bool CanSampleTextures = false;
-	void UpdateSceneTextures();
 	std::unique_ptr<VulkanPipelineLayout> TilePipelineLayout;
 	std::unique_ptr<VulkanRenderPass> TileRenderPass;
 	std::unique_ptr<VulkanPipeline> TilePipelines[3];
@@ -263,12 +196,24 @@ private:
 	std::vector<TileVertex> TileVertices;
 	std::vector<TileBatch> TileBatches;
 
+	// The last frame's submission, not yet known to be finished. Unlock does
+	// not wait for the GPU: the next frame's game logic and scene gathering
+	// run while it presents, and WaitForPreviousFrame blocks only when
+	// something is about to touch memory the GPU may still be reading.
+	std::unique_ptr<VulkanCommandBuffer> PendingCommands;
+	bool FramePending = false;
+	void WaitForPreviousFrame();
+	void WriteTimingLine(const char* line);
+	// Sleeps until the next frame is due under FPSLimit.
+	void LimitFrameRate();
+	std::chrono::steady_clock::time_point NextFrameTime;
+
 	LevelScene Scene;
-	std::unique_ptr<AccelStructure> Accel;
 
 	// Accumulation state. The image only converges while nothing moves, so the
 	// device has to notice when something has.
-	TracePushConstants LastCamera = {};
+	TraceCamera Camera = {};
+	TraceCamera LastCamera = {};
 	uint32_t AccumulatedFrames = 0;
 	size_t LastInstanceCount = 0;
 
@@ -278,22 +223,17 @@ private:
 	FPlane FlashFog = FPlane(0.0f, 0.0f, 0.0f, 0.0f);
 
 	// Where each frame's time goes, averaged and logged every few hundred
-	// frames when LogTimings is set.
+	// frames when LogTimings is set: here, and on the GPU in the helper.
 	struct FrameTimings
 	{
-		double Collect = 0, Sync = 0, Refresh = 0, TopLevel = 0, Wait = 0, Total = 0, Limit = 0;
+		double Collect = 0, Send = 0, Textures = 0, Wait = 0, Total = 0, Limit = 0;
 		int Frames = 0;
-		// The GPU's own time on each part of a traced frame, from timestamps:
-		// the top level build and texture uploads, the trace, the denoiser, the
-		// pass that puts the picture back together, and the 2D.
-		double GpuBuild = 0, GpuTrace = 0, GpuDenoise = 0, GpuComposite = 0, GpuTiles = 0;
+		double GpuBuild = 0, GpuTrace = 0, GpuDenoise = 0, GpuComposite = 0;
 		int GpuFrames = 0;
 		int Logged = 0;
 	} Timings;
 	uint32_t FrameIndex = 0;
-	bool DescriptorsDirty = true;
 
-	TracePushConstants PushConstants = {};
 	bool HaveCamera = false;
 	UBOOL UsingVsync = 0;
 

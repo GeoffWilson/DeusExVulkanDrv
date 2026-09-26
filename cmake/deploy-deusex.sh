@@ -41,6 +41,23 @@ for drv in VulkanDrv D3D11Drv D3D12Drv PathTracerDrv; do
 	fi
 done
 
+# PathTracerDrv traces in a 64-bit helper beside it, built by the 64-bit
+# configuration (see cmake/README-crossbuild.md). Without it the device will
+# not start.
+HELPER_DIR="${HELPER_DIR:-$(dirname "$0")/../build-x64}"
+if [ -f "$BUILD_DIR/PathTracerDrv.dll" ]; then
+	if [ -f "$HELPER_DIR/PathTracerHelper.exe" ]; then
+		cp "$HELPER_DIR/PathTracerHelper.exe" "$SYSTEM_DIR/"
+		if [ "$(md5sum < "$HELPER_DIR/PathTracerHelper.exe")" != "$(md5sum < "$SYSTEM_DIR/PathTracerHelper.exe")" ]; then
+			echo "Deploy of PathTracerHelper.exe did not land in $SYSTEM_DIR" >&2
+			exit 1
+		fi
+		installed+=("PathTracerHelper")
+	else
+		echo "No PathTracerHelper.exe in $HELPER_DIR: PathTracerDrv will not start without it" >&2
+	fi
+fi
+
 [ ${#installed[@]} -gt 0 ] || { echo "Nothing built in $BUILD_DIR" >&2; exit 1; }
 
 # UE1 names its ini after the executable: DeusEx.exe reads DeusEx.ini and the

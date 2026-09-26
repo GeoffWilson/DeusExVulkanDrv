@@ -1,5 +1,5 @@
 
-#include "Precomp.h"
+#include "TracePrecomp.h"
 #include "mat.h"
 #include <cmath>
 #ifdef USE_SSE2

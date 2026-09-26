@@ -1,4 +1,4 @@
-#include "Precomp.h"
+#include "TracePrecomp.h"
 #include "Denoiser.h"
 
 #ifdef PATHTRACER_NRD

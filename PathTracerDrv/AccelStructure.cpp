@@ -1,6 +1,6 @@
-#include "Precomp.h"
+#include "TracePrecomp.h"
 #include "AccelStructure.h"
-#include "UPathTracerRenderDevice.h"
+#include "GpuContext.h"
 
 // The driver strides through the instance array by its own idea of this
 // struct's size. This package compiles the engine's 4 byte packed headers
@@ -9,7 +9,7 @@
 static_assert(sizeof(VkAccelerationStructureInstanceKHR) == 64, "instance struct is the wrong size");
 static_assert(offsetof(VkAccelerationStructureInstanceKHR, accelerationStructureReference) == 56, "instance struct is laid out wrong");
 
-AccelStructure::AccelStructure(UPathTracerRenderDevice* renderer) : renderer(renderer)
+AccelStructure::AccelStructure(GpuContext* renderer) : renderer(renderer)
 {
 }
 
@@ -145,7 +145,7 @@ void AccelStructure::BuildBottomLevel(const SceneGeometry& geometry, BottomLevel
 	unguard;
 }
 
-void AccelStructure::SyncGeometry(const LevelScene& scene)
+void AccelStructure::SyncGeometry(const SceneData& scene)
 {
 	guard(AccelStructure::SyncGeometry);
 
@@ -241,7 +241,7 @@ void AccelStructure::SyncGeometry(const LevelScene& scene)
 // Laid out as one array of words: the grid's origin and cell size as floats,
 // its dimensions, then a start and count per cell, then the light indices the
 // starts point into.
-void AccelStructure::WriteLightGrid(const LevelScene& scene)
+void AccelStructure::WriteLightGrid(const SceneData& scene)
 {
 	guard(AccelStructure::WriteLightGrid);
 
@@ -448,7 +448,7 @@ void AccelStructure::EnsureTopLevelCapacity(size_t instanceCount)
 	attributesChanged = true;   // the descriptor points at the structure
 }
 
-void AccelStructure::BuildTopLevel(const LevelScene& scene, VulkanCommandBuffer* commands)
+void AccelStructure::BuildTopLevel(const SceneData& scene, VulkanCommandBuffer* commands)
 {
 	guard(AccelStructure::BuildTopLevel);
 
@@ -610,7 +610,7 @@ void AccelStructure::CreateDynamicBottomLevel(const SceneGeometry& geometry, Bot
 }
 
 // Vertices and shading data for everything that animates, written from the host.
-void AccelStructure::WriteDynamicGeometry(const LevelScene& scene)
+void AccelStructure::WriteDynamicGeometry(const SceneData& scene)
 {
 	guard(AccelStructure::WriteDynamicGeometry);
 
@@ -674,7 +674,7 @@ void AccelStructure::WriteDynamicGeometry(const LevelScene& scene)
 
 // The per frame rebuilds, recorded into the frame's command buffer so they cost
 // one submission rather than one each.
-void AccelStructure::RecordDynamicBuilds(const LevelScene& scene, VulkanCommandBuffer* commands)
+void AccelStructure::RecordDynamicBuilds(const SceneData& scene, VulkanCommandBuffer* commands)
 {
 	guard(AccelStructure::RecordDynamicBuilds);
 

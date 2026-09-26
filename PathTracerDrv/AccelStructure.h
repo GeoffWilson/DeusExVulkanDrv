@@ -1,10 +1,13 @@
 #pragma once
 
-#include "LevelScene.h"
+#include "SceneData.h"
 #include <memory>
 #include <vector>
 
-class UPathTracerRenderDevice;
+class GpuContext;
+class VulkanCommandBuffer;
+class VulkanBuffer;
+class VulkanAccelerationStructure;
 
 // The scene as the ray tracing hardware wants it.
 //
@@ -16,15 +19,15 @@ class UPathTracerRenderDevice;
 class AccelStructure
 {
 public:
-	AccelStructure(UPathTracerRenderDevice* renderer);
+	AccelStructure(GpuContext* renderer);
 	~AccelStructure();
 
 	// Builds bottom level structures for any geometry that does not have one
 	// yet, and re-uploads the shading attributes if that added some.
-	void SyncGeometry(const LevelScene& scene);
+	void SyncGeometry(const SceneData& scene);
 
 	// Rebuilt every frame, inside the frame's own command buffer.
-	void BuildTopLevel(const LevelScene& scene, VulkanCommandBuffer* commands);
+	void BuildTopLevel(const SceneData& scene, VulkanCommandBuffer* commands);
 
 	void Reset();
 
@@ -75,12 +78,12 @@ private:
 	std::unique_ptr<VulkanBuffer> UploadBuffer(const void* data, size_t size, VkBufferUsageFlags usage, const char* debugName);
 	void BuildBottomLevel(const SceneGeometry& geometry, BottomLevel& out);
 	void CreateDynamicBottomLevel(const SceneGeometry& geometry, BottomLevel& out);
-	void WriteDynamicGeometry(const LevelScene& scene);
-	void RecordDynamicBuilds(const LevelScene& scene, VulkanCommandBuffer* commands);
+	void WriteDynamicGeometry(const SceneData& scene);
+	void RecordDynamicBuilds(const SceneData& scene, VulkanCommandBuffer* commands);
 	void EnsureAttributeCapacity(size_t count);
 	void EnsureTopLevelCapacity(size_t instanceCount);
 
-	UPathTracerRenderDevice* renderer = nullptr;
+	GpuContext* renderer = nullptr;
 
 	std::vector<BottomLevel> Bottom;
 	std::vector<TriangleAttributes> AllAttributes;
@@ -99,7 +102,7 @@ private:
 
 	// Which lights can reach which part of the level, so a shaded point only
 	// considers those. Rebuilt with the light list every frame.
-	void WriteLightGrid(const LevelScene& scene);
+	void WriteLightGrid(const SceneData& scene);
 	std::unique_ptr<VulkanBuffer> LightGridBuffer;
 	size_t LightGridCapacity = 0;
 	std::vector<uint32_t> LightGrid;

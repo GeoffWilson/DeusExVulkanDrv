@@ -7,7 +7,8 @@
 # licence does not allow its source to be redistributed here. Everything lands
 # in OutputDir (default ../.nrd, beside the .xwin folder):
 #   src/        NRD itself; src/Include is what the driver includes
-#   x86/NRD.lib the library the path tracer links
+#   x86/NRD.lib a 32-bit build
+#   x64/NRD.lib the 64-bit build the path tracer's helper links
 #
 # Two stages, because NRD's shaders are HLSL compiled by Microsoft's DXC, and
 # DXC runs on the host:
@@ -86,17 +87,30 @@ cmake --build "$OUT/build-shaders" --target NRDShaders >> "$OUT/build-shaders.lo
 
 DEPS="$OUT/build-shaders/_deps"
 
-# Stage 2: the library, for i386.
-mkdir -p "$OUT/x86/obj"
-FLAGS=(--target=i386-pc-windows-msvc /std:c++17 /O2 /MT /EHsc -mssse3 /W0
-	/imsvc"$XWIN/crt/include" /imsvc"$XWIN/sdk/include/ucrt" /imsvc"$XWIN/sdk/include/um" /imsvc"$XWIN/sdk/include/shared"
-	-DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -DNDEBUG "${NRD_DEFINES[@]}"
-	-I"$OUT/src/Include" -I"$OUT/src/_Shaders" -I"$DEPS/mathlib-src" -I"$DEPS/shadermake-src")
-# NRD's sources, and ShaderMake's blob reader, which picks each shader's
-# permutation out of what NRD embeds.
-for f in "$OUT/src/Source/"*.cpp "$DEPS/shadermake-src/ShaderMake/ShaderBlob.cpp"; do
-	clang-cl "${FLAGS[@]}" /c "$f" /Fo"$OUT/x86/obj/$(basename "$f" .cpp).obj"
-done
-llvm-lib /out:"$OUT/x86/NRD.lib" "$OUT/x86/obj/"*.obj
+# Stage 2: the library, once for each architecture there are Windows libraries
+# for: i386 for the render device's own use, and x86_64 for the path tracer's
+# 64-bit helper (from ../.xwin-x64, when it has been unpacked).
+build_lib() {
+	local arch="$1" target="$2" xwin="$3"
+	mkdir -p "$OUT/$arch/obj"
+	local FLAGS=(--target="$target" /std:c++17 /O2 /MT /EHsc -mssse3 /W0
+		/imsvc"$xwin/crt/include" /imsvc"$xwin/sdk/include/ucrt" /imsvc"$xwin/sdk/include/um" /imsvc"$xwin/sdk/include/shared"
+		-DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -DNDEBUG "${NRD_DEFINES[@]}"
+		-I"$OUT/src/Include" -I"$OUT/src/_Shaders" -I"$DEPS/mathlib-src" -I"$DEPS/shadermake-src")
+	# NRD's sources, and ShaderMake's blob reader, which picks each shader's
+	# permutation out of what NRD embeds.
+	for f in "$OUT/src/Source/"*.cpp "$DEPS/shadermake-src/ShaderMake/ShaderBlob.cpp"; do
+		clang-cl "${FLAGS[@]}" /c "$f" /Fo"$OUT/$arch/obj/$(basename "$f" .cpp).obj"
+	done
+	llvm-lib /out:"$OUT/$arch/NRD.lib" "$OUT/$arch/obj/"*.obj
+	echo "NRD $(git -C "$OUT/src" describe --always) built: $OUT/$arch/NRD.lib"
+}
 
-echo "NRD $(git -C "$OUT/src" describe --always) built: $OUT/x86/NRD.lib"
+build_lib x86 i386-pc-windows-msvc "$XWIN"
+XWIN64="${XWIN64_DIR:-$REPO/../.xwin-x64}"
+if [ -d "$XWIN64/crt/include" ]; then
+	build_lib x64 x86_64-pc-windows-msvc "$XWIN64"
+else
+	echo "No x64 CRT at $XWIN64, so no x64/NRD.lib for the path tracer's helper (see cmake/README-crossbuild.md)" >&2
+fi
+

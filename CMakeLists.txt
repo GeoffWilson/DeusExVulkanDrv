@@ -74,6 +74,41 @@ target_include_directories(zvulkan PUBLIC
 	"${ZVULKAN_DIR}/include"
 	"${ZVULKAN_DIR}/include/zvulkan")
 target_compile_definitions(zvulkan PRIVATE _LIB)
+target_compile_options(zvulkan PRIVATE /MT /EHsc)
+
+# NVIDIA's NRD denoiser, when cmake/build-nrd.sh has built it: x86/NRD.lib and
+# x64/NRD.lib. The path tracer's helper is 64-bit and links the latter.
+set(PATHTRACER_NRD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.nrd" CACHE PATH "Output of cmake/build-nrd.sh")
+set(PATHTRACERDRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/PathTracerDrv")
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+
+# ---------------------------------------------------------- PathTracerHelper ---
+
+# A 64-bit build makes only the path tracer's helper: the render devices are
+# engine plugins, and the engine is 32-bit. See PathTracerDrv/TraceProtocol.h.
+add_executable(PathTracerHelper
+	"${PATHTRACERDRV_DIR}/AccelStructure.cpp"
+	"${PATHTRACERDRV_DIR}/Denoiser.cpp"
+	"${PATHTRACERDRV_DIR}/HelperMain.cpp"
+	"${PATHTRACERDRV_DIR}/mat.cpp"
+	"${PATHTRACERDRV_DIR}/Shaders.cpp"
+	"${PATHTRACERDRV_DIR}/TraceRenderer.cpp")
+target_include_directories(PathTracerHelper PRIVATE "${PATHTRACERDRV_DIR}")
+target_compile_definitions(PathTracerHelper PRIVATE PATHTRACER_HELPER WIN32 NDEBUG _CONSOLE)
+target_compile_options(PathTracerHelper PRIVATE /MT /EHsc /Zi)
+target_link_options(PathTracerHelper PRIVATE /DEBUG)
+target_link_libraries(PathTracerHelper PRIVATE zvulkan user32 advapi32)
+if(EXISTS "${PATHTRACER_NRD_DIR}/x64/NRD.lib")
+	message(STATUS "PathTracerHelper: denoising with NRD from ${PATHTRACER_NRD_DIR}")
+	target_include_directories(PathTracerHelper PRIVATE "${PATHTRACER_NRD_DIR}/src/Include")
+	target_compile_definitions(PathTracerHelper PRIVATE PATHTRACER_NRD NRD_STATIC_LIBRARY)
+	target_link_libraries(PathTracerHelper PRIVATE "${PATHTRACER_NRD_DIR}/x64/NRD.lib")
+else()
+	message(STATUS "PathTracerHelper: no NRD at ${PATHTRACER_NRD_DIR}/x64, building without the denoiser")
+endif()
+
+else()
 
 # --------------------------------------------------------------- VulkanDrv ---
 
@@ -166,7 +201,6 @@ endfunction()
 target_include_directories(VulkanDrv PRIVATE "${VULKANDRV_DIR}")
 configure_deusex_renderdevice(VulkanDrv VULKANDRV_EXPORTS)
 target_link_libraries(VulkanDrv PRIVATE zvulkan)
-target_compile_options(zvulkan PRIVATE /MT /EHsc)
 
 # ---------------------------------------------------------------- D3D11Drv ---
 
@@ -224,11 +258,10 @@ target_link_libraries(D3D12Drv PRIVATE d3d12 dxgi d3dcompiler dxguid)
 
 # ------------------------------------------------------------- PathTracerDrv ---
 
-set(PATHTRACERDRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/PathTracerDrv")
-
+# The engine's side of the path tracer: the level, the actors, the textures
+# and the 2D. The tracing is PathTracerHelper's, built by a 64-bit
+# configuration of this project and started from beside this DLL.
 add_library(PathTracerDrv SHARED
-	"${PATHTRACERDRV_DIR}/AccelStructure.cpp"
-	"${PATHTRACERDRV_DIR}/Denoiser.cpp"
 	"${PATHTRACERDRV_DIR}/LevelScene.cpp"
 	"${PATHTRACERDRV_DIR}/Materials.cpp"
 	"${PATHTRACERDRV_DIR}/mat.cpp"
@@ -236,22 +269,22 @@ add_library(PathTracerDrv SHARED
 	"${PATHTRACERDRV_DIR}/Precomp.cpp"
 	"${PATHTRACERDRV_DIR}/Shaders.cpp"
 	"${PATHTRACERDRV_DIR}/TextureCache.cpp"
+	"${PATHTRACERDRV_DIR}/TraceClient.cpp"
 	"${PATHTRACERDRV_DIR}/UPathTracerRenderDevice.cpp")
 
 target_include_directories(PathTracerDrv PRIVATE "${PATHTRACERDRV_DIR}")
 configure_deusex_renderdevice(PathTracerDrv PATHTRACERDRV_EXPORTS)
 target_link_libraries(PathTracerDrv PRIVATE zvulkan)
 
-# NVIDIA's NRD denoiser, when cmake/build-nrd.sh has built it. Without it the
-# driver builds as before and PT DENOISE says why it cannot.
-set(PATHTRACER_NRD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.nrd" CACHE PATH "Output of cmake/build-nrd.sh")
-if(EXISTS "${PATHTRACER_NRD_DIR}/x86/NRD.lib")
-	message(STATUS "PathTracerDrv: denoising with NRD from ${PATHTRACER_NRD_DIR}")
-	target_include_directories(PathTracerDrv PRIVATE "${PATHTRACER_NRD_DIR}/src/Include")
-	target_compile_definitions(PathTracerDrv PRIVATE PATHTRACER_NRD NRD_STATIC_LIBRARY)
-	target_link_libraries(PathTracerDrv PRIVATE "${PATHTRACER_NRD_DIR}/x86/NRD.lib")
-else()
-	message(STATUS "PathTracerDrv: no NRD at ${PATHTRACER_NRD_DIR}, building without the denoiser")
+# Drives the helper with a made up scene and writes what it traces to a file,
+# so the helper and the channel can be checked without the game.
+add_executable(PathTracerHelperTest EXCLUDE_FROM_ALL
+	"${PATHTRACERDRV_DIR}/HelperTest.cpp"
+	"${PATHTRACERDRV_DIR}/TraceClient.cpp")
+target_include_directories(PathTracerHelperTest PRIVATE "${PATHTRACERDRV_DIR}")
+target_compile_options(PathTracerHelperTest PRIVATE /MT /EHsc)
+target_link_libraries(PathTracerHelperTest PRIVATE zvulkan user32)
+
 endif()
 
 # ------------------------------------------------------------------- spikes ---

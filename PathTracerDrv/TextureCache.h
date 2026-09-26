@@ -40,35 +40,32 @@ public:
 	// Returns null if the texture could not be represented.
 	CachedTexture* Get(const FTextureInfo& info, bool masked);
 
-	// The same upload for a texture the trace references. Takes a UTexture
-	// rather than an FTextureInfo because the scene walks the level's own
-	// objects rather than being handed surfaces by the engine, and skips the
-	// per-texture descriptor set: the trace binds one array, not one set each.
-	// Masked says whether palette entry zero is a hole. The engine masks by the
-	// polygon's flags as well as the texture's, so one texture can be needed
-	// both ways.
-	CachedTexture* GetForScene(UTexture* texture, bool masked);
-	// The scene's entry for a texture if it has one, without making one.
-	CachedTexture* FindForScene(UTexture* texture, bool masked);
+	// Expand a texture's top mip into RGBA8.
+	static bool ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height);
 
-	// A 1x1 white image, so that unused slots in the trace's texture array are
-	// still valid descriptors.
-	CachedTexture* White();
+	// A texture the trace references, as RGBA8 pixels for the helper that
+	// traces. Takes a UTexture rather than an FTextureInfo because the scene
+	// walks the level's own objects rather than being handed surfaces by the
+	// engine. Masked says whether palette entry zero is a hole: the engine
+	// masks by the polygon's flags as well as the texture's, so one texture can
+	// be needed both ways.
+	static bool ScenePixels(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height);
 
-	// Regenerate the textures that change by themselves - fire, water, a
-	// computer screen, the laser sight's dot - and copy them into the images
-	// they already have, so nothing that points at those images has to change.
-	// Recorded into the frame's own command buffer rather than submitted one
-	// texture at a time: a submit-and-wait each is a stall each, and a room of
-	// screens cost most of the frame rate. The staging buffers must outlive the
-	// submission, so they are handed back to be released once it completes.
-	void RefreshRealtime(double time, VulkanCommandBuffer* commands, std::vector<std::unique_ptr<VulkanBuffer>>& keepAlive, const std::unordered_set<UTexture*>& fixedFrames);
+	// Whether a texture changes by itself - fire, water, a computer screen, the
+	// laser sight's dot, or a chain of frames cycled through.
+	static bool Animates(UTexture* texture);
+
+	// An animated texture's frame at time, as pixels of the size it was first
+	// sent at. lastFrame is which link of an animation chain was last sent, so
+	// one that has not moved on is not sent again. False when there is
+	// nothing new.
+	static bool AnimatedPixels(UTexture* texture, bool masked, double time, int width, int height, UTexture*& lastFrame, std::vector<uint32_t>& pixels);
 
 	void Clear();
 
 private:
 	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked, bool withDescriptorSet = true);
-	static bool ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height);
+
 
 	UPathTracerRenderDevice* renderer = nullptr;
 
@@ -76,8 +73,4 @@ private:
 	// texture can be drawn both ways in one frame and the alpha differs.
 	std::unordered_map<uint64_t, std::unique_ptr<CachedTexture>> Textures;
 
-	// Keyed on the object itself: the scene refers to textures by pointer, and
-	// the same texture is wanted once however many surfaces use it.
-	std::unordered_map<uint64_t, std::unique_ptr<CachedTexture>> SceneTextures;
-	std::unique_ptr<CachedTexture> WhitePixel;
 };
