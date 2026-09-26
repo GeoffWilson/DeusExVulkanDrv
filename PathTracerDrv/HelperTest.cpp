@@ -9,8 +9,14 @@
 //
 //   PathTracerHelperTest.exe [frames] [width] [height]    (helper beside it)
 //
-// Halfway through, the size goes up by half, as a change of resolution does,
-// so the helper makes a new shared image and this side takes it up.
+// Frames are taken the way the render device takes them: the next is asked
+// for before the last is waited for, so the helper records one while the GPU
+// traces the other. Along the way the scene does what a level does to the
+// helper's buffers: a shape animates every frame and later outgrows its
+// buffer, a large shape arrives and grows the shading data, and three hundred
+// more instances and lights arrive at once. Halfway through, the size goes up
+// by half, as a change of resolution does, so the helper makes a new shared
+// image and this side takes it up.
 //
 // Writes helper-test.ppm: a floor with a glossy checkerboard, a red box and a
 // wall, lit by one light. Exits 0 when every frame arrived and the picture is
@@ -135,6 +141,57 @@ int main(int argc, char** argv)
 		placed.Transform[0] = placed.Transform[5] = placed.Transform[10] = 1.0f;
 		std::vector<SceneInstance> instances = { placed };
 
+		// Geometry 1 animates: a green block that bobs, rebuilt every frame,
+		// and later a stack of forty that outgrows the buffer it was given.
+		auto animated = [](int frame, bool stack)
+		{
+			SceneGeometry g;
+			g.Dynamic = true;
+			g.Version = (uint32_t)frame + 1;
+			const float bob = 40.0f * std::sin(frame * 0.3f);
+			const int count = stack ? 40 : 1;
+			for (int b = 0; b < count; b++)
+			{
+				const float z = b * 12.0f;
+				AddBox(g, vec3(220, -60, z), vec3(300, 20, z + (stack ? 10.0f : 120.0f + bob)), vec3(0.1f, 0.7f, 0.2f));
+			}
+			return g;
+		};
+		instances.push_back(placed);
+		instances.back().GeometryIndex = 1;
+
+		// Geometry 3 arrives later: a blue panel of 5000 triangles in front of
+		// the wall, more shading data than the helper's first buffer holds.
+		SceneGeometry panel;
+		for (int y = 0; y < 50; y++)
+			for (int x = 0; x < 50; x++)
+			{
+				const float x0 = -560.0f + x * 6.0f, z0 = 20.0f + y * 6.0f;
+				AddQuad(panel, vec3(x0, 395, z0), vec3(x0 + 6, 395, z0), vec3(x0 + 6, 395, z0 + 6), vec3(x0, 395, z0 + 6), vec3(0.15f, 0.25f, 0.8f), -1, 1);
+			}
+
+		// Geometry 2 is a small cube, placed three hundred times at once
+		// around the edge of the floor, with a dim light over each.
+		SceneGeometry cube;
+		AddBox(cube, vec3(-6, -6, 0), vec3(6, 6, 12), vec3(0.9f, 0.8f, 0.2f));
+		std::vector<SceneInstance> ring;
+		std::vector<SceneLight> ringLights;
+		for (int k = 0; k < 300; k++)
+		{
+			const float angle = k * (6.2831853f / 300.0f);
+			SceneInstance c = placed;
+			c.GeometryIndex = 2;
+			c.Transform[3] = 520.0f * std::cos(angle);
+			c.Transform[7] = 520.0f * std::sin(angle);
+			ring.push_back(c);
+			SceneLight l = {};
+			l.PositionRadius = vec4(c.Transform[3], c.Transform[7], 40, 120);
+			l.ColorBrightness = vec4(1.0f, 0.7f, 0.3f, 0.05f);
+			l.DirectionCone = vec4(0, 0, 0, -1);
+			l.Flags = vec4(0, 0, 0, -1);
+			ringLights.push_back(l);
+		}
+
 		SceneLight light = {};
 		light.PositionRadius = vec4(-200, -250, 350, 1400);
 		light.ColorBrightness = vec4(1.0f, 0.9f, 0.8f, 2.5f);
@@ -174,13 +231,31 @@ int main(int argc, char** argv)
 
 		auto pool = CommandPoolBuilder().QueueFamily(device->GraphicsFamily).Create(device.get());
 		auto fence = FenceBuilder().Create(device.get());
+		std::unique_ptr<VulkanCommandBuffer> pending;
 		const size_t bytes = (size_t)(width * 3 / 2) * (height * 3 / 2) * 8;
 		auto readback = BufferBuilder().Size(bytes).Usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU).Create(device.get());
 
 		int arrived = 0;
-		double sendMs = 0.0;
+		double sendMs = 0.0, helperWait = 0.0, helperApply = 0.0, helperRecord = 0.0;
+		uint32_t stalls = 0;
+		LARGE_INTEGER loopStart, loopEnd, frequency;
+		QueryPerformanceFrequency(&frequency);
+		QueryPerformanceCounter(&loopStart);
 		for (int i = 0; i < frames; i++)
 		{
+			client.Geometry(1, animated(i, i >= frames / 3));
+			if (i == frames / 5)
+			{
+				client.Geometry(2, cube);
+				instances.insert(instances.end(), ring.begin(), ring.end());
+				lights.insert(lights.end(), ringLights.begin(), ringLights.end());
+			}
+			if (i == frames / 4)
+			{
+				client.Geometry(3, panel);
+				instances.push_back(placed);
+				instances.back().GeometryIndex = 3;
+			}
 			client.Instances(instances, 1);
 			client.Lights(lights, {});
 			frame.Frame = (uint32_t)i;
@@ -197,6 +272,21 @@ int main(int argc, char** argv)
 			QueryPerformanceCounter(&b);
 			QueryPerformanceFrequency(&f);
 			sendMs += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+			if (client.Alive())
+			{
+				helperWait += client.Status().HelperWaitMs;
+				helperApply += client.Status().HelperApplyMs;
+				helperRecord += client.Status().HelperRecordMs;
+				stalls += client.Status().HelperStalls;
+			}
+
+			// The last frame is waited for only now, as the render device does.
+			if (pending)
+			{
+				vkWaitForFences(device->device, 1, &fence->fence, VK_TRUE, UINT64_MAX);
+				vkResetFences(device->device, 1, &fence->fence);
+				pending.reset();
+			}
 			if (!traced)
 			{
 				printf("frame %d: not traced%s%s\n", i, client.Alive() ? "" : " - ", client.Alive() ? "" : client.Error().c_str());
@@ -241,8 +331,7 @@ int main(int argc, char** argv)
 			submit.signalSemaphoreCount = 1;
 			submit.pSignalSemaphores = &released;
 			vkQueueSubmit(device->GraphicsQueue, 1, &submit, fence->fence);
-			vkWaitForFences(device->device, 1, &fence->fence, VK_TRUE, UINT64_MAX);
-			vkResetFences(device->device, 1, &fence->fence);
+			pending = std::move(commands);
 			arrived++;
 
 			const auto& s = client.Status();
@@ -252,7 +341,12 @@ int main(int argc, char** argv)
 					s.DenoiserActive ? "on" : "off", s.DenoiserStatus, s.GpuBuildMs, s.GpuTraceMs, s.GpuDenoiseMs, s.GpuCompositeMs,
 					s.GpuTimed ? "" : " (not timed)");
 		}
-		printf("%d of %d frames arrived, %.2f ms a frame to send and have traced\n", arrived, frames, sendMs / frames);
+		if (pending)
+			vkWaitForFences(device->device, 1, &fence->fence, VK_TRUE, UINT64_MAX);
+		QueryPerformanceCounter(&loopEnd);
+		const double loopMs = (double)(loopEnd.QuadPart - loopStart.QuadPart) * 1000.0 / (double)frequency.QuadPart;
+		printf("%d of %d frames arrived, %.2f ms a frame in all, %.2f ms a frame to send and have traced (helper: wait %.2f, apply %.2f, record %.2f; %u stalls)\n",
+			arrived, frames, loopMs / frames, sendMs / frames, helperWait / frames, helperApply / frames, helperRecord / frames, stalls);
 
 		// The last frame, tonemapped already by the helper, as a PPM.
 		const uint32_t outWidth = client.OutputWidth(), outHeight = client.OutputHeight();

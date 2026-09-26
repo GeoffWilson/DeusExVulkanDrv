@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 1;
+	static const uint32_t Version = 2;
 
 	// The output image, as both sides must create it for the one allocation to
 	// be valid in both.
@@ -94,6 +94,15 @@ namespace TraceProtocol
 		float GpuCompositeMs;
 		uint32_t GpuTimed;          // the four figures above are from this frame
 		uint32_t DenoiserActive;
+
+		// The helper's own time on the last batch: waiting for the GPU, taking
+		// in the scene, and recording and submitting the frame. Stalls counts
+		// the waits for a frame still in flight, which only a new level, a
+		// new texture or a buffer outgrowing itself should cause.
+		float HelperWaitMs;
+		float HelperApplyMs;
+		float HelperRecordMs;
+		uint32_t HelperStalls;
 
 		char DeviceName[256];
 		char Error[512];

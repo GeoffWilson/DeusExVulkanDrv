@@ -333,9 +333,9 @@ void TraceClient::ReleaseOutput()
 	ImportedWidth = ImportedHeight = 0;
 }
 
-// The helper's new shared image, made here over the same memory. Only ever
-// called with nothing of this device's in flight - the render device waits
-// for its last frame before it asks for the next - so the old one can go.
+// The helper's new shared image, made here over the same memory. The device's
+// last frame may still be copying out of the old one, so everything of this
+// device's is waited for before it goes. A resize, not a per frame cost.
 bool TraceClient::ImportOutput()
 {
 	vkDeviceWaitIdle(Device->device);

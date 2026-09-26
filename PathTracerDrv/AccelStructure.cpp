@@ -1,6 +1,7 @@
 #include "TracePrecomp.h"
 #include "AccelStructure.h"
 #include "GpuContext.h"
+#include "FrameUploads.h"
 
 // The driver strides through the instance array by its own idea of this
 // struct's size. This package compiles the engine's 4 byte packed headers
@@ -32,23 +33,26 @@ void AccelStructure::Reset()
 	Bottom.clear();
 	AllAttributes.clear();
 	TopCapacity = 0;
+	InstanceCount = 0;
 	Lights = 0;
 	LightCapacity = 0;
 	attributesChanged = false;
 	LoggedInstances = false;
 }
 
-std::unique_ptr<VulkanBuffer> AccelStructure::UploadBuffer(const void* data, size_t size, VkBufferUsageFlags usage, const char* debugName)
+// A shape that never changes: its vertices uploaded with the frame, and its
+// structure built in the frame's own command buffer rather than waited for
+// on its own, so a mesh coming into view mid-level costs no stall.
+void AccelStructure::CreateStaticBottomLevel(const SceneGeometry& geometry, BottomLevel& out, FrameUploads& uploads)
 {
-	auto staging = BufferBuilder()
-		.Size(size)
-		.Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY)
-		.DebugName("PathTracerStaging")
-		.Create(renderer->GetDevice());
+	guard(AccelStructure::CreateStaticBottomLevel);
 
-	void* mapped = staging->Map(0, size);
-	memcpy(mapped, data, size);
-	staging->Unmap();
+	VulkanDevice* device = renderer->GetDevice();
+
+	out.TriangleCount = (int)(geometry.Positions.size() / 3);
+	out.Opaque = !geometry.HasMasked;
+	if (out.TriangleCount <= 0)
+		return;
 
 	// Aligned explicitly. A buffer handed to an acceleration structure build has
 	// an alignment requirement on its device address, and without asking, a
@@ -56,47 +60,23 @@ std::unique_ptr<VulkanBuffer> AccelStructure::UploadBuffer(const void* data, siz
 	// A large buffer tends to land on a well aligned boundary by luck, which is
 	// exactly how this hid: the static world is about a megabyte and built
 	// correctly, while every prop and character is a few kilobytes and did not.
-	auto buffer = BufferBuilder()
-		.Size(size)
-		.Usage(usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+	const size_t bytes = geometry.Positions.size() * sizeof(vec3);
+	out.Vertices = BufferBuilder()
+		.Size(bytes)
+		.Usage(VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 		.MinAlignment(256)
-		.DebugName(debugName)
-		.Create(renderer->GetDevice());
-
-	VulkanBuffer* src = staging.get();
-	VulkanBuffer* dst = buffer.get();
-	renderer->ExecuteImmediate([src, dst, size](VulkanCommandBuffer* cmd)
-	{
-		cmd->copyBuffer(src, dst, 0, 0, size);
-	});
-
-	return buffer;
-}
-
-void AccelStructure::BuildBottomLevel(const SceneGeometry& geometry, BottomLevel& out)
-{
-	guard(AccelStructure::BuildBottomLevel);
-
-	VulkanDevice* device = renderer->GetDevice();
-
-	out.TriangleCount = (int)(geometry.Positions.size() / 3);
-
-	out.Vertices = UploadBuffer(
-		geometry.Positions.data(), geometry.Positions.size() * sizeof(vec3),
-		VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-		"PathTracerVertices");
-
-	const uint32_t triangleCount = (uint32_t)(geometry.Positions.size() / 3);
+		.DebugName("PathTracerVertices")
+		.Create(device);
+	uploads.Upload(out.Vertices.get(), 0, geometry.Positions.data(), bytes);
 
 	VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 	geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
 	// Opaque wherever nothing is masked, which is nearly everything: traversal
 	// then accepts a hit outright instead of asking the shader about every
 	// candidate triangle it crosses.
-	geom.flags = geometry.HasMasked ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+	geom.flags = out.Opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
 	geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
 	geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-	geom.geometry.triangles.vertexData.deviceAddress = out.Vertices->GetDeviceAddress();
 	geom.geometry.triangles.vertexStride = sizeof(vec3);
 	geom.geometry.triangles.maxVertex = (uint32_t)geometry.Positions.size() - 1;
 	geom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
@@ -108,6 +88,7 @@ void AccelStructure::BuildBottomLevel(const SceneGeometry& geometry, BottomLevel
 	buildInfo.geometryCount = 1;
 	buildInfo.pGeometries = &geom;
 
+	const uint32_t triangleCount = (uint32_t)out.TriangleCount;
 	VkAccelerationStructureBuildSizesInfoKHR sizes = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
 	vkGetAccelerationStructureBuildSizesKHR(device->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &triangleCount, &sizes);
 
@@ -123,29 +104,26 @@ void AccelStructure::BuildBottomLevel(const SceneGeometry& geometry, BottomLevel
 		.DebugName("PathTracerBlas")
 		.Create(device);
 
-	auto scratch = BufferBuilder()
+	// Only needed for the build, and retired once it is recorded.
+	out.Scratch = BufferBuilder()
 		.Size(sizes.buildScratchSize)
 		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
 		.MinAlignment(256)
 		.DebugName("PathTracerBlasScratch")
 		.Create(device);
 
-	buildInfo.dstAccelerationStructure = out.Structure->accelstruct;
-	buildInfo.scratchData.deviceAddress = scratch->GetDeviceAddress();
-
-	VkAccelerationStructureBuildRangeInfoKHR range = {};
-	range.primitiveCount = triangleCount;
-	const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = { &range };
-
-	renderer->ExecuteImmediate([&buildInfo, &ranges](VulkanCommandBuffer* cmd)
-	{
-		cmd->buildAccelerationStructures(1, &buildInfo, ranges);
-	});
+	out.NeedsBuild = true;
 
 	unguard;
 }
 
-void AccelStructure::SyncGeometry(const SceneData& scene)
+void AccelStructure::Update(const SceneData& scene, FrameUploads& uploads)
+{
+	SyncGeometry(scene, uploads);
+	WriteInstances(scene, uploads);
+}
+
+void AccelStructure::SyncGeometry(const SceneData& scene, FrameUploads& uploads)
 {
 	guard(AccelStructure::SyncGeometry);
 
@@ -153,6 +131,7 @@ void AccelStructure::SyncGeometry(const SceneData& scene)
 	// already built is new.
 	if (Bottom.size() < scene.Geometries.size())
 	{
+		const size_t attributesBefore = AllAttributes.size();
 		for (size_t i = Bottom.size(); i < scene.Geometries.size(); i++)
 		{
 			BottomLevel level;
@@ -168,67 +147,71 @@ void AccelStructure::SyncGeometry(const SceneData& scene)
 			}
 			else
 			{
-				BuildBottomLevel(geometry, level);
+				CreateStaticBottomLevel(geometry, level, uploads);
 			}
 			Bottom.push_back(std::move(level));
 		}
 
 		// One buffer holding every geometry's attributes, which an instance
-		// indexes into through its custom index. Host visible, because an
-		// animated actor's normals change with its pose and its slice has to be
-		// rewritten every frame.
-		EnsureAttributeCapacity(AllAttributes.size());
-		if (AttributeBuffer && !AllAttributes.empty())
-		{
-			void* mapped = AttributeBuffer->Map(0, AllAttributes.size() * sizeof(TriangleAttributes));
-			memcpy(mapped, AllAttributes.data(), AllAttributes.size() * sizeof(TriangleAttributes));
-			AttributeBuffer->Unmap();
-		}
+		// indexes into through its custom index. Only the new ones are sent,
+		// unless the buffer had to grow and starts empty.
+		const bool grew = EnsureAttributeCapacity(AllAttributes.size(), uploads);
+		const size_t first = grew ? 0 : attributesBefore;
+		if (AttributeBuffer && AllAttributes.size() > first)
+			uploads.Upload(AttributeBuffer.get(), first * sizeof(TriangleAttributes),
+				AllAttributes.data() + first, (AllAttributes.size() - first) * sizeof(TriangleAttributes));
 	}
 
-	WriteDynamicGeometry(scene);
+	WriteDynamicGeometry(scene, uploads);
+	WriteLights(scene, uploads);
 
-	// Rewritten every frame rather than built once. A light that moves, a flare
-	// that is thrown, and the player's own light augmentation all change the
-	// list, and a list uploaded at level load could express none of them.
-	// The fog lights follow the ordinary ones in the same buffer, and the grid
-	// carries how many there are: the push constants have no room left.
+	unguard;
+}
+
+// Rewritten every frame rather than built once. A light that moves, a flare
+// that is thrown, and the player's own light augmentation all change the list,
+// and a list uploaded at level load could express none of them. The fog lights
+// follow the ordinary ones in the same buffer, and the grid carries how many
+// there are: the push constants have no room left.
+void AccelStructure::WriteLights(const SceneData& scene, FrameUploads& uploads)
+{
+	guard(AccelStructure::WriteLights);
+
 	Lights = (int)scene.Lights.size();
 	const size_t wanted = std::max<size_t>(scene.Lights.size() + scene.FogLights.size(), 1);
 	if (!LightBuffer || wanted > LightCapacity)
 	{
 		LightCapacity = std::max<size_t>(wanted * 2, 256);
+		uploads.Retire(std::move(LightBuffer));
 		LightBuffer = BufferBuilder()
 			.Size(LightCapacity * sizeof(SceneLight))
-			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 			.MinAlignment(256)
 			.DebugName("PathTracerLights")
 			.Create(renderer->GetDevice());
 		attributesChanged = true;
 	}
 
+	auto* staged = (SceneLight*)uploads.Write(LightBuffer.get(), 0, wanted * sizeof(SceneLight));
+	if (scene.Lights.empty())
 	{
-		auto* mapped = (SceneLight*)LightBuffer->Map(0, wanted * sizeof(SceneLight));
-		if (scene.Lights.empty())
-		{
-			// A storage buffer may not be zero sized; the shader checks the
-			// count before it reads anything.
-			SceneLight placeholder = {};
-			mapped[0] = placeholder;
-		}
-		else
-		{
-			memcpy(mapped, scene.Lights.data(), scene.Lights.size() * sizeof(SceneLight));
-		}
-		if (!scene.FogLights.empty())
-			memcpy(mapped + scene.Lights.size(), scene.FogLights.data(), scene.FogLights.size() * sizeof(SceneLight));
-		LightBuffer->Unmap();
+		// A storage buffer may not be zero sized; the shader checks the count
+		// before it reads anything.
+		SceneLight placeholder = {};
+		staged[0] = placeholder;
 	}
+	else
+	{
+		memcpy(staged, scene.Lights.data(), scene.Lights.size() * sizeof(SceneLight));
+	}
+	if (!scene.FogLights.empty())
+		memcpy(staged + scene.Lights.size(), scene.FogLights.data(), scene.FogLights.size() * sizeof(SceneLight));
 
-	WriteLightGrid(scene);
+	WriteLightGrid(scene, uploads);
 
 	unguard;
 }
+
 
 // A uniform grid over everywhere a light can reach, each cell listing the
 // lights whose reach touches it.
@@ -241,7 +224,7 @@ void AccelStructure::SyncGeometry(const SceneData& scene)
 // Laid out as one array of words: the grid's origin and cell size as floats,
 // its dimensions, then a start and count per cell, then the light indices the
 // starts point into.
-void AccelStructure::WriteLightGrid(const SceneData& scene)
+void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& uploads)
 {
 	guard(AccelStructure::WriteLightGrid);
 
@@ -366,23 +349,22 @@ void AccelStructure::WriteLightGrid(const SceneData& scene)
 	if (!LightGridBuffer || LightGrid.size() > LightGridCapacity)
 	{
 		LightGridCapacity = std::max<size_t>(LightGrid.size() * 2, 4096);
+		uploads.Retire(std::move(LightGridBuffer));
 		LightGridBuffer = BufferBuilder()
 			.Size(LightGridCapacity * sizeof(uint32_t))
-			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 			.MinAlignment(256)
 			.DebugName("PathTracerLightGrid")
 			.Create(renderer->GetDevice());
 		attributesChanged = true;
 	}
 
-	void* mapped = LightGridBuffer->Map(0, LightGrid.size() * sizeof(uint32_t));
-	memcpy(mapped, LightGrid.data(), LightGrid.size() * sizeof(uint32_t));
-	LightGridBuffer->Unmap();
+	uploads.Upload(LightGridBuffer.get(), 0, LightGrid.data(), LightGrid.size() * sizeof(uint32_t));
 
 	unguard;
 }
 
-void AccelStructure::EnsureTopLevelCapacity(size_t instanceCount)
+void AccelStructure::EnsureTopLevelCapacity(size_t instanceCount, FrameUploads& uploads)
 {
 	if (TopLevel && instanceCount <= TopCapacity)
 		return;
@@ -390,20 +372,25 @@ void AccelStructure::EnsureTopLevelCapacity(size_t instanceCount)
 	VulkanDevice* device = renderer->GetDevice();
 
 	// Grown with headroom so that a few more actors coming into view does not
-	// reallocate the structure every frame.
+	// reallocate the structure every frame. What it replaces may still be in
+	// use by the frame before, so it is retired rather than destroyed.
 	TopCapacity = std::max<size_t>(instanceCount * 2, 256);
+	uploads.Retire(std::move(InstanceDataBuffer));
+	uploads.Retire(std::move(InstanceBuffer));
+	uploads.Retire(std::move(TopLevel));
+	uploads.Retire(std::move(TopBuffer));
+	uploads.Retire(std::move(TopScratch));
 
-	// Written by the host every frame like the instance records themselves.
 	InstanceDataBuffer = BufferBuilder()
 		.Size(TopCapacity * sizeof(vec4))
-		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 		.MinAlignment(256)
 		.DebugName("PathTracerInstanceData")
 		.Create(device);
 
 	InstanceBuffer = BufferBuilder()
 		.Size(TopCapacity * sizeof(VkAccelerationStructureInstanceKHR))
-		.Usage(VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+		.Usage(VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 		.MinAlignment(256)   // instance data has its own 16 byte minimum
 		.DebugName("PathTracerInstances")
 		.Create(device);
@@ -448,39 +435,38 @@ void AccelStructure::EnsureTopLevelCapacity(size_t instanceCount)
 	attributesChanged = true;   // the descriptor points at the structure
 }
 
-void AccelStructure::BuildTopLevel(const SceneData& scene, VulkanCommandBuffer* commands)
+// Every placement, rewritten every frame, because the movers and the actors
+// have all moved since the last one.
+void AccelStructure::WriteInstances(const SceneData& scene, FrameUploads& uploads)
 {
-	guard(AccelStructure::BuildTopLevel);
+	guard(AccelStructure::WriteInstances);
 
+	InstanceCount = 0;
 	if (scene.Instances.empty() || Bottom.empty())
 		return;
 
-	// Everything that animates is rebuilt first, in this same command buffer,
-	// so the top level structure is built against this frame's shapes.
-	RecordDynamicBuilds(scene, commands);
-
-	EnsureTopLevelCapacity(scene.Instances.size());
-
+	EnsureTopLevelCapacity(scene.Instances.size(), uploads);
 	const size_t count = std::min(scene.Instances.size(), TopCapacity);
 
-	auto* mapped = (VkAccelerationStructureInstanceKHR*)InstanceBuffer->Map(0, count * sizeof(VkAccelerationStructureInstanceKHR));
-	auto* instanceData = (vec4*)InstanceDataBuffer->Map(0, count * sizeof(vec4));
+	auto* staged = (VkAccelerationStructureInstanceKHR*)uploads.Write(InstanceBuffer.get(), 0, count * sizeof(VkAccelerationStructureInstanceKHR));
+	auto* instanceData = (vec4*)uploads.Write(InstanceDataBuffer.get(), 0, count * sizeof(vec4));
 	for (size_t i = 0; i < count; i++)
 	{
 		instanceData[i] = scene.Instances[i].Ambient;
 		const SceneInstance& src = scene.Instances[i];
-		VkAccelerationStructureInstanceKHR& dst = mapped[i];
-		dst = {};
+		VkAccelerationStructureInstanceKHR dst = {};
 		memcpy(&dst.transform, src.Transform, sizeof(float) * 12);
 		// The custom index is how the trace shader finds this instance's
 		// shading data: it is the offset of its geometry's attributes.
 		dst.instanceCustomIndex = Bottom[src.GeometryIndex].AttributeBase;
 		dst.mask = (HideStatic && src.GeometryIndex < scene.StaticGeometries) ? 0x00 : 0xFF;
 		dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-		dst.accelerationStructureReference = Bottom[src.GeometryIndex].Structure->GetDeviceAddress();
+		// A shape with no triangles has no structure, and is placed with a
+		// null one, which traces as nothing.
+		dst.accelerationStructureReference = Bottom[src.GeometryIndex].Structure ? Bottom[src.GeometryIndex].Structure->GetDeviceAddress() : 0;
+		staged[i] = dst;
 	}
-	InstanceDataBuffer->Unmap();
-	InstanceBuffer->Unmap();
+	InstanceCount = count;
 
 	// Once per level: what the top level structure was actually built from.
 	if (!LoggedInstances)
@@ -489,6 +475,21 @@ void AccelStructure::BuildTopLevel(const SceneData& scene, VulkanCommandBuffer* 
 		debugf(TEXT("PathTracer tlas: %d instances, %d bottom level structures, %d attributes"),
 			(int)count, (int)Bottom.size(), (int)AllAttributes.size());
 	}
+
+	unguard;
+}
+
+void AccelStructure::Record(VulkanCommandBuffer* commands, FrameUploads& uploads)
+{
+	guard(AccelStructure::Record);
+
+	// New shapes, and those that animate and changed, first, in this same
+	// command buffer, so the top level structure is built against this
+	// frame's shapes.
+	RecordBottomLevelBuilds(commands, uploads);
+
+	if (!IsReady())
+		return;
 
 	VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 	geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
@@ -506,7 +507,7 @@ void AccelStructure::BuildTopLevel(const SceneData& scene, VulkanCommandBuffer* 
 	buildInfo.scratchData.deviceAddress = TopScratch->GetDeviceAddress();
 
 	VkAccelerationStructureBuildRangeInfoKHR range = {};
-	range.primitiveCount = (uint32_t)count;
+	range.primitiveCount = (uint32_t)InstanceCount;
 	const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = { &range };
 
 	commands->buildAccelerationStructures(1, &buildInfo, ranges);
@@ -523,23 +524,26 @@ void AccelStructure::BuildTopLevel(const SceneData& scene, VulkanCommandBuffer* 
 	unguard;
 }
 
-
-void AccelStructure::EnsureAttributeCapacity(size_t count)
+// True when the buffer had to be made again, and so holds nothing yet.
+bool AccelStructure::EnsureAttributeCapacity(size_t count, FrameUploads& uploads)
 {
 	if (AttributeBuffer && count <= AttributeCapacity)
-		return;
+		return false;
 
 	AttributeCapacity = std::max<size_t>(count * 2, 4096);
+	uploads.Retire(std::move(AttributeBuffer));
 	AttributeBuffer = BufferBuilder()
 		.Size(AttributeCapacity * sizeof(TriangleAttributes))
-		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 		.MinAlignment(256)
 		.DebugName("PathTracerAttributes")
 		.Create(renderer->GetDevice());
 	attributesChanged = true;
+	return true;
 }
 
-// A structure whose vertices are written by the host every frame.
+
+// A structure whose vertices are rewritten whenever its pose changes.
 //
 // Built rather than refitted: these are a few hundred triangles each and a
 // refit constrains what the geometry may do between frames, where a character
@@ -551,6 +555,7 @@ void AccelStructure::CreateDynamicBottomLevel(const SceneGeometry& geometry, Bot
 	VulkanDevice* device = renderer->GetDevice();
 
 	out.Dynamic = true;
+	out.Opaque = !geometry.HasMasked;
 	out.TriangleCount = (int)(geometry.Positions.size() / 3);
 
 	// Headroom, so that a pose with a few more triangles does not reallocate
@@ -559,8 +564,7 @@ void AccelStructure::CreateDynamicBottomLevel(const SceneGeometry& geometry, Bot
 
 	out.Vertices = BufferBuilder()
 		.Size(out.VertexCapacity * sizeof(vec3))
-		.Usage(VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-			VMA_MEMORY_USAGE_CPU_TO_GPU)
+		.Usage(VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 		.MinAlignment(256)
 		.DebugName("PathTracerDynamicVertices")
 		.Create(device);
@@ -609,16 +613,23 @@ void AccelStructure::CreateDynamicBottomLevel(const SceneGeometry& geometry, Bot
 	unguard;
 }
 
-// Vertices and shading data for everything that animates, written from the host.
-void AccelStructure::WriteDynamicGeometry(const SceneData& scene)
+// What a dynamic shape had, handed to the frame to free once the frames that
+// might still read it are done.
+void AccelStructure::RetireBottomLevel(BottomLevel& level, FrameUploads& uploads)
+{
+	uploads.Retire(std::move(level.Structure));
+	uploads.Retire(std::move(level.Buffer));
+	uploads.Retire(std::move(level.Vertices));
+	uploads.Retire(std::move(level.Scratch));
+}
+
+// Vertices and shading data for everything that animates and changed.
+void AccelStructure::WriteDynamicGeometry(const SceneData& scene, FrameUploads& uploads)
 {
 	guard(AccelStructure::WriteDynamicGeometry);
 
 	if (!haveDynamic)
 		return;
-
-	// Mapped once for the whole pass rather than once per geometry.
-	TriangleAttributes* mappedAttrs = nullptr;
 
 	const size_t count = std::min(Bottom.size(), scene.Geometries.size());
 	for (size_t i = 0; i < count; i++)
@@ -639,15 +650,12 @@ void AccelStructure::WriteDynamicGeometry(const SceneData& scene)
 		// the structure is the honest answer rather than truncating it.
 		if (geometry.Positions.size() > level.VertexCapacity)
 		{
+			RetireBottomLevel(level, uploads);
 			CreateDynamicBottomLevel(geometry, level);
-			attributesChanged = true;
 		}
 
 		level.TriangleCount = (int)(geometry.Positions.size() / 3);
-
-		void* mapped = level.Vertices->Map(0, geometry.Positions.size() * sizeof(vec3));
-		memcpy(mapped, geometry.Positions.data(), geometry.Positions.size() * sizeof(vec3));
-		level.Vertices->Unmap();
+		uploads.Upload(level.Vertices.get(), 0, geometry.Positions.data(), geometry.Positions.size() * sizeof(vec3));
 
 		// The normals moved with the pose, so this actor's slice of the shading
 		// data is stale too.
@@ -657,47 +665,33 @@ void AccelStructure::WriteDynamicGeometry(const SceneData& scene)
 		{
 			memcpy(&AllAttributes[level.AttributeBase], geometry.Attributes.data(),
 				attributeCount * sizeof(TriangleAttributes));
-
-			if (!mappedAttrs)
-				mappedAttrs = (TriangleAttributes*)AttributeBuffer->Map(
-					0, AttributeCapacity * sizeof(TriangleAttributes));
-			memcpy(mappedAttrs + level.AttributeBase, geometry.Attributes.data(),
-				attributeCount * sizeof(TriangleAttributes));
+			uploads.Upload(AttributeBuffer.get(), level.AttributeBase * sizeof(TriangleAttributes),
+				geometry.Attributes.data(), attributeCount * sizeof(TriangleAttributes));
 		}
 	}
-
-	if (mappedAttrs)
-		AttributeBuffer->Unmap();
 
 	unguard;
 }
 
-// The per frame rebuilds, recorded into the frame's command buffer so they cost
-// one submission rather than one each.
-void AccelStructure::RecordDynamicBuilds(const SceneData& scene, VulkanCommandBuffer* commands)
+// The bottom level builds this frame needs - new shapes, and poses that
+// changed - recorded into the frame's command buffer so they cost one
+// submission rather than one each.
+void AccelStructure::RecordBottomLevelBuilds(VulkanCommandBuffer* commands, FrameUploads& uploads)
 {
-	guard(AccelStructure::RecordDynamicBuilds);
+	guard(AccelStructure::RecordBottomLevelBuilds);
 
-	if (!haveDynamic)
-		return;
-
-	const size_t count = std::min(Bottom.size(), scene.Geometries.size());
 	bool any = false;
-	for (size_t i = 0; i < count; i++)
+	for (BottomLevel& level : Bottom)
 	{
-		if (!scene.Geometries[i].Dynamic)
-			continue;
-
-		BottomLevel& level = Bottom[i];
-		if (!level.Structure || !level.Vertices || level.TriangleCount <= 0)
-			continue;
 		if (!level.NeedsBuild)
 			continue;
 		level.NeedsBuild = false;
+		if (!level.Structure || !level.Vertices || !level.Scratch || level.TriangleCount <= 0)
+			continue;
 
 		VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 		geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-		geom.flags = scene.Geometries[i].HasMasked ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+		geom.flags = level.Opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
 		geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
 		geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
 		geom.geometry.triangles.vertexData.deviceAddress = level.Vertices->GetDeviceAddress();
@@ -705,9 +699,12 @@ void AccelStructure::RecordDynamicBuilds(const SceneData& scene, VulkanCommandBu
 		geom.geometry.triangles.maxVertex = (uint32_t)(level.TriangleCount * 3) - 1;
 		geom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
 
+		// The same preference the structure was sized with: built fast for a
+		// shape that is rebuilt whenever it moves, traced fast for one that is
+		// built once.
 		VkAccelerationStructureBuildGeometryInfoKHR buildInfo = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
 		buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-		buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+		buildInfo.flags = level.Dynamic ? VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
 		buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
 		buildInfo.geometryCount = 1;
 		buildInfo.pGeometries = &geom;
@@ -720,6 +717,10 @@ void AccelStructure::RecordDynamicBuilds(const SceneData& scene, VulkanCommandBu
 
 		commands->buildAccelerationStructures(1, &buildInfo, ranges);
 		any = true;
+
+		// A shape built once needs its scratch only for this build.
+		if (!level.Dynamic)
+			uploads.Retire(std::move(level.Scratch));
 	}
 
 	if (any)

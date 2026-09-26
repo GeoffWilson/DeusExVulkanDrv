@@ -1,6 +1,7 @@
 #include "TracePrecomp.h"
 #include "TraceProtocol.h"
 #include "TraceRenderer.h"
+#include <chrono>
 #include <cstdarg>
 #include <stdexcept>
 
@@ -18,6 +19,12 @@
 // when the game's process goes away.
 
 static FILE* LogFile = nullptr;
+
+static double NowMs()
+{
+	using namespace std::chrono;
+	return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
+}
 
 void HelperLog(const char* format, ...)
 {
@@ -58,6 +65,7 @@ public:
 
 	VulkanDevice* GetDevice() const override { return Device.get(); }
 	void ExecuteImmediate(const std::function<void(VulkanCommandBuffer*)>& fn) override;
+	void WaitForGpu() override;
 
 private:
 	bool OpenChannel(DWORD parentPid, const std::string& name);
@@ -67,7 +75,7 @@ private:
 	void DestroyOutput();
 	bool Batch();
 	void TraceFrame(const TraceProtocol::TraceCommand& frame);
-	void WaitForFrame();
+	void WaitForSlot(int slot);
 	void Fail(const char* what);
 	void Reply();
 
@@ -81,9 +89,24 @@ private:
 	std::shared_ptr<VulkanInstance> Instance;
 	std::shared_ptr<VulkanDevice> Device;
 	std::unique_ptr<VulkanCommandPool> CommandPool;
-	std::unique_ptr<VulkanFence> FrameFence;
-	std::unique_ptr<VulkanCommandBuffer> FrameCommands;
-	bool FramePending = false;
+
+	// A frame is recorded while the one before is still on the GPU, so each
+	// of the frames in flight has its own fence and command buffers: the
+	// trace, and the handoff that copies it into the shared image.
+	struct FrameSlot
+	{
+		std::unique_ptr<VulkanFence> Fence;
+		std::unique_ptr<VulkanCommandBuffer> Trace;
+		std::unique_ptr<VulkanCommandBuffer> Handoff;
+		bool Pending = false;
+	};
+	FrameSlot Slots[FramesInFlight];
+	int NextSlot = 0;   // the next to record into: the oldest in flight
+
+	// This batch's time waiting for the GPU, and how many of those waits were
+	// for a frame still in flight rather than for a slot to come free.
+	double BatchWaitMs = 0.0;
+	uint32_t BatchStalls = 0;
 
 	// Ready, signalled once a frame is in the shared image; Released, signalled
 	// by the device once it has copied the frame out. Every Ready is answered
@@ -111,8 +134,8 @@ Helper::~Helper()
 		DestroyOutput();
 		if (ReadySemaphore) vkDestroySemaphore(Device->device, ReadySemaphore, nullptr);
 		if (ReleasedSemaphore) vkDestroySemaphore(Device->device, ReleasedSemaphore, nullptr);
-		FrameCommands.reset();
-		FrameFence.reset();
+		for (FrameSlot& slot : Slots)
+			slot = FrameSlot();
 		CommandPool.reset();
 	}
 	Device.reset();
@@ -136,8 +159,28 @@ void Helper::ExecuteImmediate(const std::function<void(VulkanCommandBuffer*)>& f
 		.AddCommandBuffer(commands.get())
 		.Execute(Device.get(), Device->GraphicsQueue, fence.get());
 
+	const double waitStart = NowMs();
 	VkFence handle = fence->fence;
 	vkWaitForFences(Device->device, 1, &handle, VK_TRUE, UINT64_MAX);
+	BatchWaitMs += NowMs() - waitStart;
+}
+
+// Every frame in flight, oldest first. After a submission of its own has
+// completed, which ExecuteImmediate's has, this finds them all done already.
+void Helper::WaitForGpu()
+{
+	bool stalled = false;
+	for (int i = 0; i < FramesInFlight; i++)
+	{
+		const int slot = (NextSlot + i) % FramesInFlight;
+		if (Slots[slot].Pending)
+		{
+			stalled = true;
+			WaitForSlot(slot);
+		}
+	}
+	if (stalled)
+		BatchStalls++;
 }
 
 bool Helper::OpenChannel(DWORD parentPid, const std::string& name)
@@ -204,7 +247,8 @@ void Helper::CreateDevice(const std::string& uuid, bool vkDebug)
 		.QueueFamily(Device->GraphicsFamily)
 		.DebugName("PathTracerHelperCommandPool")
 		.Create(Device.get());
-	FrameFence = FenceBuilder().DebugName("PathTracerHelperFrame").Create(Device.get());
+	for (FrameSlot& slot : Slots)
+		slot.Fence = FenceBuilder().DebugName("PathTracerHelperFrame").Create(Device.get());
 }
 
 // A semaphore the device's process can wait on or signal, and its handle
@@ -254,7 +298,7 @@ void Helper::EnsureOutput(uint32_t width, uint32_t height)
 	if (SharedImage && width == SharedWidth && height == SharedHeight)
 		return;
 
-	vkDeviceWaitIdle(Device->device);
+	WaitForGpu();
 	DestroyOutput();
 
 	VkExternalMemoryImageCreateInfo external = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
@@ -324,32 +368,45 @@ void Helper::EnsureOutput(uint32_t width, uint32_t height)
 		(unsigned long long)requirements.size, Shared->OutputGeneration);
 }
 
-void Helper::WaitForFrame()
+void Helper::WaitForSlot(int slot)
 {
-	if (!FramePending)
+	FrameSlot& frame = Slots[slot];
+	if (!frame.Pending)
 		return;
-	FramePending = false;
-	VkFence handle = FrameFence->fence;
+	const double waitStart = NowMs();
+	VkFence handle = frame.Fence->fence;
 	vkWaitForFences(Device->device, 1, &handle, VK_TRUE, UINT64_MAX);
 	vkResetFences(Device->device, 1, &handle);
-	FrameCommands.reset();
-	Renderer->FrameCompleted();
+	BatchWaitMs += NowMs() - waitStart;
+	frame.Pending = false;
+	frame.Trace.reset();
+	frame.Handoff.reset();
+	Renderer->FrameCompleted(slot);
 }
 
-// The frame, then a copy of it into the shared image, handed over to the
+// The frame, recorded into the oldest slot while the frame before it may still
+// be tracing, then a copy of it into the shared image, handed over to the
 // device's process on the GPU: Ready once it is there, and the copy itself
 // waiting on Released, which the device signals once it has taken the last
-// one out.
+// one out. The copy is a submission of its own so that only it waits on the
+// device, not the frame's uploads and trace.
 void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 {
-	FrameCommands = CommandPool->createBuffer();
-	FrameCommands->begin();
-	VulkanCommandBuffer* commands = FrameCommands.get();
+	const int slotIndex = NextSlot;
+	WaitForSlot(slotIndex);
+	FrameSlot& slot = Slots[slotIndex];
 
-	const bool traced = Renderer->Record(commands, frame);
+	slot.Trace = CommandPool->createBuffer();
+	slot.Trace->begin();
+	const bool traced = Renderer->Record(slot.Trace.get(), frame, slotIndex);
+	slot.Trace->end();
+
 	if (traced)
 	{
 		EnsureOutput((uint32_t)Renderer->Width(), (uint32_t)Renderer->Height());
+		slot.Handoff = CommandPool->createBuffer();
+		slot.Handoff->begin();
+		VkCommandBuffer commands = slot.Handoff->buffer;
 		VkImage output = Renderer->Output()->image;
 		const uint32_t family = (uint32_t)Device->GraphicsFamily;
 
@@ -374,14 +431,14 @@ void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 		barriers[1].srcQueueFamilyIndex = SharedFresh ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_EXTERNAL;
 		barriers[1].dstQueueFamilyIndex = SharedFresh ? VK_QUEUE_FAMILY_IGNORED : family;
 		barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			0, 0, nullptr, 0, nullptr, 2, barriers);
 
 		VkImageCopy copy = {};
 		copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 		copy.dstSubresource = copy.srcSubresource;
 		copy.extent = { SharedWidth, SharedHeight, 1 };
-		vkCmdCopyImage(commands->buffer, output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, SharedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		vkCmdCopyImage(commands, output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, SharedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
 		// Back to GENERAL for the next frame's trace, and over to the device.
 		barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -394,25 +451,33 @@ void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 		barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
 		barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 		barriers[1].dstAccessMask = 0;
-		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
 			0, 0, nullptr, 0, nullptr, 2, barriers);
 		SharedFresh = false;
+		slot.Handoff->end();
 	}
-	FrameCommands->end();
 
 	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 	const bool waitRelease = traced && AwaitingRelease;
-	VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-	submit.waitSemaphoreCount = waitRelease ? 1 : 0;
-	submit.pWaitSemaphores = &ReleasedSemaphore;
-	submit.pWaitDstStageMask = &waitStage;
-	submit.commandBufferCount = 1;
-	submit.pCommandBuffers = &commands->buffer;
-	submit.signalSemaphoreCount = traced ? 1 : 0;
-	submit.pSignalSemaphores = &ReadySemaphore;
-	if (vkQueueSubmit(Device->GraphicsQueue, 1, &submit, FrameFence->fence) != VK_SUCCESS)
+	VkSubmitInfo submits[2] = {};
+	submits[0].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submits[0].commandBufferCount = 1;
+	submits[0].pCommandBuffers = &slot.Trace->buffer;
+	if (traced)
+	{
+		submits[1].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submits[1].waitSemaphoreCount = waitRelease ? 1 : 0;
+		submits[1].pWaitSemaphores = &ReleasedSemaphore;
+		submits[1].pWaitDstStageMask = &waitStage;
+		submits[1].commandBufferCount = 1;
+		submits[1].pCommandBuffers = &slot.Handoff->buffer;
+		submits[1].signalSemaphoreCount = 1;
+		submits[1].pSignalSemaphores = &ReadySemaphore;
+	}
+	if (vkQueueSubmit(Device->GraphicsQueue, traced ? 2 : 1, submits, slot.Fence->fence) != VK_SUCCESS)
 		throw std::runtime_error("vkQueueSubmit failed");
-	FramePending = true;
+	slot.Pending = true;
+	NextSlot = (slotIndex + 1) % FramesInFlight;
 	if (waitRelease)
 		AwaitingRelease = false;
 	if (traced)
@@ -446,13 +511,17 @@ void Helper::Reply()
 	SetEvent(ReplyEvent);
 }
 
-// Applies one batch. The last frame must be finished with first: a batch can
-// replace geometry and textures the last frame was reading, and a frame reuses
-// the buffers the last one filled.
+// Applies one batch, without waiting for the frames in flight: the scene the
+// commands change is the host's copy, which the GPU never reads. What does
+// change something a frame in flight reads - a new level, a new texture -
+// waits for them itself.
 bool Helper::Batch()
 {
 	using namespace TraceProtocol;
-	WaitForFrame();
+	const double batchStart = NowMs();
+	BatchWaitMs = 0.0;
+	BatchStalls = 0;
+	double recordMs = 0.0, recordWaitMs = 0.0;
 	Shared->Traced = 0;
 
 	const uint32_t total = std::min(Shared->CommandBytes, Shared->CommandCapacity);
@@ -546,7 +615,10 @@ bool Helper::Batch()
 		{
 			TraceCommand c;
 			memcpy(&c, body, sizeof(c));
+			const double traceStart = NowMs(), waitBefore = BatchWaitMs;
 			TraceFrame(c);
+			recordMs += NowMs() - traceStart;
+			recordWaitMs += BatchWaitMs - waitBefore;
 			break;
 		}
 
@@ -557,6 +629,12 @@ bool Helper::Batch()
 
 		offset += header.Bytes;
 	}
+
+	const double batchMs = NowMs() - batchStart;
+	Shared->HelperWaitMs = (float)BatchWaitMs;
+	Shared->HelperRecordMs = (float)(recordMs - recordWaitMs);
+	Shared->HelperApplyMs = (float)std::max(batchMs - recordMs - (BatchWaitMs - recordWaitMs), 0.0);
+	Shared->HelperStalls = BatchStalls;
 	return !Quit;
 }
 

@@ -228,6 +228,10 @@ private:
 	{
 		double Collect = 0, Send = 0, Textures = 0, Wait = 0, Total = 0, Limit = 0;
 		int Frames = 0;
+		// The helper's side of Send: waiting for the GPU, taking in the scene,
+		// recording the frame.
+		double HelperWait = 0, HelperApply = 0, HelperRecord = 0;
+		int HelperStalls = 0;
 		double GpuBuild = 0, GpuTrace = 0, GpuDenoise = 0, GpuComposite = 0;
 		int GpuFrames = 0;
 		int Logged = 0;

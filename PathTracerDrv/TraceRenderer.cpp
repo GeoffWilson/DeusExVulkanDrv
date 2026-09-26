@@ -3,6 +3,7 @@
 #include "TraceProtocol.h"
 #include "AccelStructure.h"
 #include "Denoiser.h"
+#include "FrameUploads.h"
 #include "Shaders.h"
 #include <stdexcept>
 
@@ -57,6 +58,8 @@ TraceRenderer::TraceRenderer(GpuContext* context) : Context(context), Device(con
 	}
 
 	Accel.reset(new AccelStructure(Context));
+	for (auto& uploads : Uploads)
+		uploads.reset(new FrameUploads(Device));
 	CreateTracePipeline();
 	CreateCompositePipeline();
 	Slots.resize(MaxTextures);
@@ -171,10 +174,11 @@ void TraceRenderer::CreateCompositePipeline()
 		.Create(Device);
 }
 
-// Only ever called with nothing in flight: the helper waits for the last frame
-// before it applies a batch.
+// Everything the frames in flight are reading is about to go, so they are
+// waited for first.
 void TraceRenderer::ResetScene()
 {
+	Context->WaitForGpu();
 	Accel->Reset();
 	Scene = SceneData();
 	Pending.clear();
@@ -205,10 +209,14 @@ void TraceRenderer::BindWhite(uint32_t index)
 		.Execute(Device);
 }
 
+// A new level's textures, or one first seen mid-level. It rewrites the
+// materials and a descriptor the frames in flight read, so it waits for them:
+// a stall, but not a per frame one.
 void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material)
 {
 	if (index >= (uint32_t)MaxTextures)
 		return;
+	Context->WaitForGpu();
 
 	auto* mapped = (vec4*)MaterialBuffer->Map(0, MaxTextures * sizeof(vec4));
 	mapped[index] = material;
@@ -285,7 +293,7 @@ void TraceRenderer::SetTexturePixels(uint32_t index, uint32_t width, uint32_t he
 // Copied into the images they already have, so nothing that points at those
 // images has to change, and recorded into the frame's own command buffer
 // rather than submitted one texture at a time.
-void TraceRenderer::RecordTexturePixels(VulkanCommandBuffer* commands)
+void TraceRenderer::RecordTexturePixels(VulkanCommandBuffer* commands, FrameUploads& uploads)
 {
 	for (PendingPixels& pending : Pending)
 	{
@@ -304,14 +312,14 @@ void TraceRenderer::RecordTexturePixels(VulkanCommandBuffer* commands)
 		PipelineBarrier()
 			.AddImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
 			.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		InFlightStaging.push_back(std::move(pending.Staging));
+		uploads.Retire(std::move(pending.Staging));
 	}
 	Pending.clear();
 }
 
 void TraceRenderer::Resize(int width, int height)
 {
-	vkDeviceWaitIdle(Device->device);
+	Context->WaitForGpu();
 
 	AccumView.reset();
 	AccumImage.reset();
@@ -429,7 +437,7 @@ void TraceRenderer::EnsureDenoiser(bool wanted, bool materials)
 {
 	if (Denoise && Denoise->HasSpecular() != materials)
 	{
-		vkDeviceWaitIdle(Device->device);
+		Context->WaitForGpu();
 		Denoise.reset();
 		DenoiseRestart = true;
 		DescriptorsDirty = true;
@@ -477,10 +485,14 @@ void TraceRenderer::WriteCompositeDescriptors()
 		.Execute(Device);
 }
 
+// Only when something they point at was made again. The frame before may
+// still be reading them, so it is waited for first: descriptors in use cannot
+// be rewritten.
 void TraceRenderer::UpdateDescriptors()
 {
 	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !MotionBuffer)
 		return;
+	Context->WaitForGpu();
 
 	WriteDescriptors writes;
 	for (int i = 0; i < GuideImageCount; i++)
@@ -505,23 +517,24 @@ void TraceRenderer::UpdateDescriptors()
 // the order the top level structure numbers them. An instance with no last
 // placement - new this frame, or one that never moves - is given its current
 // one, which reads as not having moved.
-void TraceRenderer::WriteMotion(const vec4 (&previousCamera)[4])
+void TraceRenderer::WriteMotion(const vec4 (&previousCamera)[4], FrameUploads& uploads)
 {
 	const size_t count = Scene.Instances.size();
 	const size_t wanted = 4 + std::max<size_t>(count, 1) * 3;
 	if (!MotionBuffer || wanted > MotionCapacity)
 	{
 		MotionCapacity = std::max<size_t>(wanted * 2, 4 + 256 * 3);
+		uploads.Retire(std::move(MotionBuffer));
 		MotionBuffer = BufferBuilder()
 			.Size(MotionCapacity * sizeof(vec4))
-			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 			.MinAlignment(256)
 			.DebugName("PathTracerMotion")
 			.Create(Device);
 		DescriptorsDirty = true;
 	}
 
-	auto* mapped = (vec4*)MotionBuffer->Map(0, wanted * sizeof(vec4));
+	auto* mapped = (vec4*)uploads.Write(MotionBuffer.get(), 0, wanted * sizeof(vec4));
 	for (int i = 0; i < 4; i++)
 		mapped[i] = previousCamera[i];
 	for (size_t i = 0; i < count; i++)
@@ -531,10 +544,13 @@ void TraceRenderer::WriteMotion(const vec4 (&previousCamera)[4])
 		for (int r = 0; r < 3; r++)
 			mapped[4 + i * 3 + r] = vec4(m[r * 4 + 0], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
 	}
-	MotionBuffer->Unmap();
+	// With no instances, the one placement the buffer is sized for.
+	if (count == 0)
+		for (int r = 0; r < 3; r++)
+			mapped[4 + r] = vec4(0.0f);
 }
 
-bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame)
+bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, int slot)
 {
 	if (frame.Width == 0 || frame.Height == 0)
 		return false;
@@ -546,9 +562,14 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	EnsureDenoiser(frame.Denoise != 0, frame.Materials != 0);
 	const bool denoising = frame.Denoise && Denoise && Denoise->Available() && frame.ViewMode == 0;
 
-	// New shapes get a bottom level structure the first time they are seen,
-	// and dynamic ones that changed are rewritten.
-	Accel->SyncGeometry(Scene);
+	// The host's half of the frame, staged: new shapes and poses, the lights,
+	// the placements and the motion. The frame before may still be reading
+	// the buffers these end up in.
+	FrameUploads& uploads = *Uploads[slot];
+	uploads.Begin();
+	Accel->HideStatic = (frame.DebugMode == 1);
+	Accel->Update(Scene, uploads);
+	WriteMotion(frame.PreviousCamera, uploads);
 	if (Accel->AttributesChanged())
 	{
 		Accel->ClearAttributesChanged();
@@ -562,35 +583,44 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		if (props.limits.timestampComputeAndGraphics && props.limits.timestampPeriod > 0.0f)
 		{
 			Timestamps = QueryPoolBuilder()
-				.QueryType(VK_QUERY_TYPE_TIMESTAMP, TimestampCount)
+				.QueryType(VK_QUERY_TYPE_TIMESTAMP, TimestampCount * GpuContext::FramesInFlight)
 				.DebugName("PathTracerTimestamps")
 				.Create(Device);
 			TimestampPeriodMs = props.limits.timestampPeriod * 1.0e-6;
 		}
 	}
 	const bool timing = Timestamps && frame.Timing;
+	const uint32_t firstStamp = (uint32_t)slot * TimestampCount;
 	auto stamp = [&](uint32_t index)
 	{
 		if (timing)
-			commands->writeTimestamp(index ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, Timestamps.get(), index);
+			commands->writeTimestamp(index ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, Timestamps.get(), firstStamp + index);
 	};
 	if (timing)
-		commands->resetQueryPool(Timestamps.get(), 0, TimestampCount);
+		commands->resetQueryPool(Timestamps.get(), firstStamp, TimestampCount);
+
+	// Everything from here on reuses what the frame before used - the
+	// buffers the uploads land in, the structures, the images, NRD's history
+	// - so it waits for that frame to be done with them, on the GPU. The CPU
+	// has already recorded this far without waiting.
+	VkMemoryBarrier previous = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+	previous.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+	previous.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+	vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &previous, 0, nullptr, 0, nullptr);
 	stamp(0);
+
+	uploads.Record(commands);
 
 	// Textures that generate themselves get their new frame before the trace
 	// reads them.
-	RecordTexturePixels(commands);
+	RecordTexturePixels(commands, uploads);
 
-	// The top level structure is rebuilt every frame, because the movers and
-	// the actors have all moved since the last one.
-	Accel->HideStatic = (frame.DebugMode == 1);
-	Accel->BuildTopLevel(Scene, commands);
+	// New shapes and changed poses, then the top level structure.
+	Accel->Record(commands, uploads);
 	if (!Accel->IsReady())
 		return false;
 	stamp(1);
 
-	WriteMotion(frame.PreviousCamera);
 	UpdateDescriptors();
 
 	PushConstants.CameraOrigin = frame.Camera[0];
@@ -646,7 +676,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		inputs[1].ViewZ = GuideViews[9].get();
 		inputs[1].Motion = ReflectionMotionView.get();
 		inputs[1].Diffuse = GuideViews[3].get();
-		Denoise->Denoise(commands, inputs, cameraOf(frame.Camera), cameraOf(frame.PreviousCamera), DenoiseRestart);
+		Denoise->Denoise(commands, inputs, cameraOf(frame.Camera), cameraOf(frame.PreviousCamera), DenoiseRestart, slot);
 		DenoiseRestart = false;
 		stamp(3);
 
@@ -663,21 +693,21 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		stamp(3);
 	}
 	stamp(4);
-	TimestampsPending = timing;
+	TimestampsPending[slot] = timing;
 	return true;
 }
 
-void TraceRenderer::FrameCompleted()
+// Only the timestamps are read here. The frame's staging is reused, and what
+// it retired freed, when its slot records again.
+void TraceRenderer::FrameCompleted(int slot)
 {
-	InFlightStaging.clear();
-
 	GpuTimed = false;
-	if (!TimestampsPending || !Timestamps)
+	if (!TimestampsPending[slot] || !Timestamps)
 		return;
-	TimestampsPending = false;
+	TimestampsPending[slot] = false;
 
 	uint64_t t[TimestampCount] = {};
-	if (!Timestamps->getResults(0, TimestampCount, sizeof(t), t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT))
+	if (!Timestamps->getResults((uint32_t)slot * TimestampCount, TimestampCount, sizeof(t), t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT))
 		return;
 	auto ms = [&](int a, int b) { return t[b] > t[a] ? (float)((double)(t[b] - t[a]) * TimestampPeriodMs) : 0.0f; };
 	GpuMs[0] = ms(0, 1);

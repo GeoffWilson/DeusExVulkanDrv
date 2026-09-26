@@ -90,6 +90,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
 add_executable(PathTracerHelper
 	"${PATHTRACERDRV_DIR}/AccelStructure.cpp"
 	"${PATHTRACERDRV_DIR}/Denoiser.cpp"
+	"${PATHTRACERDRV_DIR}/FrameUploads.cpp"
 	"${PATHTRACERDRV_DIR}/HelperMain.cpp"
 	"${PATHTRACERDRV_DIR}/mat.cpp"
 	"${PATHTRACERDRV_DIR}/Shaders.cpp"

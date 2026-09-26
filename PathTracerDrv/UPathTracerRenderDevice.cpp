@@ -1103,10 +1103,11 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	// left an acquired swap chain image unpresented, which the compositor shows
 	// as black. Whether the world can be traced and whether the frame must be
 	// presented are different questions.
-	WaitForPreviousFrame();
-
 	if (!Blit || !OutputImage)
+	{
+		WaitForPreviousFrame();
 		return;
+	}
 
 	const double frameStart = NowMs();
 
@@ -1114,6 +1115,26 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	// frame owes it: its submission must wait on Ready and signal Released,
 	// or the helper's next frame waits for ever.
 	bool owed = false;
+
+	// A frame the helper traced that cannot be presented after all is still
+	// taken, with nothing done to it: its Ready waited on and its Released
+	// signalled, so the next one can be traced at all.
+	auto settle = [&]()
+	{
+		if (!owed || !Tracer)
+			return;
+		owed = false;
+		VkSemaphore ready = Tracer->Ready(), released = Tracer->Released();
+		VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+		VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+		submit.waitSemaphoreCount = 1;
+		submit.pWaitSemaphores = &ready;
+		submit.pWaitDstStageMask = &stage;
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores = &released;
+		vkQueueSubmit(Device->GraphicsQueue, 1, &submit, VK_NULL_HANDLE);
+		vkQueueWaitIdle(Device->GraphicsQueue);
+	};
 
 	try
 	{
@@ -1147,25 +1168,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		if (windowWidth <= 0 || windowHeight <= 0)
 			return;
 
-		if (SwapChain->Lost() || SwapChain->Width() != windowWidth || SwapChain->Height() != windowHeight || UsingVsync != UseVSync)
-		{
-			PathTracerEvent("swap chain %dx%d -> %dx%d%s", SwapChain->Width(), SwapChain->Height(), windowWidth, windowHeight,
-				SwapChain->Lost() ? " (lost)" : "");
-			UsingVsync = UseVSync;
-			SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, false, false);
-		}
-
-		int imageIndex = SwapChain->AcquireImage(ImageAvailableSemaphore.get());
-		if (imageIndex == -1)
-		{
-			PathTracerEvent("no swap chain image%s", SwapChain->Lost() ? " (lost)" : "");
-			return;
-		}
-
-		// The frame is traced only once it is certain to be presented, since a
-		// traced frame has to be taken. Without one the output image keeps the
-		// last traced world, which is what the engine expects behind a menu or
-		// a conversation.
+		// Traced first, and the last frame waited for only afterwards: the
+		// helper records this one while the GPU is still on the last, and
+		// queues it behind it, so the GPU goes from one straight to the next
+		// rather than idling while the frame is described and recorded.
+		// Without a world to trace the output image keeps the last one, which
+		// is what the engine expects behind a menu or a conversation.
 		if (HaveCamera && Tracer && Tracer->Alive() && !Scene.IsEmpty())
 		{
 			const double sendStart = NowMs();
@@ -1208,6 +1216,14 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.PreviousCamera[3] = previousCamera.Forward;
 				frame.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
 				owed = Tracer->Trace(frame);
+				if (Tracer->Alive())
+				{
+					const TraceProtocol::Header& status = Tracer->Status();
+					Timings.HelperWait += status.HelperWaitMs;
+					Timings.HelperApply += status.HelperApplyMs;
+					Timings.HelperRecord += status.HelperRecordMs;
+					Timings.HelperStalls += (int)status.HelperStalls;
+				}
 				if (owed)
 				{
 					DenoiseRestart = false;
@@ -1231,6 +1247,26 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				debugf(TEXT("PathTracer: the helper has stopped (%s); PathTracerHelper.log says more. The world will not be traced again this session."),
 					*Widen(Tracer->Error().c_str()));
 			}
+		}
+
+		// The swap chain image is acquired only once the last frame is done
+		// with its semaphore.
+		WaitForPreviousFrame();
+
+		if (SwapChain->Lost() || SwapChain->Width() != windowWidth || SwapChain->Height() != windowHeight || UsingVsync != UseVSync)
+		{
+			PathTracerEvent("swap chain %dx%d -> %dx%d%s", SwapChain->Width(), SwapChain->Height(), windowWidth, windowHeight,
+				SwapChain->Lost() ? " (lost)" : "");
+			UsingVsync = UseVSync;
+			SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, false, false);
+		}
+
+		int imageIndex = SwapChain->AcquireImage(ImageAvailableSemaphore.get());
+		if (imageIndex == -1)
+		{
+			PathTracerEvent("no swap chain image%s", SwapChain->Lost() ? " (lost)" : "");
+			settle();
+			return;
 		}
 
 		auto commands = CommandPool->createBuffer();
@@ -1365,8 +1401,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				Timings.Logged++;
 				const double n = Timings.Frames;
 				char line[512];
-				snprintf(line, sizeof(line), "PathTracer ms/frame: collect %.2f send %.2f (textures %.2f) gpu-wait %.2f unlock %.2f limiter %.2f | %d instances, %d textures, %d poses rebuilt",
+				snprintf(line, sizeof(line), "PathTracer ms/frame: collect %.2f send %.2f (textures %.2f; helper wait %.2f apply %.2f record %.2f, %d stalls) gpu-wait %.2f unlock %.2f limiter %.2f | %d instances, %d textures, %d poses rebuilt",
 					Timings.Collect / n, Timings.Send / n, Timings.Textures / n,
+					Timings.HelperWait / n, Timings.HelperApply / n, Timings.HelperRecord / n, Timings.HelperStalls,
 					Timings.Wait / n, (Timings.Total - Timings.Limit) / n, Timings.Limit / n,
 					(int)Scene.Instances.size(), (int)Scene.Textures.size(), Scene.MeshBuilds);
 				WriteTimingLine(line);
@@ -1409,22 +1446,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	{
 		PathTracerEvent("frame failed: %s", e.what());
 		debugf(TEXT("PathTracer frame failed: %s"), *Widen(e.what()));
-		// A frame the helper traced is still taken, with nothing done to it:
-		// its Ready waited on and its Released signalled, so the next one can
-		// be traced at all.
-		if (owed && Tracer)
-		{
-			VkSemaphore ready = Tracer->Ready(), released = Tracer->Released();
-			VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-			VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-			submit.waitSemaphoreCount = 1;
-			submit.pWaitSemaphores = &ready;
-			submit.pWaitDstStageMask = &stage;
-			submit.signalSemaphoreCount = 1;
-			submit.pSignalSemaphores = &released;
-			vkQueueSubmit(Device->GraphicsQueue, 1, &submit, VK_NULL_HANDLE);
-			vkQueueWaitIdle(Device->GraphicsQueue);
-		}
+		settle();
 	}
 
 	unguard;

@@ -1,5 +1,6 @@
 #include "TracePrecomp.h"
 #include "Denoiser.h"
+#include "GpuContext.h"
 
 #ifdef PATHTRACER_NRD
 
@@ -126,11 +127,12 @@ struct Denoiser::Impl
 	std::vector<VkPipelineLayout> Layouts;
 	std::vector<VkPipeline> Pipelines;
 
-	// The resources sets, allocated afresh each frame.
-	VkDescriptorPool FramePool = VK_NULL_HANDLE;
+	// The resources sets, allocated afresh each frame: a pool for each frame
+	// in flight, since the one before may still be using its sets.
+	VkDescriptorPool FramePools[GpuContext::FramesInFlight] = {};
 
 	// Constants, a slice per dispatch. Host visible and rewritten every frame,
-	// which is safe because the device waits for the previous frame first.
+	// in a range of their own for each frame in flight for the same reason.
 	std::unique_ptr<VulkanBuffer> Constants;
 	uint32_t ConstantStride = 0;
 	uint32_t ConstantSlices = 0;
@@ -167,7 +169,8 @@ struct Denoiser::Impl
 		for (VkPipeline p : Pipelines) vkDestroyPipeline(d, p, nullptr);
 		for (VkPipelineLayout l : Layouts) vkDestroyPipelineLayout(d, l, nullptr);
 		for (VkDescriptorSetLayout l : ResourceLayouts) vkDestroyDescriptorSetLayout(d, l, nullptr);
-		if (FramePool) vkDestroyDescriptorPool(d, FramePool, nullptr);
+		for (VkDescriptorPool pool : FramePools)
+			if (pool) vkDestroyDescriptorPool(d, pool, nullptr);
 		if (SharedPool) vkDestroyDescriptorPool(d, SharedPool, nullptr);
 		if (SharedLayout) vkDestroyDescriptorSetLayout(d, SharedLayout, nullptr);
 		for (VkSampler s : Samplers) vkDestroySampler(d, s, nullptr);
@@ -251,7 +254,7 @@ Denoiser::Denoiser(VulkanDevice* device, bool specular) : I(std::make_unique<Imp
 	I->ConstantStride = (desc.constantBufferMaxDataSize + alignment - 1) / alignment * alignment;
 	I->ConstantSlices = 64;
 	I->Constants = BufferBuilder()
-		.Size((size_t)I->ConstantStride * I->ConstantSlices)
+		.Size((size_t)I->ConstantStride * I->ConstantSlices * GpuContext::FramesInFlight)
 		.Usage(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
 		.DebugName("PathTracerDenoiserConstants")
 		.Create(device);
@@ -370,7 +373,8 @@ Denoiser::Denoiser(VulkanDevice* device, bool specular) : I(std::make_unique<Imp
 		info.maxSets = std::max(pool.setsMaxNum * 2, 1u);
 		info.poolSizeCount = 2;
 		info.pPoolSizes = sizes;
-		vkCreateDescriptorPool(d, &info, nullptr, &I->FramePool);
+		for (VkDescriptorPool& framePool : I->FramePools)
+			vkCreateDescriptorPool(d, &info, nullptr, &framePool);
 	}
 
 	Instance = I->Nrd;
@@ -417,7 +421,7 @@ void Denoiser::Resize(int width, int height)
 VulkanImageView* Denoiser::Output(int signal) const { return I->Outputs[signal].View.get(); }
 VulkanImageView* Denoiser::SpecularOutput() const { return I->SpecularOutput.View ? I->SpecularOutput.View.get() : nullptr; }
 
-void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[SignalCount], const Camera& now, const Camera& previous, bool restart)
+void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[SignalCount], const Camera& now, const Camera& previous, bool restart, int slot)
 {
 	if (!Available() || !I->Width)
 		return;
@@ -465,10 +469,12 @@ void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[
 	for (int signal = 0; signal < SignalCount; signal++)
 		nrd::SetDenoiserSettings(*I->Nrd, (nrd::Identifier)signal, &relax);
 
-	vkResetDescriptorPool(d, I->FramePool, 0);
-	uint8_t* constants = (uint8_t*)I->Constants->Map(0, (size_t)I->ConstantStride * I->ConstantSlices);
+	VkDescriptorPool framePool = I->FramePools[slot];
+	vkResetDescriptorPool(d, framePool, 0);
+	const uint32_t firstSlice = (uint32_t)slot * I->ConstantSlices;
+	uint8_t* constants = (uint8_t*)I->Constants->Map(0, (size_t)I->ConstantStride * I->ConstantSlices * GpuContext::FramesInFlight);
 	uint32_t slice = 0;
-	uint32_t constantOffset = 0;
+	uint32_t constantOffset = firstSlice * I->ConstantStride;
 
 	// One signal at a time, each against its own images. NRD's own
 	// integration does the same when the signals' inputs differ.
@@ -504,7 +510,7 @@ void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[
 
 			VkDescriptorSet set = VK_NULL_HANDLE;
 			VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-			alloc.descriptorPool = I->FramePool;
+			alloc.descriptorPool = framePool;
 			alloc.descriptorSetCount = 1;
 			alloc.pSetLayouts = &I->ResourceLayouts[dispatch.pipelineIndex];
 			if (vkAllocateDescriptorSets(d, &alloc, &set) != VK_SUCCESS)
@@ -547,7 +553,7 @@ void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[
 
 			if (dispatch.constantBufferDataSize && !dispatch.constantBufferDataMatchesPreviousDispatch && slice < I->ConstantSlices)
 			{
-				constantOffset = slice * I->ConstantStride;
+				constantOffset = (firstSlice + slice) * I->ConstantStride;
 				memcpy(constants + constantOffset, dispatch.constantBufferData, dispatch.constantBufferDataSize);
 				slice++;
 			}
@@ -582,7 +588,7 @@ struct Denoiser::Impl {};
 Denoiser::Denoiser(VulkanDevice*, bool specular) : I(std::make_unique<Impl>()), Specular(specular) { Status = "built without NRD (see cmake/build-nrd.sh)"; }
 Denoiser::~Denoiser() {}
 void Denoiser::Resize(int, int) {}
-void Denoiser::Denoise(VulkanCommandBuffer*, const Inputs (&)[SignalCount], const Camera&, const Camera&, bool) {}
+void Denoiser::Denoise(VulkanCommandBuffer*, const Inputs (&)[SignalCount], const Camera&, const Camera&, bool, int) {}
 VulkanImageView* Denoiser::Output(int) const { return nullptr; }
 VulkanImageView* Denoiser::SpecularOutput() const { return nullptr; }
 

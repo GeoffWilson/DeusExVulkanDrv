@@ -7,6 +7,7 @@
 
 class AccelStructure;
 class Denoiser;
+class FrameUploads;
 namespace TraceProtocol { struct TraceCommand; }
 
 // The trace shader's push constants: see Shaders::Trace.
@@ -57,14 +58,16 @@ public:
 	// New pixels for an existing slot, copied in as the next frame starts.
 	void SetTexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels);
 
-	// Records a frame: pending uploads, the top level structure, the trace,
-	// and when denoising NRD and the composite. The picture ends up in Output,
-	// in GENERAL layout. False when there is nothing to trace yet.
-	bool Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame);
+	// Records a frame into one of the FramesInFlight slots, whose last frame
+	// the caller has waited for: the uploads, the structures, the trace, and
+	// when denoising NRD and the composite. The frame before may still be on
+	// the GPU, and the recording starts by waiting for it there. The picture
+	// ends up in Output, in GENERAL layout. False when there is nothing to
+	// trace yet.
+	bool Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, int slot);
 
-	// The GPU has finished what Record recorded: its staging can go, and its
-	// timestamps can be read.
-	void FrameCompleted();
+	// The GPU has finished the frame in slot: its timestamps can be read.
+	void FrameCompleted(int slot);
 
 	VulkanImage* Output() const { return OutputImage.get(); }
 	int Width() const { return TraceWidth; }
@@ -87,8 +90,8 @@ private:
 	void EnsureDenoiser(bool wanted, bool materials);
 	void UpdateDescriptors();
 	void WriteCompositeDescriptors();
-	void WriteMotion(const vec4 (&previousCamera)[4]);
-	void RecordTexturePixels(VulkanCommandBuffer* commands);
+	void WriteMotion(const vec4 (&previousCamera)[4], FrameUploads& uploads);
+	void RecordTexturePixels(VulkanCommandBuffer* commands, FrameUploads& uploads);
 	void BindWhite(uint32_t index);
 
 	GpuContext* Context = nullptr;
@@ -138,6 +141,9 @@ private:
 	std::unique_ptr<VulkanShader> CompositeShader;
 	std::unique_ptr<VulkanPipeline> CompositePipeline;
 
+	// What each frame in flight stages for the GPU, and what it retires.
+	std::unique_ptr<FrameUploads> Uploads[GpuContext::FramesInFlight];
+
 	// Last frame's camera and each instance's last placement, for motion
 	// vectors. Rewritten every frame.
 	std::unique_ptr<VulkanBuffer> MotionBuffer;
@@ -161,18 +167,18 @@ private:
 	std::unique_ptr<VulkanBuffer> MaterialBuffer;
 
 	// Pixels waiting to be copied into their slots at the start of the next
-	// frame, and the staging of the frame in flight, kept until it completes.
+	// frame. Their staging is retired with that frame.
 	struct PendingPixels
 	{
 		uint32_t Index;
 		std::unique_ptr<VulkanBuffer> Staging;
 	};
 	std::vector<PendingPixels> Pending;
-	std::vector<std::unique_ptr<VulkanBuffer>> InFlightStaging;
 
+	// TimestampCount queries for each frame slot.
 	std::unique_ptr<VulkanQueryPool> Timestamps;
 	double TimestampPeriodMs = 0.0;
-	bool TimestampsPending = false;
+	bool TimestampsPending[GpuContext::FramesInFlight] = {};
 	static const uint32_t TimestampCount = 5;
 
 	TracePushConstants PushConstants = {};

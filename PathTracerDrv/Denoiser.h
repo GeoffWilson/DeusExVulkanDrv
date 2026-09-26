@@ -67,9 +67,10 @@ public:
 	// The two signals: what is seen, and what is seen in mirrors.
 	static const int SignalCount = 2;
 
-	// Records this frame's denoising. Restarts the history when told to, as
-	// after a level change or a camera cut.
-	void Denoise(VulkanCommandBuffer* commands, const Inputs (&inputs)[SignalCount], const Camera& now, const Camera& previous, bool restart);
+	// Records this frame's denoising, into the frame slot the caller records
+	// in (see GpuContext::FramesInFlight). Restarts the history when told to,
+	// as after a level change or a camera cut.
+	void Denoise(VulkanCommandBuffer* commands, const Inputs (&inputs)[SignalCount], const Camera& now, const Camera& previous, bool restart, int slot);
 
 	// Denoised, demodulated radiance for a signal, RGBA16F, GENERAL layout.
 	VulkanImageView* Output(int signal) const;
