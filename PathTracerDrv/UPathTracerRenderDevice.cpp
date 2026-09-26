@@ -250,6 +250,28 @@ static LRESULT CALLBACK PathTracerWndProc(HWND window, UINT message, WPARAM wPar
 	return CallWindowProc(PathTracerEngineWndProc, window, message, wParam, lParam);
 }
 
+// PinnedUI as an aspect ratio to lay the UI out in, or 0 for the whole width.
+// Anything narrower than square is taken as a mistake rather than a request
+// for a portrait UI.
+static float UsablePinnedAspect(float aspect)
+{
+	return (aspect >= 1.0f && aspect <= 8.0f) ? aspect : 0.0f;
+}
+
+// "16:9", "4:3", "1.78" or "off", as PT PINNEDUI takes it.
+static float ParsePinnedAspect(const TCHAR* text)
+{
+	while (*text == ' ')
+		text++;
+	const TCHAR* colon = appStrchr(text, ':');
+	if (colon)
+	{
+		const float height = appAtof(colon + 1);
+		return height > 0.0f ? UsablePinnedAspect(appAtof(text) / height) : 0.0f;
+	}
+	return UsablePinnedAspect(appAtof(text));
+}
+
 static void* PathTracerExceptionHandle = nullptr;
 
 void UPathTracerRenderDevice::StaticConstructor()
@@ -279,6 +301,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	GlossBounces = 1;
 	UseMaterials = 0;
 	UseWidescreenFOV = 1;
+	PinnedUI = 0.0f;
 	UseDLSS = 0;
 	DLSSQuality = 1;
 
@@ -295,6 +318,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("Denoise"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDenoiser), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("WidescreenFOV"), RF_Public) UBoolProperty(CPP_PROPERTY(UseWidescreenFOV), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("PinnedUI"), RF_Public) UFloatProperty(CPP_PROPERTY(PinnedUI), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
@@ -313,6 +337,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	DlssQualityNow = Clamp(DLSSQuality, 0, 4);
 	MaterialsEnabled = UseMaterials != 0;
 	WidescreenFovEnabled = UseWidescreenFOV != 0;
+	PinnedAspect = UsablePinnedAspect(PinnedUI);
 
 	// Started afresh once per run: the engine can make a new device mid
 	// session, and what led up to that is the part worth keeping.
@@ -759,6 +784,18 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 
 	EnumWindows(PathTracerHideSplash, (LPARAM)window);
 
+	// The UI pinned to a narrower box: the engine is given a mode of that
+	// shape at the height asked for, and lays its HUD, menus and conversations
+	// out in it, while the trace fills the screen around it (see
+	// CreateSwapChainResources). Only in fullscreen, where the window is the
+	// screen whatever mode the engine has; in a window it would only shrink it.
+	INT engineX = NewX;
+	if (Fullscreen && PinnedAspect > 0.0f && NewX > NewY * PinnedAspect + 1.0f)
+	{
+		engineX = (INT)(NewY * PinnedAspect + 0.5f) & ~1;
+		PathTracerEvent("UI pinned: the engine gets %dx%d", (int)engineX, (int)NewY);
+	}
+
 	// BLIT_Fullscreen even though the window below is only borderless. The engine
 	// keys a good deal off believing it is fullscreen - input capture, the
 	// pointer clip, and whether the system cursor is shown - so telling it
@@ -766,9 +803,20 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 	// draws itself. The actual display mode change it asks for is undone by the
 	// restyle that follows; UseDirectDraw=False in DeusEx.ini removes it
 	// entirely, which a device presenting through Vulkan has no use for.
-	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), NewX, NewY, NewColorBytes))
+	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), engineX, NewY, NewColorBytes))
 		return 0;
 	PathTracerWindowEvent("engine resized", window);
+
+	// The engine keeps the mode it was given as the one to start in next time.
+	// Keep the one the player chose instead, so that with the pin taken off
+	// the game comes back at the whole width rather than the narrower mode.
+	if (engineX != NewX)
+	{
+		UClient* client = Viewport->GetOuterUClient();
+		client->FullscreenViewportX = NewX;
+		client->FullscreenViewportY = NewY;
+		client->SaveConfig();
+	}
 
 	if (enteringFullscreen)
 	{
@@ -813,8 +861,25 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	// Sized to the viewport rather than the window: the result is blitted, so
 	// the two need not agree and the trace should cost what the game asked for.
 	// The helper follows whatever size the frames are asked for at.
-	int width = Max((int)Viewport->SizeX, 1);
+	const int uiWidth = Max((int)Viewport->SizeX, 1);
+	int width = uiWidth;
 	int height = Max((int)Viewport->SizeY, 1);
+
+	// Except with the UI pinned, where the engine's view is narrower than the
+	// screen on purpose: the trace takes the window's shape at the engine's
+	// height, and the engine's view - and everything it draws in 2D - sits in
+	// the middle of it.
+	if (PinnedAspect > 0.0f && FullscreenState.Enabled)
+	{
+		RECT box = {};
+		GetClientRect((HWND)Viewport->GetWindow(), &box);
+		if (box.right > 0 && box.bottom > 0 && (int64_t)box.right * height > (int64_t)box.bottom * uiWidth)
+		{
+			width = Min((int)((float)height * box.right / box.bottom + 0.5f), 16384);
+			width += (width - uiWidth) & 1;
+		}
+	}
+	UiOffsetX = (width - uiWidth) / 2;
 
 	if (OutputImage && width == TraceWidth && height == TraceHeight)
 		return;
@@ -1858,6 +1923,25 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			Ar.Logf(TEXT("PT: widescreen field of view %s"), WidescreenFovEnabled ? TEXT("on (Hor+)") : TEXT("off (the engine's own, cropped top and bottom)"));
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("PINNEDUI")))
+		{
+			while (*Cmd == ' ')
+				Cmd++;
+			if (*Cmd)
+			{
+				PinnedAspect = ParsePinnedAspect(Cmd);
+				// Only a new mode gives the engine the new shape, so set the
+				// one the player has again.
+				UClient* client = Viewport ? Viewport->GetOuterUClient() : nullptr;
+				if (client && FullscreenState.Enabled)
+					SetRes(client->FullscreenViewportX, client->FullscreenViewportY, Max(client->FullscreenColorBits / 8, 2), 1);
+			}
+			if (PinnedAspect > 0.0f)
+				Ar.Logf(TEXT("PT: UI pinned to %.2f:1 in fullscreen, the world filling the screen around it"), PinnedAspect);
+			else
+				Ar.Logf(TEXT("PT: UI across the whole screen"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("GLOSSBOUNCES")))
 		{
 			GlossBounces = Max(appAtoi(Cmd), 0);
@@ -1923,7 +2007,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | JITTERSIGN | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | JITTERSIGN | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 
@@ -2067,10 +2151,11 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	// Only once a level is up: the menu has enough art to use the whole budget
 	// before anything in the game is drawn, which it has done twice now.
 	// The engine gives tile positions in viewport pixels including the frame's
-	// own offset, and texture coordinates in texels.
-	const float x0 = (X + Frame->XB);
+	// own offset, and texture coordinates in texels. With the UI pinned the
+	// viewport sits in the middle of the trace.
+	float x0 = (X + Frame->XB) + (float)UiOffsetX;
 	const float y0 = (Y + Frame->YB);
-	const float x1 = x0 + XL;
+	float x1 = x0 + XL;
 	const float y1 = y0 + YL;
 
 	const float sx = 2.0f / (float)TraceWidth;
@@ -2079,10 +2164,31 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	const float uScale = Info.USize > 0 ? 1.0f / (Info.UScale * Info.USize) : 0.0f;
 	const float vScale = Info.VSize > 0 ? 1.0f / (Info.VScale * Info.VSize) : 0.0f;
 
-	const float u0 = U * uScale;
+	float u0 = U * uScale;
 	const float v0 = V * vScale;
-	const float u1 = (U + UL) * uScale;
+	float u1 = (U + UL) * uScale;
 	const float v1 = (V + VL) * vScale;
+
+	// Sampled the way the other devices sample it: see TileSamplers. By the
+	// flags the tile was drawn with alone, as they and the original D3D
+	// driver take them, not with the texture's own added.
+	int samplerMode = (PolyFlags & PF_NoSmooth) ? 1 : 0;
+	if (Min(u0, u1) >= 0.0f && Max(u0, u1) <= 1.00001f && Min(v0, v1) >= 0.0f && Max(v0, v1) <= 1.00001f)
+		samplerMode |= 2;
+
+	// What spans the engine's whole width - a conversation's black bars, a
+	// fade, the darkening behind a menu - is meant to span the screen, and
+	// stopping at the edges of a pinned UI left the world showing past its
+	// ends. Carried on to the trace's edges at the same texel density, so a
+	// pattern continues rather than stretches.
+	if (UiOffsetX > 0 && XL > 0.0f && x0 - (float)UiOffsetX <= 0.5f && x1 - (float)UiOffsetX >= (float)Viewport->SizeX - 0.5f)
+	{
+		const float uPerPixel = (u1 - u0) / (x1 - x0);
+		u0 -= x0 * uPerPixel;
+		u1 += ((float)TraceWidth - x1) * uPerPixel;
+		x0 = 0.0f;
+		x1 = (float)TraceWidth;
+	}
 
 	vec4 colour = vec4(Color.X, Color.Y, Color.Z, 1.0f);
 	if (flags & PF_Modulated)
@@ -2094,12 +2200,6 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	corners[2] = { vec2(x1 * sx - 1.0f, y1 * sy - 1.0f), vec2(u1, v1), colour };
 	corners[3] = { vec2(x0 * sx - 1.0f, y1 * sy - 1.0f), vec2(u0, v1), colour };
 
-	// Sampled the way the other devices sample it: see TileSamplers. By the
-	// flags the tile was drawn with alone, as they and the original D3D
-	// driver take them, not with the texture's own added.
-	int samplerMode = (PolyFlags & PF_NoSmooth) ? 1 : 0;
-	if (Min(u0, u1) >= 0.0f && Max(u0, u1) <= 1.00001f && Min(v0, v1) >= 0.0f && Max(v0, v1) <= 1.00001f)
-		samplerMode |= 2;
 	if (!TileSet(texture, samplerMode))
 		return;
 

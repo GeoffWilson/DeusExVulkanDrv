@@ -143,6 +143,13 @@ public:
 	// the width and crop the top and bottom as the engine does. See
 	// SetSceneNode. PT WIDESCREEN switches it for the session.
 	BITFIELD UseWidescreenFOV;
+	// In fullscreen, lay the game's own 2D - the HUD, menus, conversations and
+	// the pointer - out in a box no wider than this aspect ratio, centred, with
+	// the traced world filling the screen either side ("PinnedUI" in the ini:
+	// 1.777778 for 16:9, 1.333333 for 4:3, 0 to use the whole width). Picking a
+	// narrower mode narrows the box further; with it off, a narrower mode is
+	// letterboxed. See SetRes. PT PINNEDUI switches it for the session.
+	FLOAT PinnedUI;
 
 private:
 	FString DescribeDenoiser() const;
@@ -174,6 +181,9 @@ private:
 	std::unique_ptr<VulkanImageView> OutputView;
 	int TraceWidth = 0;
 	int TraceHeight = 0;
+	// Where the engine's view sits across the trace: wider than it when the
+	// UI is pinned and the world fills the screen around it.
+	int UiOffsetX = 0;
 
 	// The helper that traces, and what it has been sent so far: which
 	// geometries, at which versions, and which textures - with what is needed
@@ -199,13 +209,14 @@ private:
 	// in the level are arriving and being left to the trace: see DrawTile.
 	bool LoggedWorldSprite = false;
 
-	// PT DENOISE, PT DLSS, PT MATERIALS and PT WIDESCREEN, for the session;
-	// the helper follows.
+	// PT DENOISE, PT DLSS, PT MATERIALS, PT WIDESCREEN and PT PINNEDUI, for
+	// the session; the helper follows.
 	bool DenoiseEnabled = false;
 	bool DlssEnabled = false;
 	int DlssQualityNow = 1;
 	bool MaterialsEnabled = true;
 	bool WidescreenFovEnabled = true;
+	float PinnedAspect = 0.0f;
 	bool DenoiseRestart = true;
 	// Which part of the picture PT VIEW shows in its place, as the trace
 	// shader numbers them; 0 for the picture itself.
