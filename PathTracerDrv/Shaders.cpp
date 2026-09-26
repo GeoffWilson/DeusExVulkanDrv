@@ -562,6 +562,48 @@ std::string Shaders::Trace()
 		// its light dim. None of the material is needed in here, which keeps
 		// it out of the registers across the light loop.
 		// everyLight gives no light to sample: it is only asked of glass.
+		// A value from 0 to 1 for each 32 unit cell of the level - about a
+		// lightmap texel - and each step, blended between neighbouring cells
+		// the way a lightmap's texels are filtered.
+		float cellHash(ivec3 cell, uint step)
+		{
+			uint h = pcgHash(uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ uint(cell.z) * 83492791u ^ pcgHash(step));
+			return float(h) * (1.0 / 4294967296.0);
+		}
+
+		float cellNoise(vec3 position, uint step)
+		{
+			vec3 p = position / 32.0;
+			ivec3 c = ivec3(floor(p));
+			vec3 f = p - vec3(c);
+			float x00 = mix(cellHash(c, step), cellHash(c + ivec3(1, 0, 0), step), f.x);
+			float x10 = mix(cellHash(c + ivec3(0, 1, 0), step), cellHash(c + ivec3(1, 1, 0), step), f.x);
+			float x01 = mix(cellHash(c + ivec3(0, 0, 1), step), cellHash(c + ivec3(1, 0, 1), step), f.x);
+			float x11 = mix(cellHash(c + ivec3(0, 1, 1), step), cellHash(c + ivec3(1, 1, 1), step), f.x);
+			return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+		}
+
+		// Torch waver, fire waver and watery shimmer, as Render.dll applies
+		// them: after a surface's lightmap is lit, each texel the light reaches
+		// is scaled by its own entry of a table of randoms, 0.95 to 1 for a
+		// torch and 0.8 to 1 for a fire, the table drawn afresh every frame;
+		// watery shimmer scales by 0.6 to 1 from a second table whose entries
+		// drift towards new randoms over about a second. So a torch or a fire
+		// flickers across the surfaces it lights rather than as a whole, and
+		// shimmer ripples slowly. The texel becomes a cell of the level.
+		float waver(vec3 position, float pattern)
+		{
+			if (pattern < 3.5)
+				return 0.95 + 0.05 * cellNoise(position, Counts.x);
+			if (pattern < 4.5)
+				return 0.8 + 0.2 * cellNoise(position, Counts.x);
+			float t = Time;
+			uint second = uint(floor(t));
+			float drift = smoothstep(0.0, 1.0, fract(t));
+			float s = mix(cellNoise(position, second + 0x9e3779b9u), cellNoise(position, second + 0x9e3779bau), drift);
+			return 0.6 + 0.4 * s;
+		}
+
 		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, out vec3 lightDirection, out vec3 lightBase)
 		{
 			lightDirection = normal;
@@ -644,7 +686,13 @@ std::string Shaders::Trace()
 				// work from the angle around the light and fade their pattern
 				// near the light's vertical axis, measured in world units.
 				float disco = 1.0;
-				if (light.Flags.w > -0.5)
+				if (light.Flags.w > 2.5)
+				{
+					// The wavers, which Render.dll applies to each lightmap
+					// texel a light reaches: see waver().
+					disco = waver(position, light.Flags.w);
+				}
+				else if (light.Flags.w > -0.5)
 				{
 					vec3 v = -dir;
 					float across2 = (v.x * v.x + v.y * v.y) * distance * distance;

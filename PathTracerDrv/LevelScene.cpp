@@ -494,7 +494,8 @@ void LevelScene::AddLight(AActor* actor)
 	// one. Every light used to be taken as steady, so nothing in the game
 	// ever pulsed, blinked or flickered.
 	float brightness = actor->LightBrightness / 255.0f;
-	bool changing = actor->LightEffect == LE_Disco || actor->LightEffect == LE_Searchlight || actor->LightEffect == LE_Rotor;
+	const bool waver = actor->LightEffect == LE_TorchWaver || actor->LightEffect == LE_FireWaver || actor->LightEffect == LE_WateryShimmer;
+	bool changing = actor->LightEffect == LE_Disco || actor->LightEffect == LE_Searchlight || actor->LightEffect == LE_Rotor || waver;
 	const double seconds = actor->Level ? (double)actor->Level->TimeSeconds : 0.0;
 	const double cycle = seconds * 35.0 / Max((int)actor->LightPeriod, 1) + actor->LightPhase / 256.0;
 	const float wave = (float)std::sin(cycle * 2.0 * PI);
@@ -556,10 +557,13 @@ void LevelScene::AddLight(AActor* actor)
 		light.DirectionCone = vec4(dir.X, dir.Y, dir.Z, 1.0f - actor->LightCone / 256.0f);
 	}
 	// Patterns worked out in the shader with the engine's own formulas, read
-	// out of Render.dll: 0 disco, 1 searchlight, 2 rotor, -1 none.
+	// out of Render.dll: 0 disco, 1 searchlight, 2 rotor, 3 torch waver,
+	// 4 fire waver, 5 watery shimmer, -1 none.
 	float pattern = -1.0f;
 	if (actor->LightEffect == LE_Disco)
 		pattern = 0.0f;
+	else if (waver)
+		pattern = 3.0f + (float)(actor->LightEffect - LE_TorchWaver);
 	else if (actor->LightEffect == LE_Rotor)
 	{
 		pattern = 2.0f;
