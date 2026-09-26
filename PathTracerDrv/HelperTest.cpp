@@ -64,8 +64,10 @@ static float HalfToFloat(uint16_t h)
 static vec3 Cross(const vec3& a, const vec3& b) { return vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
 static vec3 Normalized(const vec3& v) { float l = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); return vec3(v.x / l, v.y / l, v.z / l); }
 
-// A quad as two triangles, textured or not, into the geometry.
-static void AddQuad(SceneGeometry& g, vec3 a, vec3 b, vec3 c, vec3 d, vec3 albedo, int texture, float uvScale)
+// A quad as two triangles, textured or not, into the geometry. Given a centre,
+// each corner's normal points away from it, the way the engine smooths a
+// mesh's normals: the path a mesh takes rather than a level's flat one.
+static void AddQuad(SceneGeometry& g, vec3 a, vec3 b, vec3 c, vec3 d, vec3 albedo, int texture, float uvScale, const vec3* centre = nullptr)
 {
 	const vec3 normal = Normalized(Cross(vec3(b.x - a.x, b.y - a.y, b.z - a.z), vec3(c.x - a.x, c.y - a.y, c.z - a.z)));
 	const vec3 corners[2][3] = { { a, b, c }, { a, c, d } };
@@ -81,21 +83,30 @@ static void AddQuad(SceneGeometry& g, vec3 a, vec3 b, vec3 c, vec3 d, vec3 albed
 		attr.Ambient = vec4(0.03f, 0.03f, 0.04f, 0.0f);
 		attr.UV01 = vec4(uvs[t][0], uvs[t][1], uvs[t][2], uvs[t][3]);
 		attr.UV2Tex = vec4(uvs[t][4], uvs[t][5], (float)texture, 0.0f);
+		if (centre)
+		{
+			vec3 normals[3];
+			for (int v = 0; v < 3; v++)
+				normals[v] = Normalized(vec3(corners[t][v].x - centre->x, corners[t][v].y - centre->y, corners[t][v].z - centre->z));
+			SetCornerNormals(attr, corners[t], normals);
+		}
 		g.Attributes.push_back(attr);
 	}
 }
 
-static void AddBox(SceneGeometry& g, vec3 lo, vec3 hi, vec3 albedo)
+static void AddBox(SceneGeometry& g, vec3 lo, vec3 hi, vec3 albedo, bool smooth = false)
 {
 	vec3 p[8];
 	for (int i = 0; i < 8; i++)
 		p[i] = vec3((i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y, (i & 4) ? hi.z : lo.z);
-	AddQuad(g, p[4], p[5], p[7], p[6], albedo, -1, 1);   // top
-	AddQuad(g, p[0], p[2], p[3], p[1], albedo, -1, 1);   // bottom
-	AddQuad(g, p[0], p[1], p[5], p[4], albedo, -1, 1);   // -y
-	AddQuad(g, p[2], p[6], p[7], p[3], albedo, -1, 1);   // +y
-	AddQuad(g, p[0], p[4], p[6], p[2], albedo, -1, 1);   // -x
-	AddQuad(g, p[1], p[3], p[7], p[5], albedo, -1, 1);   // +x
+	const vec3 centre((lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f, (lo.z + hi.z) * 0.5f);
+	const vec3* c = smooth ? &centre : nullptr;
+	AddQuad(g, p[4], p[5], p[7], p[6], albedo, -1, 1, c);   // top
+	AddQuad(g, p[0], p[2], p[3], p[1], albedo, -1, 1, c);   // bottom
+	AddQuad(g, p[0], p[1], p[5], p[4], albedo, -1, 1, c);   // -y
+	AddQuad(g, p[2], p[6], p[7], p[3], albedo, -1, 1, c);   // +y
+	AddQuad(g, p[0], p[4], p[6], p[2], albedo, -1, 1, c);   // -x
+	AddQuad(g, p[1], p[3], p[7], p[5], albedo, -1, 1, c);   // +x
 }
 
 int main(int argc, char** argv)
@@ -141,7 +152,7 @@ int main(int argc, char** argv)
 		// The scene: a checkered glossy floor, a red box, a grey wall.
 		SceneGeometry world;
 		AddQuad(world, vec3(-600, -600, 0), vec3(600, -600, 0), vec3(600, 600, 0), vec3(-600, 600, 0), vec3(0.8f, 0.8f, 0.8f), 0, 8);
-		AddBox(world, vec3(-80, -80, 0), vec3(80, 80, 160), vec3(0.8f, 0.15f, 0.1f));
+		AddBox(world, vec3(-80, -80, 0), vec3(80, 80, 160), vec3(0.8f, 0.15f, 0.1f), true);
 		AddQuad(world, vec3(-600, 400, 0), vec3(600, 400, 0), vec3(600, 400, 600), vec3(-600, 400, 600), vec3(0.6f, 0.6f, 0.6f), -1, 1);
 		std::vector<uint32_t> checker(64 * 64);
 		for (int y = 0; y < 64; y++)

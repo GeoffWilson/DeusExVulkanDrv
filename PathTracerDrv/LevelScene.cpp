@@ -1294,9 +1294,13 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		FMeshUV Tex[3];
 		DWORD PolyFlags;
 		INT TextureIndex;
+		// The vertex each corner is, as the engine counts them when it
+		// smooths the normals: what the faces sharing a vertex share.
+		INT smoothVertex[3];
 	};
 
 	std::vector<SourceTriangle> triangles;
+	INT smoothVertexCount = 0;
 	if (useLod)
 	{
 		triangles.reserve(lod->Faces.Num());
@@ -1329,6 +1333,8 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 				}
 				tri.iVertex[v] = enginePose ? iVertex : keyVertex;
 				tri.keyVertex[v] = keyVertex;
+				tri.smoothVertex[v] = iVertex;
+				smoothVertexCount = Max(smoothVertexCount, iVertex + 1);
 			}
 			if (ok)
 				triangles.push_back(tri);
@@ -1347,6 +1353,11 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			tri.keyVertex[0] = src.iVertex[0];
 			tri.keyVertex[1] = src.iVertex[1];
 			tri.keyVertex[2] = src.iVertex[2];
+			for (int v = 0; v < 3; v++)
+			{
+				tri.smoothVertex[v] = src.iVertex[v];
+				smoothVertexCount = Max(smoothVertexCount, (INT)src.iVertex[v] + 1);
+			}
 			tri.Tex[0] = src.Tex[0];
 			tri.Tex[1] = src.Tex[1];
 			tri.Tex[2] = src.Tex[2];
@@ -1372,10 +1383,25 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	geometry.Positions.reserve(triangles.size() * 3);
 	geometry.Attributes.reserve(triangles.size());
 
-	for (const SourceTriangle& tri : triangles)
+	// Every triangle is posed first, and the engine's smoothing worked out from
+	// all of them before any is written. Render.dll sums the unit normal of
+	// each face - hidden ones too - into its three vertices and lights the
+	// mesh at those, normalised, blending the light across each face: that is
+	// what makes a security camera's eight flat sides look round, where
+	// shading each face by its own normal cut it from a block.
+	struct PosedTriangle
 	{
-		if (tri.PolyFlags & PF_Invisible)
-			continue;
+		vec3 Corners[3];
+		vec3 Normal;        // unit
+		bool Ok = false;    // posed, and with an area to have a normal
+		bool Blended = false;
+	};
+	std::vector<PosedTriangle> posedTriangles(triangles.size());
+	std::vector<vec3> vertexNormals(smoothVertexCount, vec3(0.0f));
+
+	for (size_t t = 0; t < triangles.size(); t++)
+	{
+		const SourceTriangle& tri = triangles[t];
 
 		FVector p[3];
 		bool ok = true;
@@ -1432,16 +1458,33 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		if (!ok)
 			continue;
 
-		const vec3 v0 = ToVec3(p[0]);
-		const vec3 v1 = ToVec3(p[1]);
-		const vec3 v2 = ToVec3(p[2]);
-
-		const vec3 cr = cross(v1 - v0, v2 - v0);
+		PosedTriangle& posedTri = posedTriangles[t];
+		for (int v = 0; v < 3; v++)
+			posedTri.Corners[v] = ToVec3(p[v]);
+		const vec3 cr = cross(posedTri.Corners[1] - posedTri.Corners[0], posedTri.Corners[2] - posedTri.Corners[0]);
 		const float len2 = dot(cr, cr);
 		if (len2 <= 1e-6f)
 			continue;
 
-		const vec3 normal = cr * (1.0f / std::sqrt(len2));
+		posedTri.Normal = cr * (1.0f / std::sqrt(len2));
+		posedTri.Ok = true;
+		posedTri.Blended = blended;
+		for (int v = 0; v < 3; v++)
+			vertexNormals[tri.smoothVertex[v]] += posedTri.Normal;
+	}
+
+	for (size_t t = 0; t < triangles.size(); t++)
+	{
+		const SourceTriangle& tri = triangles[t];
+		const PosedTriangle& posedTri = posedTriangles[t];
+		if ((tri.PolyFlags & PF_Invisible) || !posedTri.Ok)
+			continue;
+
+		const vec3 v0 = posedTri.Corners[0];
+		const vec3 v1 = posedTri.Corners[1];
+		const vec3 v2 = posedTri.Corners[2];
+		const vec3 normal = posedTri.Normal;
+		const bool blended = posedTri.Blended;
 
 		// The actor's own skin for this material first: Deus Ex's characters
 		// carry no textures on the mesh at all, so without this every person in
@@ -1508,6 +1551,20 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		// A mesh is instanced into whatever room the actor is standing in, so
 		// its ambient comes from the instance rather than from here.
 		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+
+		// Each corner's smoothed normal, turned to agree with the face. A
+		// vertex whose faces cancel out, or a face wound against its
+		// neighbours, keeps the face's own.
+		vec3 cornerNormals[3];
+		for (int v = 0; v < 3; v++)
+		{
+			const vec3 sum = vertexNormals[tri.smoothVertex[v]];
+			const float sum2 = dot(sum, sum);
+			cornerNormals[v] = sum2 > 1e-8f ? sum * (1.0f / std::sqrt(sum2)) : normal;
+			if (dot(cornerNormals[v], normal) <= 0.0f)
+				cornerNormals[v] = normal;
+		}
+		SetCornerNormals(attr, posedTri.Corners, cornerNormals);
 
 		geometry.Positions.push_back(v0);
 		geometry.Positions.push_back(v1);

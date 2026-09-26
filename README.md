@@ -100,7 +100,9 @@ straight out of `UModel` and the actor list:
 - the BSP, with its textures, panning, masked, translucent, modulated, unlit,
   mirrored and backdrop surfaces;
 - movers, meshes and characters, posed by the engine itself so animation blends,
-  facial animation and attachments come out as the game draws them;
+  facial animation and attachments come out as the game draws them, and shaded
+  with normals smoothed across their faces the way the engine smooths them, so
+  a low polygon mesh looks as rounded as it does in the original;
 - sprites, decals, environment mapped meshes, the first person weapon, and
   animated and procedural textures (fire, water, and the "wet" textures that
   ripple another texture);

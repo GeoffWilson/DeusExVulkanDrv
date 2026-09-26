@@ -32,6 +32,8 @@ std::string Shaders::Trace()
 			vec4 Ambient;
 			vec4 UV01;      // u0 v0 u1 v1
 			vec4 UV2Tex;    // u2 v2 texture unused
+			uvec4 CornerNormals;   // a mesh's smoothed normal at each corner, packed; w 1 when there are any
+			uvec4 CornerOffsets;   // each corner's neighbours off its tangent plane, half pairs
 		};
 
 		struct SceneLight
@@ -153,6 +155,69 @@ std::string Shaders::Trace()
 			// The engine's art is authored in sRGB; the trace works in linear.
 			vec3 linearRgb = pow(max(texel.rgb, vec3(0.0)), vec3(2.2));
 			return linearRgb;
+		}
+
+		// A unit vector as LevelScene packs it: octahedral, 16 bits a component.
+		vec3 unpackUnitVector(uint packed)
+		{
+			vec2 e = unpackSnorm2x16(packed);
+			vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+			if (n.z < 0.0)
+				n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+			return normalize(n);
+		}
+
+		// The normal to shade a hit with. The engine lights a mesh at its
+		// vertices, each with the average of the faces around it, and blends
+		// the light across each face, so its meshes look rounded where the
+		// triangles are flat; the corners' normals are blended the same way
+		// here. Anything else is as flat as its face. faceNormal is the face's
+		// own, already turned towards the ray, and side is which way it was
+		// turned; the corners are turned with it.
+		//
+		// lifted is where rays leaving the hit should start: the point moved
+		// off the flat triangle onto the rounded surface the corner normals
+		// describe (Hanika, "Hacking the Shadow Terminator"). A ray started on
+		// the flat triangle, towards a light the smoothed normal says it faces
+		// but the face itself does not, runs into the mesh's own neighbouring
+		// faces, and the shadow's edge comes out as square as the faces were.
+		vec3 smoothNormal(TriangleAttributes attr, vec2 bary, mat3 toWorld, vec3 faceNormal, float side, vec3 position, out vec3 lifted)
+		{
+			lifted = position;
+			if (attr.CornerNormals.w == 0u)
+				return faceNormal;
+
+			float w0 = 1.0 - bary.x - bary.y;
+			vec3 n0 = unpackUnitVector(attr.CornerNormals.x) * side;
+			vec3 n1 = unpackUnitVector(attr.CornerNormals.y) * side;
+			vec3 n2 = unpackUnitVector(attr.CornerNormals.z) * side;
+			vec3 shading = toWorld * (n0 * w0 + n1 * bary.x + n2 * bary.y);
+			if (dot(shading, faceNormal) <= 1.0e-6)
+				return faceNormal;
+			shading = normalize(shading);
+
+			// How far below each corner's tangent plane the hit is, from how
+			// far its neighbours are: the hit is the corners' weighted sum.
+			vec2 o0 = unpackHalf2x16(attr.CornerOffsets.x) * side;
+			vec2 o1 = unpackHalf2x16(attr.CornerOffsets.y) * side;
+			vec2 o2 = unpackHalf2x16(attr.CornerOffsets.z) * side;
+			float below0 = min(o0.x * bary.x + o0.y * bary.y, 0.0);
+			float below1 = min(o1.x * w0 + o1.y * bary.y, 0.0);
+			float below2 = min(o2.x * w0 + o2.y * bary.x, 0.0);
+			// Only straight out of the face. The rounded surface also runs
+			// sideways past the face's edges, and following it there put the
+			// start of a ray from the bottom of a box on the floor under the
+			// floor, in the dark.
+			vec3 lift = -(toWorld * (n0 * (w0 * below0) + n1 * (bary.x * below1) + n2 * (bary.y * below2)));
+			lifted = position + faceNormal * max(dot(lift, faceNormal), 0.0);
+			return shading;
+		}
+
+		// A direction chosen about a smoothed normal can point into the face
+		// it was chosen on; mirrored back out of it, it leaves as it should.
+		vec3 aboveFace(vec3 direction, vec3 faceNormal)
+		{
+			return dot(direction, faceNormal) < 0.0 ? reflect(direction, faceNormal) : direction;
 		}
 
 		// A small hash based generator. Path tracing needs a different stream per
@@ -972,12 +1037,17 @@ std::string Shaders::Trace()
 					// world - without it every mover and character would be lit as
 					// though it had never turned.
 					mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-					vec3 normal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
+					vec3 faceNormal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
+					// These surfaces are single sided in the engine but solid from
+					// either direction here, so face the normal back at the ray.
+					float side = dot(faceNormal, direction) > 0.0 ? -1.0 : 1.0;
+					faceNormal *= side;
 
 					vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-					attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal), attr.Albedo.w);
-
 					vec3 position = origin + direction * t;
+					vec3 lifted;
+					vec3 normal = smoothNormal(attr, bary, mat3(objectToWorld), faceNormal, side, position, lifted);
+					attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal), attr.Albedo.w);
 
 					// Translucent: add what this surface contributes and carry on
 					// through it in the same direction. UE1 draws these additively,
@@ -1066,10 +1136,9 @@ std::string Shaders::Trace()
 							}
 							else
 							{
-								vec3 facing = dot(normal, direction) > 0.0 ? -normal : normal;
 								vec3 surroundings = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
 								vec3 unusedDirection, unusedBase;
-								contribution = attr.Albedo.rgb * directLight(position, facing, attr.Ambient.w > 0.5, true, unusedDirection, unusedBase)
+								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, unusedDirection, unusedBase)
 									+ attr.Albedo.rgb * surroundings;
 							}
 							radiance += throughput * contribution;
@@ -1127,7 +1196,7 @@ std::string Shaders::Trace()
 						radiance = vec3(0.0);
 						throughput = vec3(1.0);
 						reflectionAlbedo = attr.Albedo.rgb * (attr.UV2Tex.w > 2.5 ? 0.5 : 1.0);
-						reflectionNormal = dot(normal, direction) > 0.0 ? -normal : normal;
+						reflectionNormal = normal;
 						reflectionDistance = distance(position, specularOrigin);
 						hitDistance = 0.0;
 						wantHitDistance = true;
@@ -1159,12 +1228,12 @@ std::string Shaders::Trace()
 							diffuseAlbedo = vec3(0.0);
 						}
 						specularAlbedo = mirror ? surfaceThroughput * mirrorTint * 0.5 : vec3(0.0);
-						surfaceNormal = dot(normal, direction) > 0.0 ? -normal : normal;
+						surfaceNormal = normal;
 						if (mirror)
 						{
 							pendingSpecular = true;
-							specularOrigin = position + surfaceNormal * Params.z;
-							specularDirection = reflect(direction, surfaceNormal);
+							specularOrigin = lifted + faceNormal * Params.z;
+							specularDirection = aboveFace(reflect(direction, surfaceNormal), faceNormal);
 						}
 						surfaceRoughness = mirror ? 0.0 : (material.glossy ? material.roughness : 1.0);
 						surfaceMetalness = material.metalness;
@@ -1180,8 +1249,8 @@ std::string Shaders::Trace()
 							if (sampleGlossy(material, f0, surfaceNormal, toEye, L, weight))
 							{
 								pendingGloss = true;
-								specularOrigin = position + surfaceNormal * Params.z;
-								specularDirection = L;
+								specularOrigin = lifted + faceNormal * Params.z;
+								specularDirection = aboveFace(L, faceNormal);
 								// Divided by the colour it is put back with.
 								reflectionThroughput = weight / max(shineAlbedo, vec3(1.0e-4));
 							}
@@ -1200,9 +1269,9 @@ std::string Shaders::Trace()
 						// marble has an albedo near 0.1, and multiplying the
 						// reflection by that made it invisible.
 						throughput *= mirrorTint;
-						origin = position + normal * Params.z;
+						origin = lifted + faceNormal * Params.z;
 						rayMin = Params.z;
-						direction = reflect(direction, normal);
+						direction = aboveFace(reflect(direction, normal), faceNormal);
 						continue;
 					}
 
@@ -1238,11 +1307,6 @@ std::string Shaders::Trace()
 						break;
 					}
 
-					// These surfaces are single sided in the engine but solid from
-					// either direction here, so face the normal back at the ray.
-					if (dot(normal, direction) > 0.0)
-						normal = -normal;
-
 					// Self lit surfaces emit the colour they actually are, which is
 					// only known once the texture has been sampled. Emission.w is
 					// the flag; the rgb carries nothing.
@@ -1263,7 +1327,7 @@ std::string Shaders::Trace()
 					// on afterwards. Its glossy reflection likewise, gathered apart
 					// and divided by the colour it goes back on with.
 					vec3 lightDirection, lightBase;
-					vec3 lit = directLight(position, normal, attr.Ambient.w > 0.5, false, lightDirection, lightBase);
+					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, lightDirection, lightBase);
 
 					// What it is made of, only now the light loop is done with.
 					// A surface seen in a mirror is captured as matte, since its
@@ -1353,10 +1417,11 @@ std::string Shaders::Trace()
 						throughput /= p;
 					}
 
-					origin = position + normal * Params.z;
+					origin = lifted + faceNormal * Params.z;
 					rayMin = Params.z;
 					if (!glossyBounce)
 						direction = cosineDirection(normal);
+					direction = aboveFace(direction, faceNormal);
 				}
 			}
 

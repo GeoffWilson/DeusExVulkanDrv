@@ -1,6 +1,9 @@
 #pragma once
 
 #include "vec.h"
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 // The scene as the tracer consumes it: plain data, with nothing of the engine
@@ -31,7 +34,76 @@ struct TriangleAttributes
 	// index into the bound texture array, or -1 for an untextured surface.
 	vec4 UV01;      // u0 v0 u1 v1
 	vec4 UV2Tex;    // u2 v2 texture unused
+	// A mesh's normal at each corner, smoothed as the engine smooths it: the
+	// average of the unit normals of every face using that vertex. The engine
+	// lights a mesh at its vertices and blends the light across each face, so
+	// its meshes look rounded where the triangles are flat. Each is packed
+	// octahedrally, 16 bits a component (the shader's unpackSnorm2x16); w is 1
+	// when the corners are there and 0 for a flat surface, which is everything
+	// that is not a mesh.
+	uint32_t CornerNormals[4] = {};
+	// How far each corner's two neighbours lie off its tangent plane,
+	// dot(Pj - Pi, Ni), as half floats in pairs: corner 0's to 1 and 2, corner
+	// 1's to 0 and 2, corner 2's to 0 and 1. What the trace needs to lift a ray's
+	// start off the flat triangle onto the rounded surface: see smoothNormal in
+	// Shaders.cpp.
+	uint32_t CornerOffsets[4] = {};
 };
+
+// A unit vector in 32 bits: octahedral, 16 bits a component, laid out as the
+// shader's unpackSnorm2x16 reads it.
+inline uint32_t PackUnitVector(vec3 n)
+{
+	const float l1 = std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
+	float x = n.x / l1, y = n.y / l1;
+	if (n.z < 0.0f)
+	{
+		const float foldedX = (1.0f - std::abs(y)) * (x >= 0.0f ? 1.0f : -1.0f);
+		const float foldedY = (1.0f - std::abs(x)) * (y >= 0.0f ? 1.0f : -1.0f);
+		x = foldedX;
+		y = foldedY;
+	}
+	auto snorm = [](float v) { return (uint32_t)(uint16_t)(int16_t)std::floor((v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v)) * 32767.0f + 0.5f); };
+	return snorm(x) | (snorm(y) << 16);
+}
+
+// A float as a half, rounded to nearest, for distances across one of a mesh's
+// triangles: too small for a normal half is zero, too large the largest.
+inline uint32_t PackHalf(float f)
+{
+	uint32_t bits;
+	memcpy(&bits, &f, sizeof(bits));
+	const uint32_t sign = (bits >> 16) & 0x8000u;
+	const int exponent = (int)((bits >> 23) & 0xffu) - 127 + 15;
+	const uint32_t mantissa = bits & 0x7fffffu;
+	if (exponent <= 0)
+		return sign;
+	if (exponent >= 31)
+		return sign | 0x7bffu;
+	uint32_t half = sign | ((uint32_t)exponent << 10) | (mantissa >> 13);
+	if (mantissa & 0x1000u)
+		half++;
+	if ((half & 0x7fffu) > 0x7bffu)
+		half = sign | 0x7bffu;
+	return half;
+}
+
+// Fills in a triangle's CornerNormals and CornerOffsets from its corners and
+// the unit normal wanted at each, in the same space as its positions.
+inline void SetCornerNormals(TriangleAttributes& attr, const vec3 corners[3], const vec3 normals[3])
+{
+	for (int i = 0; i < 3; i++)
+	{
+		attr.CornerNormals[i] = PackUnitVector(normals[i]);
+		// The other two corners, in order.
+		const int j = i == 0 ? 1 : 0;
+		const int k = i == 2 ? 1 : 2;
+		attr.CornerOffsets[i] = PackHalf(dot(corners[j] - corners[i], normals[i])) |
+			(PackHalf(dot(corners[k] - corners[i], normals[i])) << 16);
+	}
+	attr.CornerNormals[3] = 1;
+	attr.CornerOffsets[3] = 0;
+}
 
 // A light as the engine describes it, converted to something physical.
 struct SceneLight
