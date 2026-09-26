@@ -396,6 +396,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 
 		Textures.reset(new TextureCache(this));
 		CreateTilePipeline();
+		CreateBrightnessPipeline();
 
 		if (!StartTracer())
 		{
@@ -697,6 +698,69 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 		.Execute(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 }
 
+void UPathTracerRenderDevice::CreateBrightnessPipeline()
+{
+	BrightnessShader = ShaderBuilder()
+		.Type(ShaderType::Compute)
+		.AddSource("shaders/Brightness.comp", Shaders::Brightness())
+		.DebugName("PathTracerBrightness")
+		.Create("PathTracerBrightness", Device.get());
+
+	BrightnessSetLayout = DescriptorSetLayoutBuilder()
+		.AddBinding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.DebugName("PathTracerBrightnessSetLayout")
+		.Create(Device.get());
+	BrightnessDescriptorPool = DescriptorPoolBuilder()
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1)
+		.MaxSets(1)
+		.DebugName("PathTracerBrightnessDescriptorPool")
+		.Create(Device.get());
+	BrightnessSet = BrightnessDescriptorPool->allocate(BrightnessSetLayout.get());
+
+	BrightnessPipelineLayout = PipelineLayoutBuilder()
+		.AddSetLayout(BrightnessSetLayout.get())
+		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 4 + sizeof(int32_t) * 4)
+		.DebugName("PathTracerBrightnessPipelineLayout")
+		.Create(Device.get());
+	BrightnessPipeline = ComputePipelineBuilder()
+		.Layout(BrightnessPipelineLayout.get())
+		.ComputeShader(BrightnessShader.get())
+		.DebugName("PathTracerBrightnessPipeline")
+		.Create(Device.get());
+}
+
+// The game's Brightness setting - the client's, which its menu's slider sets
+// - as a gamma curve over the finished picture, the 2D included, the way the
+// original D3D driver's gamma ramp lifts the whole screen. The curve is
+// VulkanDrv's, pow(c, 1 / (2 * Brightness)), which leaves the picture as it
+// is at the default of 0.5; the original's ramp is 2.5 * Brightness, a lift
+// even at the default. Under Proton's Wayland driver, which cannot set a
+// gamma ramp, the original's does nothing at all.
+void UPathTracerRenderDevice::ApplyBrightness(VulkanCommandBuffer* commands)
+{
+	if (!BrightnessPipeline || !OutputImage || !Viewport)
+		return;
+	const float brightness = Clamp(Viewport->GetOuterUClient()->Brightness * 2.0f, 0.05f, 2.99f);
+	if (fabs(brightness - 1.0f) < 0.001f)
+		return;
+
+	PipelineBarrier()
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+	struct { float InvGamma[4]; int32_t Size[4]; } constants = { { 1.0f / brightness, 0.0f, 0.0f, 0.0f }, { TraceWidth, TraceHeight, 0, 0 } };
+	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, BrightnessPipeline.get());
+	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, BrightnessPipelineLayout.get(), 0, BrightnessSet.get());
+	commands->pushConstants(BrightnessPipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+	commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+
+	PipelineBarrier()
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+			VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+}
+
 // Keep the engine's cursor clip on the window we actually have.
 //
 // The engine clips the pointer to the window as it stands when ResizeViewport
@@ -898,7 +962,7 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	OutputImage = ImageBuilder()
 		.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
 		.Size(width, height)
-		.Usage(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+		.Usage(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT)
 		.DebugName("PathTracerOutput")
 		.Create(Device.get());
 	OutputView = ImageViewBuilder().Image(OutputImage.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName("PathTracerOutputView").Create(Device.get());
@@ -913,6 +977,13 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 			.AddAttachment(OutputView.get())
 			.DebugName("PathTracerTileFramebuffer")
 			.Create(Device.get());
+	}
+
+	if (BrightnessSet)
+	{
+		WriteDescriptors()
+			.AddStorageImage(BrightnessSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			.Execute(Device.get());
 	}
 
 	TraceWidth = width;
@@ -1562,8 +1633,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				0, 0, nullptr, 0, nullptr, 2, barriers);
 		}
 
-		// HUD, menus and console on top of the traced world.
+		// HUD, menus and console on top of the traced world, and the game's
+		// Brightness over the lot.
 		RenderTiles(commands.get());
+		ApplyBrightness(commands.get());
 
 		// The copy and the tiles write the output image; the blit reads it.
 		PipelineBarrier()
@@ -2089,6 +2162,12 @@ void UPathTracerRenderDevice::Exit()
 	Textures.reset();
 	TileDescriptorPool.reset();
 	TileSetLayout.reset();
+	BrightnessPipeline.reset();
+	BrightnessPipelineLayout.reset();
+	BrightnessSet.reset();
+	BrightnessDescriptorPool.reset();
+	BrightnessSetLayout.reset();
+	BrightnessShader.reset();
 	// Released here with everything else. Left to the member destructors
 	// they outlive the device and destroy themselves against a dead handle,
 	// which crashed on exit - and when the engine replaces the device on

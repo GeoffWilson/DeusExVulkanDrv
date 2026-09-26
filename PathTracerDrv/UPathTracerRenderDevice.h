@@ -165,6 +165,8 @@ private:
 	void ReleaseSwapChainResources();
 	void CreateTilePipeline();
 	void RenderTiles(VulkanCommandBuffer* commands);
+	void CreateBrightnessPipeline();
+	void ApplyBrightness(VulkanCommandBuffer* commands);
 	void EnsureSceneBuilt(ULevel* level);
 	// Whether the engine has collected garbage since last asked, told by a
 	// transient object nothing refers to, which every collection destroys.
@@ -255,6 +257,15 @@ private:
 	size_t TileVertexCapacity = 0;
 	std::vector<TileVertex> TileVertices;
 	std::vector<TileBatch> TileBatches;
+
+	// The game's Brightness setting, over the finished picture: see
+	// ApplyBrightness.
+	std::unique_ptr<VulkanShader> BrightnessShader;
+	std::unique_ptr<VulkanDescriptorSetLayout> BrightnessSetLayout;
+	std::unique_ptr<VulkanDescriptorPool> BrightnessDescriptorPool;
+	std::unique_ptr<VulkanDescriptorSet> BrightnessSet;
+	std::unique_ptr<VulkanPipelineLayout> BrightnessPipelineLayout;
+	std::unique_ptr<VulkanPipeline> BrightnessPipeline;
 
 	// The last frame's submission, not yet known to be finished. Unlock does
 	// not wait for the GPU: the next frame's game logic and scene gathering

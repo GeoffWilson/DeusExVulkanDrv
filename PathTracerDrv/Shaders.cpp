@@ -1888,3 +1888,27 @@ std::string Shaders::TileFragment()
 		}
 	)";
 }
+
+std::string Shaders::Brightness()
+{
+	return R"(
+		#version 460
+
+		layout(local_size_x = 8, local_size_y = 8) in;
+		layout(binding = 0, rgba16f) uniform image2D picture;
+		layout(push_constant) uniform BrightnessConstants
+		{
+			vec4 InvGamma;  // x the exponent
+			ivec4 Size;     // xy the picture's size
+		};
+
+		void main()
+		{
+			ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+			if (pixel.x >= Size.x || pixel.y >= Size.y)
+				return;
+			vec4 c = imageLoad(picture, pixel);
+			imageStore(picture, pixel, vec4(pow(max(c.rgb, vec3(0.0)), vec3(InvGamma.x)), c.a));
+		}
+	)";
+}

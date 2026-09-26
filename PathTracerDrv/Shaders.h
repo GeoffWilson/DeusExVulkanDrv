@@ -18,4 +18,8 @@ namespace Shaders
 	// without them the game renders but cannot be used.
 	std::string TileVertex();
 	std::string TileFragment();
+
+	// The game's Brightness setting, applied over the finished picture - the
+	// 2D and all - as a gamma curve.
+	std::string Brightness();
 }
