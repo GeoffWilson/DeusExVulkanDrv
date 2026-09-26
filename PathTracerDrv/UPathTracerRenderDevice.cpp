@@ -810,6 +810,11 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 		return 0;
 	PathTracerWindowEvent("engine resized", window);
 
+	// The trace fills out to the mode chosen, not to the window: a mode chosen
+	// narrower than the screen is traced as it is and letterboxed.
+	PinnedModeWidth = engineX != NewX ? NewX : 0;
+	PinnedModeHeight = NewY;
+
 	// The engine keeps the mode it was given as the one to start in next time.
 	// Keep the one the player chose instead, so that with the pin taken off
 	// the game comes back at the whole width rather than the narrower mode.
@@ -869,18 +874,14 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	int height = Max((int)Viewport->SizeY, 1);
 
 	// Except with the UI pinned, where the engine's view is narrower than the
-	// screen on purpose: the trace takes the window's shape at the engine's
-	// height, and the engine's view - and everything it draws in 2D - sits in
-	// the middle of it.
-	if (PinnedAspect > 0.0f && FullscreenState.Enabled)
+	// mode the player chose on purpose: the trace is the mode chosen, and the
+	// engine's view - and everything it draws in 2D - sits in the middle of
+	// it. Filling out to the window instead traced a 1920x1440 mode at
+	// 3440x1440 on a 21:9 screen, and a 640x480 one at 1147x480.
+	if (PinnedModeWidth > uiWidth && PinnedModeHeight == height && FullscreenState.Enabled)
 	{
-		RECT box = {};
-		GetClientRect((HWND)Viewport->GetWindow(), &box);
-		if (box.right > 0 && box.bottom > 0 && (int64_t)box.right * height > (int64_t)box.bottom * uiWidth)
-		{
-			width = Min((int)((float)height * box.right / box.bottom + 0.5f), 16384);
-			width += (width - uiWidth) & 1;
-		}
+		width = Min(PinnedModeWidth, 16384);
+		width += (width - uiWidth) & 1;
 	}
 	UiOffsetX = (width - uiWidth) / 2;
 

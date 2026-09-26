@@ -275,12 +275,13 @@ that frames the view follows from that:
   view, so it lands on what the trace shows rather than where the engine's
   narrower view would have put it.
 - **A pinned HUD** (`PinnedUI`, `PT PINNEDUI 16:9`). The game is given a 16:9 or
-  4:3 mode at the screen's height, lays its HUD, menus and conversations out in
-  it as it was designed to, and the trace fills the screen around them; what
-  spans the whole of the game's width - a conversation's bars, a fade - is
-  carried on to the screen's edges.
-- **A mode narrower than the screen** without the pin is letterboxed, with the
-  bars cleared rather than showing the last picture shown there.
+  4:3 mode at the height of the mode chosen, lays its HUD, menus and
+  conversations out in it as it was designed to, and the trace fills the rest
+  of the mode chosen around them; what spans the whole of the game's width - a
+  conversation's bars, a fade - is carried on to the picture's edges.
+- **A mode narrower than the screen** is traced at that mode and letterboxed,
+  pinned or not, with the bars cleared rather than showing the last picture
+  shown there. A 4:3 mode costs what a 4:3 mode costs.
 
 ### Settings
 
@@ -347,9 +348,11 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   whole screen: 1.333333 for 4:3 (the default), 1.777778 for 16:9, 0 for the
   whole width. The game is given a mode of that shape at the height chosen,
   so the resolution it lists is the narrower one, but the ini keeps the one
-  chosen. Choosing a mode narrower still narrows the box further; with it off,
-  a narrower mode is letterboxed as on the other devices. `PT PINNEDUI 16:9`,
-  `PT PINNEDUI 4:3` and `PT PINNEDUI OFF` switch it for the session.
+  chosen. The picture is always the mode chosen: at the screen's own
+  resolution the world fills the screen around the box, and a narrower mode
+  is letterboxed as on the other devices, with the box inside it when the mode
+  is wider than the box. `PT PINNEDUI 16:9`, `PT PINNEDUI 4:3` and
+  `PT PINNEDUI OFF` switch it for the session.
 - `LightSize`: the radius, in world units, of the disc around each light that
   shadows are cast from; 4 by default, a small lamp's size. A shadow then
   starts sharp where something meets it and softens with distance, as a real

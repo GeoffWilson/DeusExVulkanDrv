@@ -147,9 +147,10 @@ public:
 	// the pointer - out in a box no wider than this aspect ratio, centred, with
 	// the traced world filling the screen either side ("PinnedUI" in the ini:
 	// 1.333333 for 4:3, the default, 1.777778 for 16:9, 0 to use the whole
-	// width). Picking a narrower mode narrows the box further; with it off, a
-	// narrower mode is letterboxed. See SetRes. PT PINNEDUI switches it for
-	// the session.
+	// width). The picture is the mode chosen: at the screen's own width the
+	// world fills the screen around the box, and a narrower mode is
+	// letterboxed with the box inside it. See SetRes. PT PINNEDUI switches it
+	// for the session.
 	FLOAT PinnedUI;
 	// How big a light is, for its shadows: the radius, in world units, of the
 	// disc around each light that shadows are cast from. 0 casts them from a
@@ -191,6 +192,10 @@ private:
 	// Where the engine's view sits across the trace: wider than it when the
 	// UI is pinned and the world fills the screen around it.
 	int UiOffsetX = 0;
+	// The mode the player chose, when the pin gave the engine a narrower one:
+	// what the trace fills out to. 0 when the engine has the mode chosen.
+	int PinnedModeWidth = 0;
+	int PinnedModeHeight = 0;
 
 	// The helper that traces, and what it has been sent so far: which
 	// geometries, at which versions, and which textures - with what is needed
