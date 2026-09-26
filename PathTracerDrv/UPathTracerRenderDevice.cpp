@@ -222,6 +222,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	FPSLimit = 120;
 	GlossBounces = 1;
 	UseMaterials = 1;
+	UseDLSS = 0;
+	DLSSQuality = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -237,6 +239,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("DLSSQuality"), RF_Public) UIntProperty(CPP_PROPERTY(DLSSQuality), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -247,6 +251,8 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 
 	Viewport = InViewport;
 	DenoiseEnabled = UseDenoiser != 0;
+	DlssEnabled = UseDLSS != 0;
+	DlssQualityNow = Clamp(DLSSQuality, 0, 4);
 	MaterialsEnabled = UseMaterials != 0;
 
 	// Started afresh once per run: the engine can make a new device mid
@@ -1190,7 +1196,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.DisableBits = DisableBits;
 				frame.ViewMode = (uint32_t)ViewMode;
 				frame.DebugMode = (uint32_t)DebugMode;
-				frame.Denoise = DenoiseEnabled ? 1 : 0;
+				frame.Denoise = !DenoiseEnabled ? TraceProtocol::DenoiseOff : (DlssEnabled ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd);
+				frame.DlssQuality = (uint32_t)DlssQualityNow;
 				frame.Materials = MaterialsEnabled ? 1 : 0;
 				frame.RestartDenoiser = DenoiseRestart ? 1 : 0;
 				frame.Timing = LogTimings ? 1 : 0;
@@ -1425,11 +1432,13 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				if (Timings.GpuFrames > 0 && Tracer)
 				{
 					const double g = Timings.GpuFrames;
-					snprintf(line, sizeof(line), "PathTracer GPU ms/frame (helper): build %.2f trace %.2f denoise %.2f composite %.2f | total %.2f at %dx%d, bounces %d, glossy bounces %d, materials %s, denoiser %s",
+					const TraceProtocol::Header& status = Tracer->Status();
+					static const char* denoisers[] = { "off", "NRD", "DLSS-RR" };
+					snprintf(line, sizeof(line), "PathTracer GPU ms/frame (helper): build %.2f trace %.2f denoise %.2f composite %.2f | total %.2f at %dx%d traced at %ux%u, bounces %d, glossy bounces %d, materials %s, denoiser %s",
 						Timings.GpuBuild / g, Timings.GpuTrace / g, Timings.GpuDenoise / g, Timings.GpuComposite / g,
 						(Timings.GpuBuild + Timings.GpuTrace + Timings.GpuDenoise + Timings.GpuComposite) / g,
-						TraceWidth, TraceHeight, (int)Bounces, (int)GlossBounces,
-						MaterialsEnabled ? "on" : "off", Tracer->Status().DenoiserActive ? "on" : "off");
+						TraceWidth, TraceHeight, status.RenderWidth, status.RenderHeight, (int)Bounces, (int)GlossBounces,
+						MaterialsEnabled ? "on" : "off", denoisers[Min<uint32_t>(status.DenoisedWith, 2)]);
 					WriteTimingLine(line);
 				}
 			}
@@ -1652,6 +1661,30 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			ViewMode = 0;
 			handled = true;
 		}
+		// DLSS Ray Reconstruction in place of NRD, or back; with a quality,
+		// that quality and DLSS on.
+		if (ParseCommand(&Cmd, TEXT("DLSS")))
+		{
+			static const struct { const TCHAR* Name; int Quality; } qualities[] = {
+				{ TEXT("DLAA"), 0 }, { TEXT("QUALITY"), 1 }, { TEXT("BALANCED"), 2 }, { TEXT("PERFORMANCE"), 3 }, { TEXT("ULTRAPERFORMANCE"), 4 },
+			};
+			bool named = false;
+			for (const auto& q : qualities)
+				if (ParseCommand(&Cmd, q.Name))
+				{
+					DlssQualityNow = q.Quality;
+					DlssEnabled = true;
+					named = true;
+				}
+			if (!named)
+				DlssEnabled = !DlssEnabled;
+			DenoiseRestart = true;
+			static const TCHAR* qualityNames[] = { TEXT("DLAA"), TEXT("quality"), TEXT("balanced"), TEXT("performance"), TEXT("ultra performance") };
+			Ar.Logf(TEXT("PT: DLSS Ray Reconstruction %s, %s (%s)  (PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE])"),
+				DlssEnabled ? TEXT("on") : TEXT("off"), qualityNames[Clamp(DlssQualityNow, 0, 4)],
+				(Tracer && Tracer->Alive()) ? *Widen(Tracer->Status().DlssStatus) : TEXT("no helper"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("DENOISE")))
 		{
 			DenoiseEnabled = !DenoiseEnabled;
@@ -1682,7 +1715,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("OFF"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOMATERIALS | OPAQUE | DENOISE | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOMATERIALS | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

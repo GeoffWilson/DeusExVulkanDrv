@@ -126,6 +126,14 @@ public:
 	// and the trace and the denoiser cost what they did before materials.
 	// PT NOMATERIALS switches it for the session.
 	BITFIELD UseMaterials;
+	// Denoise with NVIDIA's DLSS Ray Reconstruction rather than NRD ("DLSS"
+	// in the ini), wherever it can run - an RTX GPU, and under wine the
+	// pieces Proton provides - and with NRD wherever it cannot. It upscales
+	// as it denoises: DLSSQuality is 0 DLAA (no upscaling), 1 quality,
+	// 2 balanced, 3 performance, 4 ultra performance. PT DLSS switches it for
+	// the session and sets the quality.
+	BITFIELD UseDLSS;
+	INT DLSSQuality;
 
 private:
 	void CreateSwapChainResources();
@@ -172,8 +180,11 @@ private:
 	int TextureFailuresLogged = 0;
 	bool TracerLost = false;
 
-	// PT DENOISE and PT NOMATERIALS, for the session; the helper follows.
+	// PT DENOISE, PT DLSS and PT NOMATERIALS, for the session; the helper
+	// follows.
 	bool DenoiseEnabled = false;
+	bool DlssEnabled = false;
+	int DlssQualityNow = 1;
 	bool MaterialsEnabled = true;
 	bool DenoiseRestart = true;
 	// Which part of the picture PT VIEW shows in its place, as the trace

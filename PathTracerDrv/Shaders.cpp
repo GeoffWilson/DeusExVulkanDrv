@@ -77,9 +77,15 @@ std::string Shaders::Trace()
 		//   picture += glossAlbedo * gloss
 		layout(binding = 21, rgba16f) uniform writeonly image2D glossImage;
 		layout(binding = 22, rgba16f) uniform writeonly image2D glossAlbedoImage;
-		// Last frame's camera, as the push constants carry it, then each
-		// instance's last placement as three rows.
-		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 previousRows[]; };
+		// Last frame's camera, as the push constants carry it, this frame's
+		// fixed jitter in xy (see Disable bit 256), then each instance's last
+		// placement as three rows.
+		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 previousRows[]; };
+		// DLSS Ray Reconstruction's own inputs, written in place of NRD's when
+		// asked for (Disable bit 256): the depth and the motion, each on its
+		// own. The rest share NRD's images, written differently for it.
+		layout(binding = 23, r32f) uniform writeonly image2D rrDepthImage;
+		layout(binding = 24, rg16f) uniform writeonly image2D rrMotionImage;
 		// Sized to match the layout rather than left open: an unsized array needs
 		// the runtime descriptor array capability, and a device without it would
 		// fail to create the pipeline at all rather than simply not texture.
@@ -96,7 +102,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials; 64 write the denoiser's inputs
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -769,7 +775,11 @@ std::string Shaders::Trace()
 
 			// Jitter inside the pixel: this is the whole of the antialiasing,
 			// and it costs nothing because the samples are being averaged anyway.
-			vec2 jitter = vec2(randomFloat(), randomFloat());
+			// For Ray Reconstruction it is one offset for the whole frame, the
+			// one it is told: it rebuilds detail finer than a pixel from frames
+			// sampled at known, evenly spread offsets, and a random one per
+			// pixel would be a lie about where each sample was taken.
+			vec2 jitter = (Disable & 256u) != 0u ? frameJitter.xy + vec2(0.5) : vec2(randomFloat(), randomFloat());
 			vec2 uv = (vec2(pixel) + jitter) / vec2(size) * 2.0 - 1.0;
 
 			vec3 origin = CameraOrigin.xyz;
@@ -1460,6 +1470,33 @@ std::string Shaders::Trace()
 				}
 			}
 
+			// Ray Reconstruction takes the picture as it is, noisy, one sample,
+			// before any accumulation or tonemapping, and works the lighting out
+			// from the colours it is given with it - so there is nothing for this
+			// shader to average. Its finish pass tonemaps what comes back and
+			// puts the fog and the flash over it.
+			if ((Disable & 256u) != 0u)
+			{
+				// What the picture's colour is made of. Where there is nothing
+				// to reflect light - the sky, a surface that only glows - the
+				// albedo has to be white rather than black: divided by nothing,
+				// the colour turns black, and a sky trails ghosts behind rain.
+				// A mirror or a glossy surface's reflection is its specular
+				// part, with the mirror's own roughness of nothing.
+				vec3 specularGuide = surfaceFound ? specularAlbedo + glossAlbedo : vec3(0.0);
+				vec3 diffuseGuide = surfaceFound ? diffuseAlbedo : vec3(0.0);
+				if (max(max(diffuseGuide.r + specularGuide.r, diffuseGuide.g + specularGuide.g), diffuseGuide.b + specularGuide.b) < 0.01)
+					diffuseGuide = vec3(1.0);
+				imageStore(outImage, pixel, vec4(max(radiance, vec3(0.0)) * Params.x, 1.0));
+				imageStore(guideNormalImage, pixel, vec4(surfaceFound ? surfaceNormal : -viewDirection, surfaceFound ? surfaceRoughness : 1.0));
+				imageStore(diffuseAlbedoImage, pixel, vec4(diffuseGuide, 1.0));
+				imageStore(specularAlbedoImage, pixel, vec4(specularGuide, 1.0));
+				imageStore(rrDepthImage, pixel, vec4(viewZ));
+				imageStore(rrMotionImage, pixel, vec4(motion, 0.0, 0.0));
+				imageStore(fogImage, pixel, (Disable & 32u) == 0u ? volumetricFog(CameraOrigin.xyz, viewDirection, primaryDistance) : vec4(0.0));
+				return;
+			}
+
 			// PT VIEW: one of the parts in place of the picture, averaged the
 			// same way. Lighting is shown tonemapped like the picture; the
 			// rest as plain values.
@@ -1656,6 +1693,47 @@ std::string Shaders::Composite()
 			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
 
 			vec4 fog = imageLoad(fogImage, pixel);
+			mapped = fog.rgb + mapped * (1.0 - fog.a);
+
+			mapped = Flash.yzw + mapped * Flash.x;
+			imageStore(outImage, pixel, vec4(mapped, 1.0));
+		}
+	)";
+}
+
+// After Ray Reconstruction, at the output's size: what it returns is the
+// picture, denoised and upscaled but still linear, so it is tonemapped the
+// way the trace tonemaps its own, and the fog and the screen flash go over
+// it. The fog was traced at the render size, and is smooth enough to be
+// filtered up to this one.
+std::string Shaders::Finish()
+{
+	return R"(
+		#version 460
+
+		layout(local_size_x = 8, local_size_y = 8) in;
+
+		layout(binding = 0, rgba16f) uniform writeonly image2D outImage;
+		layout(binding = 1, rgba16f) uniform readonly image2D reconstructedImage;
+		layout(binding = 2) uniform sampler2D fogTexture;
+
+		layout(push_constant) uniform PushConstants
+		{
+			vec4 Flash;      // x the picture's scale, yzw the flash colour
+		};
+
+		void main()
+		{
+			ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+			ivec2 size = imageSize(outImage);
+			if (pixel.x >= size.x || pixel.y >= size.y)
+				return;
+
+			vec3 mapped = max(imageLoad(reconstructedImage, pixel).rgb, vec3(0.0));
+			mapped = mapped / (mapped + vec3(1.0));
+			mapped = pow(mapped, vec3(1.0 / 2.2));
+
+			vec4 fog = texture(fogTexture, (vec2(pixel) + vec2(0.5)) / vec2(size));
 			mapped = fog.rgb + mapped * (1.0 - fog.a);
 
 			mapped = Flash.yzw + mapped * Flash.x;

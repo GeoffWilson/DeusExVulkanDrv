@@ -7,7 +7,10 @@
 // semaphores. What it cannot check is the engine's end - LevelScene and the
 // textures - which only the game can.
 //
-//   PathTracerHelperTest.exe [frames] [width] [height]    (helper beside it)
+//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality]    (helper beside it)
+//
+// --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
+// 4 ultra performance) rather than NRD, where it can run.
 //
 // Frames are taken the way the render device takes them: the next is asked
 // for before the last is waited for, so the helper records one while the GPU
@@ -97,9 +100,18 @@ static void AddBox(SceneGeometry& g, vec3 lo, vec3 hi, vec3 albedo)
 
 int main(int argc, char** argv)
 {
-	const int frames = argc > 1 ? atoi(argv[1]) : 30;
-	const uint32_t width = argc > 2 ? (uint32_t)atoi(argv[2]) : 320;
-	const uint32_t height = argc > 3 ? (uint32_t)atoi(argv[3]) : 240;
+	std::vector<const char*> args;
+	int dlss = -1;
+	for (int i = 1; i < argc; i++)
+	{
+		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
+			dlss = atoi(argv[++i]);
+		else
+			args.push_back(argv[i]);
+	}
+	const int frames = args.size() > 0 ? atoi(args[0]) : 30;
+	const uint32_t width = args.size() > 1 ? (uint32_t)atoi(args[1]) : 320;
+	const uint32_t height = args.size() > 2 ? (uint32_t)atoi(args[2]) : 240;
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	printf("pointer size: %d bits\n", (int)(sizeof(void*) * 8));
 
@@ -219,7 +231,8 @@ int main(int argc, char** argv)
 		frame.MaxSamples = 256;
 		frame.Bounces = 3;
 		frame.GlossBounces = 1;
-		frame.Denoise = 1;
+		frame.Denoise = dlss >= 0 ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd;
+		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
 		frame.Timing = 1;
 		frame.Exposure = 0.2f + 128 * (2.0f / 255.0f);
@@ -338,10 +351,13 @@ int main(int argc, char** argv)
 
 			const auto& s = client.Status();
 			if (i == 0 || i == frames / 2 || i == frames - 1)
-				printf("frame %d: %ux%u, %u lights, %u textures, %u shapes, %u instances, denoiser %s (%s), GPU build %.2f trace %.2f denoise %.2f composite %.2f ms%s\n",
-					i, client.OutputWidth(), client.OutputHeight(), s.LightCount, s.TextureCount, s.BottomCount, s.InstanceCount,
-					s.DenoiserActive ? "on" : "off", s.DenoiserStatus, s.GpuBuildMs, s.GpuTraceMs, s.GpuDenoiseMs, s.GpuCompositeMs,
+			{
+				static const char* denoisers[] = { "none", "NRD", "DLSS-RR" };
+				printf("frame %d: %ux%u traced at %ux%u, %u lights, %u textures, %u shapes, %u instances, denoised with %s (NRD %s, DLSS %s), GPU build %.2f trace %.2f denoise %.2f composite %.2f ms%s\n",
+					i, client.OutputWidth(), client.OutputHeight(), s.RenderWidth, s.RenderHeight, s.LightCount, s.TextureCount, s.BottomCount, s.InstanceCount,
+					denoisers[std::min(s.DenoisedWith, 2u)], s.DenoiserStatus, s.DlssStatus, s.GpuBuildMs, s.GpuTraceMs, s.GpuDenoiseMs, s.GpuCompositeMs,
 					s.GpuTimed ? "" : " (not timed)");
+			}
 		}
 		if (pending)
 			vkWaitForFences(device->device, 1, &fence->fence, VK_TRUE, UINT64_MAX);

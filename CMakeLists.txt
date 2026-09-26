@@ -93,6 +93,7 @@ add_executable(PathTracerHelper
 	"${PATHTRACERDRV_DIR}/FrameUploads.cpp"
 	"${PATHTRACERDRV_DIR}/HelperMain.cpp"
 	"${PATHTRACERDRV_DIR}/mat.cpp"
+	"${PATHTRACERDRV_DIR}/RayReconstruction.cpp"
 	"${PATHTRACERDRV_DIR}/Shaders.cpp"
 	"${PATHTRACERDRV_DIR}/TraceRenderer.cpp")
 target_include_directories(PathTracerHelper PRIVATE "${PATHTRACERDRV_DIR}")
@@ -107,6 +108,20 @@ if(EXISTS "${PATHTRACER_NRD_DIR}/x64/NRD.lib")
 	target_link_libraries(PathTracerHelper PRIVATE "${PATHTRACER_NRD_DIR}/x64/NRD.lib")
 else()
 	message(STATUS "PathTracerHelper: no NRD at ${PATHTRACER_NRD_DIR}/x64, building without the denoiser")
+endif()
+
+# NVIDIA's DLSS Ray Reconstruction, when cmake/fetch-dlss.sh has fetched the
+# SDK. Its runtime, nvngx_dlssd.dll, goes beside the helper, where NGX looks.
+set(PATHTRACER_DLSS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.dlss" CACHE PATH "Output of cmake/fetch-dlss.sh")
+if(EXISTS "${PATHTRACER_DLSS_DIR}/x64/nvsdk_ngx_s.lib")
+	message(STATUS "PathTracerHelper: DLSS Ray Reconstruction from ${PATHTRACER_DLSS_DIR}")
+	target_include_directories(PathTracerHelper PRIVATE "${PATHTRACER_DLSS_DIR}/include")
+	target_compile_definitions(PathTracerHelper PRIVATE PATHTRACER_DLSS)
+	target_link_libraries(PathTracerHelper PRIVATE "${PATHTRACER_DLSS_DIR}/x64/nvsdk_ngx_s.lib")
+	add_custom_command(TARGET PathTracerHelper POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PATHTRACER_DLSS_DIR}/nvngx_dlssd.dll" "$<TARGET_FILE_DIR:PathTracerHelper>")
+else()
+	message(STATUS "PathTracerHelper: no DLSS SDK at ${PATHTRACER_DLSS_DIR}, building without Ray Reconstruction")
 endif()
 
 else()
@@ -316,7 +331,6 @@ endif()
 # since NGX is, and only once cmake/fetch-dlss.sh has fetched the SDK. The
 # Ray Reconstruction runtime is copied beside it, where NGX looks.
 #   cmake --build build-x64 --target ngxcheck
-set(PATHTRACER_DLSS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.dlss" CACHE PATH "Output of cmake/fetch-dlss.sh")
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND EXISTS "${PATHTRACER_DLSS_DIR}/x64/nvsdk_ngx_s.lib")
 	add_executable(ngxcheck EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/spike/ngxcheck.cpp")
 	target_include_directories(ngxcheck PRIVATE "${PATHTRACER_DLSS_DIR}/include")

@@ -31,7 +31,16 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 2;
+	static const uint32_t Version = 3;
+
+	// TraceCommand::Denoise.
+	enum DenoiserChoice : uint32_t
+	{
+		DenoiseOff = 0,
+		DenoiseNrd = 1,
+		// DLSS Ray Reconstruction, and NRD wherever it cannot run.
+		DenoiseDlss = 2,
+	};
 
 	// The output image, as both sides must create it for the one allocation to
 	// be valid in both.
@@ -104,9 +113,17 @@ namespace TraceProtocol
 		float HelperRecordMs;
 		uint32_t HelperStalls;
 
+		// What the last frame was traced at and denoised with: the render size,
+		// smaller than the output when DLSS upscales, and a DenoiserChoice.
+		uint32_t RenderWidth;
+		uint32_t RenderHeight;
+		uint32_t DenoisedWith;
+		uint32_t Pad;
+
 		char DeviceName[256];
 		char Error[512];
 		char DenoiserStatus[128];
+		char DlssStatus[160];       // "ready", or why Ray Reconstruction cannot run
 	};
 #pragma pack(pop)
 
@@ -209,14 +226,14 @@ namespace TraceProtocol
 		uint32_t DisableBits;       // PT's switches, as the device keeps them
 		uint32_t ViewMode;          // PT VIEW, 0 for the picture
 		uint32_t DebugMode;
-		uint32_t Denoise;
+		uint32_t Denoise;           // a DenoiserChoice
 		uint32_t Materials;
 		uint32_t RestartDenoiser;   // camera cut or new level
 		uint32_t Timing;            // LogTimings: time the GPU's work
 		float Time;                 // the level's clock
 		float Exposure;
 		float SkyIntensity;
-		float Pad;
+		uint32_t DlssQuality;       // 0 DLAA, 1 quality, 2 balanced, 3 performance, 4 ultra performance
 		// Origin, right, up and forward, as the trace shader's push constants
 		// carry them - w holding the screen flash - and the same for last frame.
 		vec4 Camera[4];

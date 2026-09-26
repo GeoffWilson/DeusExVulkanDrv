@@ -1,6 +1,7 @@
 #include "TracePrecomp.h"
 #include "TraceProtocol.h"
 #include "TraceRenderer.h"
+#include "RayReconstruction.h"
 #include <chrono>
 #include <cstdarg>
 #include <stdexcept>
@@ -210,10 +211,18 @@ bool Helper::OpenChannel(DWORD parentPid, const std::string& name)
 // meaningful on the one that made it.
 void Helper::CreateDevice(const std::string& uuid, bool vkDebug)
 {
+	// DLSS Ray Reconstruction's extensions have to be asked for now, before
+	// there is a device - and so before anyone has asked for it - or not at
+	// all. Wherever they are offered they are enabled.
+	std::vector<std::string> ngxInstance, ngxDevice;
+	RayReconstruction::RequiredExtensions(ngxInstance, ngxDevice);
+
 	HelperLog("creating the Vulkan instance");
-	Instance = VulkanInstanceBuilder()
-		.DebugLayer(vkDebug)
-		.Create();
+	VulkanInstanceBuilder instanceBuilder;
+	instanceBuilder.DebugLayer(vkDebug);
+	for (const std::string& name : ngxInstance)
+		instanceBuilder.OptionalExtension(name);
+	Instance = instanceBuilder.Create();
 	HelperLog("instance created, %d physical devices", (int)Instance->PhysicalDevices.size());
 
 	VulkanDeviceBuilder builder;
@@ -221,6 +230,8 @@ void Helper::CreateDevice(const std::string& uuid, bool vkDebug)
 	builder.OptionalDescriptorIndexing();
 	builder.RequireExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
 	builder.RequireExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+	for (const std::string& name : ngxDevice)
+		builder.OptionalExtension(name);
 
 	std::vector<VulkanCompatibleDevice> devices = builder.FindDevices(Instance);
 	int chosen = -1;
@@ -496,6 +507,10 @@ void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 	Shared->InstanceCount = (uint32_t)Renderer->Scene.Instances.size();
 	Shared->DenoiserActive = Renderer->DenoiserActive() ? 1 : 0;
 	snprintf(Shared->DenoiserStatus, sizeof(Shared->DenoiserStatus), "%s", Renderer->DenoiserStatus());
+	Shared->RenderWidth = (uint32_t)Renderer->RenderWidth();
+	Shared->RenderHeight = (uint32_t)Renderer->RenderHeight();
+	Shared->DenoisedWith = Renderer->DenoisedWith();
+	snprintf(Shared->DlssStatus, sizeof(Shared->DlssStatus), "%s", Renderer->DlssStatus());
 }
 
 void Helper::Fail(const char* what)

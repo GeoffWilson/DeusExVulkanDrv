@@ -53,6 +53,12 @@ if [ -f "$BUILD_DIR/PathTracerDrv.dll" ]; then
 			exit 1
 		fi
 		installed+=("PathTracerHelper")
+		# DLSS Ray Reconstruction's runtime, when the helper was built with it:
+		# NGX looks for it beside the helper.
+		if [ -f "$HELPER_DIR/nvngx_dlssd.dll" ]; then
+			cp "$HELPER_DIR/nvngx_dlssd.dll" "$SYSTEM_DIR/"
+			installed+=("nvngx_dlssd")
+		fi
 	else
 		echo "No PathTracerHelper.exe in $HELPER_DIR: PathTracerDrv will not start without it" >&2
 	fi

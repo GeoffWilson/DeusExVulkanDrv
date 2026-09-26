@@ -2,12 +2,15 @@
 
 #include "SceneData.h"
 #include "GpuContext.h"
+#include <chrono>
 #include <memory>
+#include <string>
 #include <vector>
 
 class AccelStructure;
 class Denoiser;
 class FrameUploads;
+class RayReconstruction;
 namespace TraceProtocol { struct TraceCommand; }
 
 // The trace shader's push constants: see Shaders::Trace.
@@ -35,8 +38,13 @@ struct TracePushConstants
 };
 
 // Everything that turns the scene into a picture on the GPU: the acceleration
-// structures, the texture array and the materials, the trace, NRD and the pass
-// that puts the picture back together from what it returns.
+// structures, the texture array and the materials, the trace, and a denoiser -
+// NRD and the pass that puts the picture back together from what it returns,
+// or DLSS Ray Reconstruction and the pass that finishes what it returns.
+//
+// With Ray Reconstruction the trace runs at a render size smaller than the
+// picture, which it upscales as it denoises; everything else is at the
+// picture's own size.
 //
 // It runs in the 64-bit helper, which keeps Scene as the render device sends
 // it and asks for a frame at a time; nothing here knows the engine exists.
@@ -69,9 +77,13 @@ public:
 	// The GPU has finished the frame in slot: its timestamps can be read.
 	void FrameCompleted(int slot);
 
+	// The picture, at the size the device asked for.
 	VulkanImage* Output() const { return OutputImage.get(); }
-	int Width() const { return TraceWidth; }
-	int Height() const { return TraceHeight; }
+	int Width() const { return OutputWidth; }
+	int Height() const { return OutputHeight; }
+	// What the trace itself ran at.
+	int RenderWidth() const { return TraceWidth; }
+	int RenderHeight() const { return TraceHeight; }
 	bool SamplesTextures() const { return CanSampleTextures; }
 
 	// About the last frame.
@@ -80,17 +92,22 @@ public:
 	int TextureCount() const { return (int)BoundTextures; }
 	bool DenoiserActive() const;
 	const char* DenoiserStatus() const;
+	// A TraceProtocol::DenoiserChoice: what the last frame was denoised with.
+	uint32_t DenoisedWith() const { return LastDenoiser; }
+	const char* DlssStatus() const;
 	bool GpuTimed = false;
 	float GpuMs[4] = {};    // build, trace, denoise, composite
 
 private:
 	void CreateTracePipeline();
 	void CreateCompositePipeline();
-	void Resize(int width, int height);
+	void CreateFinishPipeline();
+	void Resize(int renderWidth, int renderHeight, int outputWidth, int outputHeight, bool forRayReconstruction);
 	void EnsureDenoiser(bool wanted, bool materials);
 	void UpdateDescriptors();
 	void WriteCompositeDescriptors();
-	void WriteMotion(const vec4 (&previousCamera)[4], FrameUploads& uploads);
+	void WriteFinishDescriptors();
+	void WriteMotion(const vec4 (&previousCamera)[4], vec2 jitter, FrameUploads& uploads);
 	void RecordTexturePixels(VulkanCommandBuffer* commands, FrameUploads& uploads);
 	void BindWhite(uint32_t index);
 
@@ -116,6 +133,11 @@ private:
 	std::unique_ptr<VulkanImageView> OutputView;
 	int TraceWidth = 0;
 	int TraceHeight = 0;
+	int OutputWidth = 0;
+	int OutputHeight = 0;
+	// The images are laid out for Ray Reconstruction: the trace writes its
+	// picture into RrColorImage at the render size rather than into Output.
+	bool TracingForRr = false;
 
 	// A denoiser's inputs, written by the trace at bindings 9 to 15 when asked
 	// for, the fog at 17, what mirrors show at 18 and 19, and the glossy
@@ -140,6 +162,33 @@ private:
 	std::unique_ptr<VulkanPipelineLayout> CompositePipelineLayout;
 	std::unique_ptr<VulkanShader> CompositeShader;
 	std::unique_ptr<VulkanPipeline> CompositePipeline;
+
+	// DLSS Ray Reconstruction, started the first time it is asked for, and
+	// only tried the once: where it cannot run, NRD stands in.
+	std::unique_ptr<RayReconstruction> Rr;
+	bool RrTried = false;
+	// Its inputs that NRD's images cannot carry - the picture at the render
+	// size, the depth and the motion each on their own - and its output.
+	// The depth and motion are always there, since the trace binds them.
+	std::unique_ptr<VulkanImage> RrColorImage;
+	std::unique_ptr<VulkanImageView> RrColorView;
+	std::unique_ptr<VulkanImage> RrDepthImage;
+	std::unique_ptr<VulkanImageView> RrDepthView;
+	std::unique_ptr<VulkanImage> RrMotionImage;
+	std::unique_ptr<VulkanImageView> RrMotionView;
+	std::unique_ptr<VulkanImage> RrOutputImage;
+	std::unique_ptr<VulkanImageView> RrOutputView;
+	std::unique_ptr<VulkanSampler> FogSampler;
+	std::unique_ptr<VulkanDescriptorSetLayout> FinishLayout;
+	std::unique_ptr<VulkanDescriptorPool> FinishPool;
+	std::unique_ptr<VulkanDescriptorSet> FinishSet;
+	std::unique_ptr<VulkanPipelineLayout> FinishPipelineLayout;
+	std::unique_ptr<VulkanShader> FinishShader;
+	std::unique_ptr<VulkanPipeline> FinishPipeline;
+	uint32_t LastDenoiser = 0;
+	// When the last frame was recorded: Ray Reconstruction scales how hard it
+	// denoises by how fast things move, and wants to know how long a frame is.
+	std::chrono::steady_clock::time_point LastRecordTime;
 
 	// What each frame in flight stages for the GPU, and what it retires.
 	std::unique_ptr<FrameUploads> Uploads[GpuContext::FramesInFlight];
