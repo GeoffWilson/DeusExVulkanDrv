@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 15;
+	static const uint32_t Version = 16;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -308,7 +308,9 @@ namespace TraceProtocol
 		// How much the level's glowing surfaces light what is around them,
 		// 1 as they glow: the device's GlowLighting.
 		float GlowLighting;
-		uint32_t Pad;
+		// How wet the level's ground is where rain would reach it, 0 dry to
+		// 1 soaked: the device's Wetness.
+		float Wetness;
 		// Origin, right, up and forward, as the trace shader's push constants
 		// carry them - w holding the screen flash - and the same for last frame.
 		vec4 Camera[4];

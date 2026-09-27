@@ -10,7 +10,7 @@
 //   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still]
 //                            [--lightsize radius] [--reference] [--backlight]
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
-//                            [--photo aperture]
+//                            [--photo aperture] [--glass] [--wet percent] [--view n]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -40,6 +40,15 @@
 // level's glowing surfaces are; --glow-unsampled the same strip found only by
 // the bounces that reach it. With --reference the two should come to the
 // same picture, the sampled one with less noise on the way.
+//
+// --glass hangs a pane of red glass under the light, which should throw a
+// red patch on the floor rather than a shadow (glassTransmittance); --wet
+// makes the scene ground open to the sky and that wet, darker and shining
+// with puddles on the floor - but for the patch under the glass, which the
+// rain does not reach.
+//
+// --view shows one part of the picture in its place, numbered as PT VIEW
+// numbers them: 12 is each surface's material, red its roughness.
 //
 // --photo refines the picture as photo mode does (the device's PT PHOTO):
 // --reference, with every frame taken as another sample whatever changes
@@ -158,6 +167,9 @@ int main(int argc, char** argv)
 	bool inset = false;
 	bool fog = false, flashlight = false, dark = false, fogUnshadowed = false, glowStrip = false, glowUnsampled = false;
 	float photoAperture = -1.0f;
+	bool glass = false;
+	int wetness = 0;
+	uint32_t view = 0;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -192,6 +204,12 @@ int main(int argc, char** argv)
 			glowStrip = true;
 		else if (!strcmp(argv[i], "--glow-unsampled"))
 			glowStrip = glowUnsampled = true;
+		else if (!strcmp(argv[i], "--glass"))
+			glass = true;
+		else if (!strcmp(argv[i], "--wet") && i + 1 < argc)
+			wetness = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--view") && i + 1 < argc)
+			view = (uint32_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--photo") && i + 1 < argc)
 		{
 			photoAperture = (float)atof(argv[++i]);
@@ -268,6 +286,22 @@ int main(int argc, char** argv)
 				glowSources.push_back(e);
 				attr.Emission.z = (float)glowSources.size();
 			}
+		}
+		// Ground open to the sky, as a level's zone with a window onto the
+		// sky zone marks it (Ambient.w's 4).
+		if (wetness > 0)
+			for (TriangleAttributes& attr : world.Attributes)
+				attr.Ambient.w += 4.0f;
+		// The red pane under the light: translucent (UV2Tex.w 2), so the
+		// world is no longer opaque throughout and its triangles are offered
+		// to the shader to pass or stop.
+		if (glass)
+		{
+			const size_t first = world.Attributes.size();
+			AddQuad(world, vec3(-260, -310, 200), vec3(-140, -310, 200), vec3(-140, -190, 200), vec3(-260, -190, 200), vec3(0.8f, 0.1f, 0.1f), -1, 1);
+			for (size_t t = first; t < world.Attributes.size(); t++)
+				world.Attributes[t].UV2Tex.w = 2.0f;
+			world.HasMasked = true;
 		}
 		std::vector<uint32_t> emitterWords;
 		EmitterGrid::Build(glowSources, emitterWords);
@@ -494,6 +528,8 @@ int main(int argc, char** argv)
 			frame.PhotoLens = vec4(photoAperture, 0.0f, 0.0f, 0.0f);
 		}
 		frame.GlowLighting = 1.0f;
+		frame.Wetness = wetness / 100.0f;
+		frame.ViewMode = view;
 		frame.Timing = 1;
 		frame.Exposure = 0.2f + 128 * (2.0f / 255.0f);
 		frame.SkyIntensity = dark ? 0.0f : 128 * (2.0f / 255.0f);

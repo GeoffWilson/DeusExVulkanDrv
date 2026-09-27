@@ -325,6 +325,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	FlashlightHaze = 0;
 	UseFogShadows = 1;
 	GlowLighting = 1000;
+	UseColouredGlass = 1;
+	Wetness = 0;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -357,6 +359,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("FlashlightHaze"), RF_Public) UIntProperty(CPP_PROPERTY(FlashlightHaze), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FogShadows"), RF_Public) UBoolProperty(CPP_PROPERTY(UseFogShadows), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlowLighting"), RF_Public) UIntProperty(CPP_PROPERTY(GlowLighting), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("ColouredGlass"), RF_Public) UBoolProperty(CPP_PROPERTY(UseColouredGlass), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("Wetness"), RF_Public) UIntProperty(CPP_PROPERTY(Wetness), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -375,7 +379,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	LightSizeNow = Clamp(LightSize, 0, 255);
 	EngineLightingNow = Lighting != 0;
 	NeutralToneMapNow = NeutralToneMap != 0;
-	DisableBits = (DisableBits & ~(65536u | 131072u)) | ConfiguredBits();
+	DisableBits = (DisableBits & ~ConfiguredMask) | ConfiguredBits();
 
 	// Started afresh once per run: the engine can make a new device mid
 	// session, and what led up to that is the part worth keeping.
@@ -1303,6 +1307,8 @@ static const TCHAR* const BenchSteps[] = {
 	TEXT("glowing surfaces not sampled"),
 	TEXT("fog unshadowed"),
 	TEXT("the game's light augmentation"),
+	TEXT("light untinted by glass"),
+	TEXT("dry streets"),
 	TEXT("one bounce"),
 	TEXT("no shadows"),
 	TEXT("as set, again"),
@@ -1317,6 +1323,7 @@ void UPathTracerRenderDevice::StartBench()
 	Bench.Anisotropy = MaxAnisotropy;
 	Bench.LightSize = LightSizeNow;
 	Bench.Bounces = Bounces;
+	Bench.Wetness = Wetness;
 	// Off meanwhile, as the frame limit is, so the frame times are the
 	// frame's own; the swap chain is made again for it.
 	Bench.Vsync = UseVSync != 0;
@@ -1337,6 +1344,7 @@ bool UPathTracerRenderDevice::ApplyBenchStep(int step)
 	MaxAnisotropy = Bench.Anisotropy;
 	LightSizeNow = Bench.LightSize;
 	Bounces = Bench.Bounces;
+	Wetness = Bench.Wetness;
 	AccumulatedFrames = 0;
 	DenoiseRestart = true;
 
@@ -1362,8 +1370,10 @@ bool UPathTracerRenderDevice::ApplyBenchStep(int step)
 	// light is out of the list on the frames it is dark.
 	case 10: return FrameIndex - LastFogFrame < 120u && !(DisableBits & 32u) && setBit(65536u);
 	case 11: return Scene.Flashlight[0].w > 0.0f && setBit(131072u);
-	case 12: if (Bounces <= 1) return false; Bounces = 1; return true;
-	case 13: return setBit(2u);
+	case 12: return setBit(1048576u);
+	case 13: if (Wetness <= 0) return false; Wetness = 0; return true;
+	case 14: if (Bounces <= 1) return false; Bounces = 1; return true;
+	case 15: return setBit(2u);
 	default: return true;
 	}
 }
@@ -2130,6 +2140,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				for (int i = 0; i < 3; i++)
 					frame.Flashlight[i] = Scene.Flashlight[i];
 				frame.GlowLighting = Max(GlowLighting, 0) / 100.0f;
+				frame.Wetness = Clamp(Wetness, 0, 100) / 100.0f;
 				frame.PhotoLens = vec4(Photo.Aperture, Photo.Focus, 0.0f, 0.0f);
 				// The windows' views, each averaging its samples while it and
 				// the scene hold still, as the player's does.
@@ -2910,6 +2921,26 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				: TEXT("on, each baked light held to the lightmap's shadow mask as well as traced"));
 			handled = true;
 		}
+		// Glass's colour on the light through it, and wet streets.
+		if (ParseCommand(&Cmd, TEXT("GLASS")))
+		{
+			DisableBits ^= 1048576u;
+			AccumulatedFrames = 0;
+			Ar.Logf(TEXT("PT: light through glass %s"), (DisableBits & 1048576u)
+				? TEXT("as it is, as the engine's lightmaps pass it")
+				: TEXT("tinted by the glass"));
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("WET")))
+		{
+			Wetness = Clamp(appAtoi(Cmd), 0, 100);
+			AccumulatedFrames = 0;
+			if (Wetness > 0)
+				Ar.Logf(TEXT("PT: the streets %d%% wet"), (int)Wetness);
+			else
+				Ar.Logf(TEXT("PT: the streets dry"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("FOGSHADOWS")))
 		{
 			DisableBits ^= 65536u;
@@ -3110,7 +3141,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

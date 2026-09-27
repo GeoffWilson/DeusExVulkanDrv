@@ -483,6 +483,19 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 	out.Positions.reserve(out.Positions.size() + nodeCount * 6);
 	out.Attributes.reserve(out.Attributes.size() + nodeCount * 2);
 
+	// The zones open to the sky: those a window onto the sky zone faces
+	// into. Only their ground is wet when the streets are (the trace
+	// shader's wetnessAt), which spares every floor indoors the ray that
+	// looks for rain.
+	bool openToSky[FBspNode::MAX_ZONES] = {};
+	for (INT i = 0; i < nodeCount; i++)
+	{
+		const FBspNode& node = model->Nodes(i);
+		if (node.iSurf >= 0 && node.iSurf < model->Surfs.Num() && (model->Surfs(node.iSurf).PolyFlags & PF_FakeBackdrop) &&
+			node.iZone[1] < FBspNode::MAX_ZONES)
+			openToSky[node.iZone[1]] = true;
+	}
+
 	for (INT i = 0; i < nodeCount; i++)
 	{
 		const FBspNode& node = model->Nodes(i);
@@ -543,9 +556,11 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		// is what made unlit masked surfaces glow the key colour.
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
 		// w: the surface is special lit, and only special lights reach it.
-		// w: special lit, plus 2 in a fog zone, as for an instance's.
+		// w: special lit, plus 2 in a fog zone, as for an instance's, plus
+		// 4 in a zone open to the sky.
 		attr.Ambient = vec4(ambient.x, ambient.y, ambient.z,
-			((surf.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f) + ((zone && zone->bFogZone) ? 2.0f : 0.0f));
+			((surf.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f) + ((zone && zone->bFogZone) ? 2.0f : 0.0f) +
+			((node.iZone[1] < FBspNode::MAX_ZONES && openToSky[node.iZone[1]]) ? 4.0f : 0.0f));
 		// z: which of the level's lightmaps the surface has, for the engine's
 		// own shadow masks on it (see Lightmaps).
 		if (model == LightmappedModel)

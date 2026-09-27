@@ -721,7 +721,7 @@ void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 j
 	auto* mapped = (vec4*)uploads.Write(MotionBuffer.get(), 0, wanted * sizeof(vec4));
 	for (int i = 0; i < 4; i++)
 		mapped[i] = frame.PreviousCamera[i];
-	mapped[4] = vec4(jitter.x, jitter.y, frame.GlowLighting, 0.0f);
+	mapped[4] = vec4(jitter.x, jitter.y, frame.GlowLighting, frame.Wetness);
 	for (int i = 0; i < 3; i++)
 		mapped[5 + i] = frame.Flashlight[i];
 	for (int i = 0; i < 3; i++)

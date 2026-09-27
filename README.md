@@ -148,6 +148,15 @@ crash, flushed as they happen.
   to every frame's samples averaged, up to 4095 a pixel, with more bounces
   than play can afford. Fire saves it as a PNG in `Photos` beside `System`,
   and `PT PHOTO APERTURE n` adds depth of field. See the commands below.
+- **Coloured light through glass.** The engine's lightmaps let light through
+  glass as if it were not there. A lamp shining through a tinted pane now
+  takes its colour, and stained glass throws its pattern onto the floor in
+  colour, softening with distance as shadows do (`ColouredGlass`,
+  `PT GLASS`).
+- **Wet streets.** Optional, since it never rains in the original: the ground
+  open to the sky darkened and shining as after rain, with puddles standing
+  on the flat, reflecting the neon across the street. What an awning, a
+  balcony or a glass roof covers stays dry (`Wetness`, `PT WET n`).
 
 ### New in 1.2
 
@@ -508,6 +517,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	FlashlightHaze=0
 	FogShadows=True
 	GlowLighting=1000
+	ColouredGlass=True
+	Wetness=0
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Lighting`: `Engine`, the default, lights the level's surfaces as the engine
@@ -614,6 +625,22 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   where they would add at least a fiftieth to what the lights give; glass and
   meshes that glow are found only by the bounces that reach them.
   `PT GLOW n` sets it for the session.
+- `ColouredGlass`: light through glass takes its colour, on by default.
+  Glass drawn by adding its colour - most of Deus Ex's windows - passes its
+  texture's hue as far as it is coloured at all, so clear and grey panes pass
+  light as it is and deep red stained glass passes red; glass drawn
+  modulated passes what it darkens the view by. Read texel by texel, so a
+  stained window's pattern lands on the floor. Sprites and what glows - a
+  lamp's light cone - tint nothing. `PT GLASS` switches it for the session.
+- `Wetness`: wet streets, in percent, 0 (dry) by default. The ground in zones
+  with a window onto the sky, facing up, with nothing but the sky above it,
+  is darkened, damp; towards the puddles a film of water gathers, its
+  reflection traced and sharpening as it deepens, and the puddles on the flat
+  are mirrors. The wetter it is, the further the film spreads. Awnings,
+  balconies, glass roofs and anything else overhead keep what is under them
+  dry; a grate's holes let the rain through. 100 is soaked. Only the first
+  surface the view meets is wet: what it reflects is shaded dry. `PT WET n`
+  sets it for the session.
 - `FPSLimit`: frames per second to hold the game to, 120 by default and 0 for
   no limit. Deus Ex cuts conversation audio short when left to run at a few
   hundred frames a second, the intro included. Unlike VulkanDrv's it does not wait
@@ -681,6 +708,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   flashlight on or off or at a brightness, its beam's haze, the fog's
   shadows, and how much glowing surfaces light, as the settings of the same
   names.
+- `PT GLASS`, `PT WET n`: light through glass tinted or not, and how wet the
+  streets are, as `ColouredGlass` and `Wetness`.
 - `PT GLOWSAMPLING`: glowing surfaces found only by the bounces that reach
   them, as before, or sampled as lights as well, to compare. The two should
   settle to the same picture.
@@ -712,8 +741,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   costlier features off one at a time - the engine's lighting, the baked
   shadow masks, mipmaps, anisotropic filtering, detail textures, the engine's
   mesh lighting, soft shadows, glowing surfaces lighting the room and being
-  sampled as lights, the fog's shadows, the flashlight (against the game's own light augmentation), the
-  extra bounces, shadows - with the frame limit and VSync off, then logs a table to
+  sampled as lights, the fog's shadows, the flashlight (against the game's own light augmentation),
+  glass's colour, wet streets, the extra bounces, shadows - with the frame limit and VSync off, then logs a table to
   `PathTracerTimings.log`: the GPU's time, the scene gathering and the frame
   with each, and how each compares with the settings as they are. `PT BENCH`
   again stops it.

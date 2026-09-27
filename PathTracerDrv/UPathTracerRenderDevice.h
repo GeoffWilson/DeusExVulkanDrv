@@ -205,11 +205,24 @@ public:
 	// neon that spills its colour onto the walls around it. What they look
 	// like is unchanged. PT GLOW n sets it for the session.
 	INT GlowLighting;
+	// Light through glass takes its colour: stained glass throws coloured
+	// patches, a tinted pane tints what it lets in (glassTransmittance in
+	// Shaders.cpp). The engine's lightmaps pass light through glass as if
+	// it were not there. PT GLASS switches it for the session.
+	BITFIELD UseColouredGlass;
+	// Wet streets, in percent, 0 - the default - for dry: the ground open to
+	// the sky darkened and shining as after rain, with puddles standing on
+	// the flat, reflecting the neon (wetnessAt in Shaders.cpp). Not in the
+	// original, where it never rains, so off unless asked for. PT WET n
+	// sets it for the session.
+	INT Wetness;
 
 private:
 	// The switches in DisableBits the ini sets rather than PT alone: the
-	// fog's shadows (65536) and the flashlight (131072).
-	uint32_t ConfiguredBits() const { return (UseFogShadows ? 0u : 65536u) | (UseFlashlight ? 0u : 131072u); }
+	// fog's shadows (65536), the flashlight (131072) and glass's colour
+	// (1048576).
+	static const uint32_t ConfiguredMask = 65536u | 131072u | 1048576u;
+	uint32_t ConfiguredBits() const { return (UseFogShadows ? 0u : 65536u) | (UseFlashlight ? 0u : 131072u) | (UseColouredGlass ? 0u : 1048576u); }
 	// The flashlight as last traced, to notice it moving or going out.
 	vec4 LastFlashlight[3] = {};
 	FString DescribeDenoiser() const;
@@ -426,6 +439,7 @@ private:
 		FLOAT Anisotropy = 0.0f;
 		int LightSize = 0;
 		INT Bounces = 1;
+		INT Wetness = 0;
 		// This step's sums, from when it has settled.
 		double Gpu = 0, Trace = 0, Collect = 0, FrameSum = 0;
 		int GpuFrames = 0, Frames = 0;

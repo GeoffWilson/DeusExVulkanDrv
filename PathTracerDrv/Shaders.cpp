@@ -113,7 +113,8 @@ static std::string TraceCommon()
 		layout(binding = 21, rgba16f) uniform writeonly image2D glossImage;
 		layout(binding = 22, rgba16f) uniform writeonly image2D glossAlbedoImage;
 		// Last frame's camera, as the push constants carry it, this frame's
-		// fixed jitter in xy (see Disable bit 256), the flashlight (see
+		// fixed jitter in xy (see Disable bit 256), GlowLighting in z and
+		// Wetness in w, the flashlight (see
 		// flashlightAt), which way the sky zone faces (TraceCommand's
 		// SkyAxes), photo mode's lens (PhotoLens), then each instance's last
 		// placement as three rows.
@@ -145,13 +146,14 @@ static std::string TraceCommon()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
 		#define GlossBounces ((Counts.z >> 8u) & 255u)
 		// How much a glowing surface gives what it lights: GlowLighting.
 		#define GlowScale frameJitter.z
+		#define Wetness frameJitter.w
 		#define LightRadius float((Counts.z >> 16u) & 255u)
 		#define MipBias (float(int(Counts.z) >> 24) / 16.0)
 		// Whether the level's surfaces take their lights as the engine's
@@ -178,6 +180,11 @@ static std::string TraceCommon()
 		// the player's hands, which it shines from among, but not a light
 		// fitting: there is no lamp of the flashlight's inside one (0xE9).
 		const uint FlashlightRays = 0xE9u;
+		// Rain, looked for straight up from wet ground (wetnessAt): stopped
+		// by what shadows are, but not by the player's body or the weapon at
+		// the player's eyes, which would leave a dry patch wherever the
+		// player stood.
+		const uint RainRays = 0xE9u;
 
 		// Does this point on the triangle actually exist? UE1 masked art keys
 		// transparency to palette index zero, which the upload turns into an
@@ -701,12 +708,64 @@ static std::string TraceCommon()
 		// lights.
 		vec3 lightmapAmbient = vec3(0.0);
 
+	)";
+
+	source += R"(
+		// What light keeps passing through a surface it is not stopped by:
+		// all of it, but for glass. Modulated glass passes what it multiplies
+		// the view by, at most all of it. Translucent glass - drawn by adding
+		// its colour, so it absorbs nothing the engine shows - passes its
+		// texel's hue, as far as the texel is coloured at all: clear and grey
+		// glass pass the light as it is, deep red stained glass passes red.
+		// Read at the top mip level, so a stained window's pattern lands on
+		// the floor, softening with distance as its shadows do. Sprites and
+		// what glows - a lamp's light cone, a force field - tint nothing, and
+		// neither does a masked texture's hole.
+		vec3 glassTransmittance(int attributeBase, int primitive, vec2 bary, vec3 dir, mat3 toWorld)
+		{
+			if ((Disable & 1048576u) != 0u)
+				return vec3(1.0);
+			TriangleAttributes attr = tris[attributeBase + primitive];
+			float kind = attr.UV2Tex.w;
+			bool modulated = kind > 3.5 && kind < 4.5;
+			if (!modulated && (kind < 1.5 || kind > 2.5))
+				return vec3(1.0);
+			if (attr.Emission.w > 0.5)
+				return vec3(1.0);
+			vec3 colour = attr.Albedo.rgb;
+			int index = int(attr.UV2Tex.z);
+			if (index >= 0 && uint(index) < TextureCount)
+			{
+				vec2 uv = surfaceUV(attr, bary, dir, normalize(toWorld * attr.Normal.xyz));
+				vec4 texel = textureLod(sceneTextures[nonuniformEXT(index)], uv, 0.0);
+				if (texel.a <= 0.5)
+					return vec3(1.0);
+				colour = pow(max(texel.rgb, vec3(0.0)), vec3(2.2));
+			}
+			if (modulated)
+				return clamp(colour * 4.595, vec3(0.0), vec3(1.0));
+			float top = max(colour.r, max(colour.g, colour.b));
+			if (top < 0.01)
+				return vec3(1.0);
+			float saturation = 1.0 - min(colour.r, min(colour.g, colour.b)) / top;
+			return mix(vec3(1.0), colour / top, saturation);
+		}
+
+		// What the glass a shadow ray passed through let through, when it
+		// was not stopped: see occludedBy.
+		vec3 shadowTint = vec3(1.0);
+
 		// cullMask is which instances can be in the way: ShadowRays for the
-		// level's lights (occluded), FlashlightRays for the flashlight.
+		// level's lights (occluded), FlashlightRays for the flashlight. Glass
+		// on the way tints the light (shadowTint), each pane once: a ray
+		// query can offer the same triangle more than once.
 		bool occludedBy(vec3 origin, vec3 dir, float dist, uint cullMask)
 		{
+			shadowTint = vec3(1.0);
 			if ((Disable & 2u) != 0u)
 				return false;
+			ivec2 tinted[4];
+			uint tintedCount = 0u;
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, topLevel,
 				gl_RayFlagsTerminateOnFirstHitEXT | ((Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : 0u),
@@ -719,12 +778,25 @@ static std::string TraceCommon()
 			{
 				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 				{
-					if (confirmCandidate(
-							rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
-							rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
-							rayQueryGetIntersectionBarycentricsEXT(rq, false),
-							true, dir, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
+					int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+					int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+					vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+					mat3 toWorld = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false));
+					if (confirmCandidate(attributeBase, primitive, bary, true, dir, toWorld))
 						rayQueryConfirmIntersectionEXT(rq);
+					else
+					{
+						ivec2 pane = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, false), primitive);
+						bool seen = false;
+						for (uint p = 0u; p < tintedCount; p++)
+							seen = seen || tinted[p] == pane;
+						if (!seen)
+						{
+							shadowTint *= glassTransmittance(attributeBase, primitive, bary, dir, toWorld);
+							if (tintedCount < 4u)
+								tinted[tintedCount++] = pane;
+						}
+					}
 				}
 			}
 			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
@@ -1068,7 +1140,10 @@ static std::string TraceCommon()
 		// A light behind a mesh reaches it only as the engine's sheen, which a
 		// shadow ray could not show: it would start into the mesh itself. The
 		// engine never shadows a mesh at all, so that part is left unshadowed.
-		bool lightReaches(vec3 position, vec3 dir, float distance, bool behind)
+		//
+		// What reaches, of each colour: nothing when something is in the way,
+		// and what the glass on the way lets through (glassTransmittance).
+		vec3 lightReaches(vec3 position, vec3 dir, float distance, bool behind)
 		{
 			vec3 shadowDir = dir;
 			float shadowDistance = distance;
@@ -1083,7 +1158,9 @@ static std::string TraceCommon()
 				shadowDistance = length(toTarget);
 				shadowDir = toTarget / shadowDistance;
 			}
-			return behind || !occluded(position, shadowDir, shadowDistance - RayEpsilon * 2.0);
+			if (behind)
+				return vec3(1.0);
+			return occluded(position, shadowDir, shadowDistance - RayEpsilon * 2.0) ? vec3(0.0) : shadowTint;
 		}
 
 		// The light a point takes from the lights.
@@ -1250,14 +1327,21 @@ static std::string TraceCommon()
 				if (lights[strongIndex[t]].Flags.z > 0.5)
 					litByChangingLight = true;
 				float weight = luminance(value);
-				if (weight <= 0.0 || !lightReaches(position, dir, distance, behind))
+				if (weight <= 0.0)
 					continue;
-				reaches += value;
+				// Glass tints light as it is, linear; the engine's sum is of
+				// displayed values.
+				vec3 through = lightReaches(position, dir, distance, behind);
+				if (luminance(through) <= 0.0)
+					continue;
+				if (engineSum)
+					through = pow(through, vec3(1.0 / 2.2));
+				reaches += value * through;
 				if (weight > highlightWeight)
 				{
 					highlightWeight = weight;
 					lightDirection = dir;
-					lightBase = base;
+					lightBase = base * through;
 				}
 			}
 			if (chosen >= 0 && chosenWeight > 0.0)
@@ -1268,14 +1352,17 @@ static std::string TraceCommon()
 				lightAt(uint(chosen), position, normal, specialLit, meshGlow, viewDir, lightmap, true, value, base, dir, distance, behind);
 				if (lights[chosen].Flags.z > 0.5)
 					litByChangingLight = true;
-				if (luminance(value) > 0.0 && lightReaches(position, dir, distance, behind))
+				vec3 through = luminance(value) > 0.0 ? lightReaches(position, dir, distance, behind) : vec3(0.0);
+				if (luminance(through) > 0.0)
 				{
+					if (engineSum)
+						through = pow(through, vec3(1.0 / 2.2));
 					float scale = restWeight / chosenWeight;
-					reaches += value * scale;
+					reaches += value * through * scale;
 					if (highlightWeight <= 0.0)
 					{
 						lightDirection = dir;
-						lightBase = base * scale;
+						lightBase = base * through * scale;
 					}
 				}
 			}
@@ -1368,8 +1455,9 @@ static std::string TraceCommon()
 		}
 
 		// Does the flashlight reach the point? One shadow ray to a random
-		// point on the lamp, as lightReaches does for the level's lights.
-		bool flashlightReaches(vec3 position, vec3 dir, float dist)
+		// point on the lamp, as lightReaches does for the level's lights,
+		// and what of it glass on the way lets through.
+		vec3 flashlightReaches(vec3 position, vec3 dir, float dist)
 		{
 			vec3 across = normalize(cross(dir, abs(dir.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
 			vec3 along = cross(dir, across);
@@ -1377,7 +1465,7 @@ static std::string TraceCommon()
 			float a = 6.2831853 * randomFloat();
 			vec3 toTarget = dir * dist + (across * cos(a) + along * sin(a)) * r;
 			float d = length(toTarget);
-			return !occludedBy(position, toTarget / d, d - RayEpsilon * 2.0, FlashlightRays);
+			return occludedBy(position, toTarget / d, d - RayEpsilon * 2.0, FlashlightRays) ? vec3(0.0) : shadowTint;
 		}
 
 		// The beam in the air between the eye and what it meets: the light
@@ -1651,6 +1739,7 @@ static std::string TraceCommon()
 				return vec3(0.0);
 			if (occludedBy(p, dir, dist - 1.0, ShadowRays))
 				return vec3(0.0);
+			glow *= shadowTint;
 			float pdfLight = (chosenWeight / total) * dist2 / (area * cosE);
 			float pdfBounce = pdfScale * cosX / 3.14159265;
 			return glow * (GlowScale * cosX / 3.14159265 / (pdfLight + pdfBounce));
@@ -1852,6 +1941,90 @@ static std::string TraceCommon()
 				passed[passedCount++] = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, true), primitive);
 			}
 			return max(travelled, 1.0);
+		}
+
+		// Wet streets (the device's Wetness). How wet a point of the level is:
+		// ground in a zone open to the sky (a level surface's Ambient.w over
+		// 3.5), facing up, with nothing above it but the sky - an awning, a
+		// balcony or a glass roof keeps what is under it dry, a grate's holes
+		// let the rain through. Straight up rather than a spread of
+		// directions, so the edge of what is covered stays put from one frame
+		// to the next, as the denoiser needs the surface it is told of to.
+		float wetnessAt(TriangleAttributes attr, vec3 position, vec3 normal)
+		{
+			if (Wetness <= 0.0 || attr.Ambient.w < 3.5 || normal.z < 0.7 || attr.UV2Tex.w > 1.5 || attr.Emission.w > 0.5)
+				return 0.0;
+			vec3 up = vec3(0.0, 0.0, 1.0);
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsNoneEXT, RainRays, position + normal * 0.5, RayEpsilon, up, 65536.0);
+			while (rayQueryProceedEXT(rq))
+			{
+				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+				{
+					int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+					int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+					// Smoke and a lamp's corona keep no rain off.
+					if (tris[attributeBase + primitive].Emission.w < 1.5 &&
+						confirmCandidate(attributeBase, primitive, rayQueryGetIntersectionBarycentricsEXT(rq, false), false, up,
+							mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
+						rayQueryConfirmIntersectionEXT(rq);
+				}
+			}
+			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+			{
+				float kind = tris[rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) + rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)].UV2Tex.w;
+				if (kind < 4.5)
+					return 0.0;
+			}
+			return clamp(Wetness, 0.0, 1.0) * smoothstep(0.7, 0.85, normal.z);
+		}
+
+		float puddleHash(ivec2 cell)
+		{
+			return float(pcgHash(uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u)) * (1.0 / 4294967296.0);
+		}
+
+		float puddleNoise(vec2 p)
+		{
+			ivec2 c = ivec2(floor(p));
+			vec2 f = fract(p);
+			f = f * f * (3.0 - 2.0 * f);
+			return mix(mix(puddleHash(c), puddleHash(c + ivec2(1, 0)), f.x),
+				mix(puddleHash(c + ivec2(0, 1)), puddleHash(c + ivec2(1, 1)), f.x), f.y);
+		}
+
+		// Where the water lies, over one field fixed to the ground: in its
+		// hollows the ground is only damp; rising towards the puddles a film
+		// of water gathers (x), sheen by sheen; and at the top of it water
+		// stands (y), on what is flat. The wetter it is, the further the
+		// film spreads and the more water stands. A film over all of it
+		// alike was one flat sheen across the whole street.
+		vec2 wetPatches(vec3 position, vec3 normal, float wet)
+		{
+			float n = 0.65 * puddleNoise(position.xy / 260.0) + 0.35 * puddleNoise(position.xy / 70.0 + vec2(17.3, 41.9));
+			float film = smoothstep(0.66 - 0.2 * wet, 0.66, n) * wet;
+			float puddle = smoothstep(0.62, 0.68, n) * smoothstep(0.97, 0.995, normal.z) * smoothstep(0.3, 0.8, wet);
+			return vec2(film, puddle);
+		}
+
+		// A surface made wet: darker all over, as water fills its pores;
+		// where a film has gathered, darker again and shining, its
+		// reflection sharper the more water there is; and a mirror where
+		// water stands. The reflection is traced, so the neon across the
+		// street shows in it.
+		void wetten(inout Material m, inout vec3 albedo, float wet, vec2 patches)
+		{
+			if (wet <= 0.0)
+				return;
+			float film = patches.x, puddle = patches.y;
+			albedo *= mix(1.0, 0.65, wet) * mix(1.0, 0.8, film) * mix(1.0, 0.7, puddle);
+			if (film <= 0.0 && puddle <= 0.0)
+				return;
+			m.roughness = mix(m.roughness, mix(0.25, 0.02, puddle), max(film, puddle));
+			m.metalness *= 1.0 - puddle;
+			m.reflectance = max(m.reflectance, 0.02);
+			m.glossy = m.glossy || m.roughness < 0.8;
+			m.traced = m.roughness < 0.5 && GlossBounces > 0u;
 		}
 	)";
 
@@ -2112,7 +2285,7 @@ std::string Shaders::Trace()
 						if (!inSky)
 						{
 							airDistance = distance(CameraOrigin.xyz, origin + direction * t);
-							primaryFogged = attr.Ambient.w > 1.5 || abs(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w) > 32.0;
+							primaryFogged = mod(attr.Ambient.w, 4.0) > 1.5 || abs(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w) > 32.0;
 						}
 						primaryDistance = t;
 						primaryPosition = origin + direction * t;
@@ -2272,6 +2445,14 @@ std::string Shaders::Trace()
 									contribution += attr.Albedo.rgb * flashBase * dot(normal, flashDir);
 							}
 							radiance += throughput * contribution;
+							// A path gathering light, rather than the view looking
+							// through, is tinted by the glass as a shadow ray is:
+							// the light behind stained glass bounces in coloured,
+							// and a glowing surface behind it is the same colour
+							// whichever way it is found.
+							if (bounce > firstBounce)
+								throughput *= glassTransmittance(attributeBase, primitive, rayQueryGetIntersectionBarycentricsEXT(rq, true),
+									direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true)));
 						}
 
 						origin = position;
@@ -2310,6 +2491,17 @@ std::string Shaders::Trace()
 					bool unlitSurface = attr.Emission.w > 0.5;
 					bool firstSurface = bounce == 0u && !surfaceFound && !inSky && (!unlitSurface || attr.UV2Tex.w > 2.5) &&
 						(Params.w < 0.5 || Params.w > 2.5);
+					// Wet streets, on the first surface the view meets: what
+					// it reflects, and anything further along a path, is
+					// shaded dry.
+					float wet = 0.0;
+					vec2 wetness = vec2(0.0);
+					if (firstSurface && lobePass == 0 && Wetness > 0.0)
+					{
+						wet = wetnessAt(attr, position, normal);
+						if (wet > 0.0)
+							wetness = wetPatches(position, normal, wet);
+					}
 					// Likewise the first lit surface seen in a mirror. A mirror
 					// seen in a mirror gives only its own half here: its
 					// reflection would need a third pass.
@@ -2345,9 +2537,11 @@ std::string Shaders::Trace()
 						// Worked out here and again where it is shaded rather
 						// than kept in between.
 						Material material = surfaceMaterial(attr);
+						vec3 surfaceColour = attr.Albedo.rgb;
+						wetten(material, surfaceColour, wet, wetness);
 						vec3 toEye = -direction;
 						vec3 f0, shineAlbedo, diffuseColour;
-						splitColour(material, attr.Albedo.rgb,
+						splitColour(material, surfaceColour,
 							max(abs(dot(normal, toEye)), 1.0e-4), f0, shineAlbedo, diffuseColour);
 						diffuseAlbedo = surfaceThroughput * diffuseColour * (mirror ? 0.5 : 1.0);
 						// Unlit, its half is exactly its texture: emission, with no
@@ -2407,6 +2601,9 @@ std::string Shaders::Trace()
 						continue;
 					}
 
+	)";
+
+	source += R"(
 					// Debug: light every instance that is not the static world, so
 					// that "the actors are not being drawn" can be told apart from
 					// "the actors are drawn and too dark to see". The static world
@@ -2485,8 +2682,12 @@ std::string Shaders::Trace()
 					// Not in the skybox, which is somewhere else entirely.
 					vec3 flashBase, flashDir;
 					float flashDistance;
-					bool flashLit = !inSky && flashlightAt(lifted, normal, flashBase, flashDir, flashDistance) &&
-						flashlightReaches(lifted, flashDir, flashDistance);
+					bool flashLit = !inSky && flashlightAt(lifted, normal, flashBase, flashDir, flashDistance);
+					if (flashLit)
+					{
+						flashBase *= flashlightReaches(lifted, flashDir, flashDistance);
+						flashLit = luminance(flashBase) > 0.0;
+					}
 					if (flashLit)
 						lit += flashBase * dot(normal, flashDir);
 
@@ -2494,9 +2695,11 @@ std::string Shaders::Trace()
 					// A surface seen in a mirror is captured as matte, since its
 					// own reflection would need a pass of its own.
 					Material material = reflectedSurface ? matte() : surfaceMaterial(attr);
+					vec3 surfaceColour = attr.Albedo.rgb;
+					wetten(material, surfaceColour, wet, wetness);
 					vec3 toEye = -direction;
 					vec3 f0, shineAlbedo, diffuseColour;
-					splitColour(material, attr.Albedo.rgb, max(dot(normal, toEye), 1.0e-4), f0, shineAlbedo, diffuseColour);
+					splitColour(material, surfaceColour, max(dot(normal, toEye), 1.0e-4), f0, shineAlbedo, diffuseColour);
 					bool glossCapture = firstSurface && material.glossy;
 					// Which way the path goes on from here is chosen below, a
 					// glossy surface's in proportion to what each half
