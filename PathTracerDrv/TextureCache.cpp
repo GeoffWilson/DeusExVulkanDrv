@@ -14,6 +14,7 @@ TextureCache::~TextureCache()
 
 void TextureCache::Clear()
 {
+	Changed.clear();
 	Textures.clear();
 }
 
@@ -23,7 +24,24 @@ CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
 
 	auto it = Textures.find(key);
 	if (it != Textures.end())
-		return it->second.get();
+	{
+		// One that draws itself says so as the engine ticks it: its new
+		// picture is taken, once a frame, and the flag cleared, as the other
+		// devices clear it once they have it.
+		CachedTexture* cached = it->second.get();
+		if (info.bRealtimeChanged && cached->ChangedFrame != Frame)
+		{
+			int width = 0, height = 0;
+			if (ConvertPixels(info, masked, cached->NewPixels, width, height) && width == cached->Width && height == cached->Height)
+			{
+				cached->ChangedFrame = Frame;
+				Changed.push_back(cached);
+			}
+			if (info.Texture)
+				info.Texture->bRealtimeChanged = 0;
+		}
+		return cached;
+	}
 
 	auto cached = Upload(info, masked);
 	CachedTexture* result = cached.get();
@@ -231,6 +249,10 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 		return nullptr;
 
 	auto cached = std::make_unique<CachedTexture>();
+	cached->Width = width;
+	cached->Height = height;
+	if (info.Texture)
+		info.Texture->bRealtimeChanged = 0;
 
 	cached->Image = ImageBuilder()
 		.Format(VK_FORMAT_R8G8B8A8_UNORM)
@@ -279,6 +301,39 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 	unguard;
 }
 
+
+void TextureCache::RecordChanges(VulkanCommandBuffer* commands)
+{
+	for (CachedTexture* cached : Changed)
+	{
+		const size_t byteSize = cached->NewPixels.size() * sizeof(uint32_t);
+		if (!cached->Staging)
+		{
+			cached->Staging = BufferBuilder()
+				.Size(byteSize)
+				.Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+				.DebugName("PathTracerTileChange")
+				.Create(renderer->GetDevice());
+		}
+		void* mapped = cached->Staging->Map(0, byteSize);
+		memcpy(mapped, cached->NewPixels.data(), byteSize);
+		cached->Staging->Unmap();
+
+		VulkanImage* image = cached->Image.get();
+		PipelineBarrier()
+			.AddImage(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+			.Execute(commands, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkBufferImageCopy region = {};
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent = { (uint32_t)cached->Width, (uint32_t)cached->Height, 1 };
+		commands->copyBufferToImage(cached->Staging->buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		PipelineBarrier()
+			.AddImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+			.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	}
+	Changed.clear();
+}
 
 // One mip of a texture read straight off the object rather than through
 // UTexture::Lock. Lock expects to be called while the engine is handing
@@ -448,6 +503,46 @@ bool TextureCache::Animates(UTexture* texture)
 	return texture && (texture->bRealtime || texture->bParametric || texture->AnimNext != nullptr);
 }
 
+// How fast an animation chain runs when the frame a surface starts it on sets
+// no speed of its own. The engine steps such a chain once every frame it
+// renders, so it ran two to four times as fast here, at 80 to 120 frames a
+// second, as in a rasteriser at 30 to 50 - and a level can start a chain
+// partway along: the radar screens use radar_A02 of a chain whose radar_A00
+// sets 8 frames a second. So the speed any frame of the chain sets, after it
+// or leading into it, or 30 frames a second where none does.
+static float ChainRate(UTexture* texture)
+{
+	static std::unordered_map<UTexture*, std::pair<FName, float>> rates;
+	auto found = rates.find(texture);
+	if (found != rates.end() && found->second.first == texture->GetFName())
+		return found->second.second;
+
+	float rate = 0.0f;
+	std::unordered_set<UTexture*> chain;
+	for (UTexture* t = texture; t && !chain.count(t) && chain.size() < 1000; t = t->AnimNext)
+	{
+		chain.insert(t);
+		if (rate <= 0.0f && t->MaxFrameRate > 0.0f)
+			rate = t->MaxFrameRate;
+	}
+	for (bool grew = true; grew && rate <= 0.0f; )
+	{
+		grew = false;
+		for (TObjectIterator<UTexture> it; it && rate <= 0.0f; ++it)
+			if (it->AnimNext && chain.count(it->AnimNext) && !chain.count(*it))
+			{
+				chain.insert(*it);
+				grew = true;
+				if (it->MaxFrameRate > 0.0f)
+					rate = it->MaxFrameRate;
+			}
+	}
+	if (rate <= 0.0f)
+		rate = 30.0f;
+	rates[texture] = { texture->GetFName(), rate };
+	return rate;
+}
+
 bool TextureCache::AnimatedPixels(UTexture* texture, bool masked, double time, int width, int height, UTexture*& lastFrame, std::vector<uint32_t>& pixels)
 {
 	guard(TextureCache::AnimatedPixels);
@@ -476,7 +571,24 @@ bool TextureCache::AnimatedPixels(UTexture* texture, bool masked, double time, i
 		texture->Lock(locked, time, 0, nullptr);
 		texture->Unlock(locked);
 	}
-	UTexture* frame = texture->Get(time);
+	// A chain that sets its own speed is left to the engine, which paces it by
+	// the clock. One that does not is stepped here by the clock at the speed
+	// ChainRate finds, round the frames the engine steps it round: on along
+	// the chain from the one the surface uses, and back to it at the end.
+	UTexture* frame = nullptr;
+	if (!regenerates && texture->AnimNext && texture->MaxFrameRate <= 0.0f)
+	{
+		int length = 1;
+		for (UTexture* t = texture->AnimNext; t && t != texture && length < 1000; t = t->AnimNext)
+			length++;
+		const long long step = (long long)std::floor(time * ChainRate(texture));
+		int index = (int)(step % length);
+		frame = texture;
+		for (int i = 0; i < index; i++)
+			frame = frame->AnimNext ? frame->AnimNext : texture;
+	}
+	else
+		frame = texture->Get(time);
 	if (!frame)
 		return false;
 

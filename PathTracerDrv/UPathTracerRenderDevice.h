@@ -239,8 +239,12 @@ private:
 		bool Animated = false;
 		int Width = 0, Height = 0;
 		UTexture* LastFrame = nullptr;
+		// How many times its frame has been sent anew, for PT LOOK.
+		uint32_t Advances = 0;
 	};
 	std::vector<SentTexture> SentTextures;
+	// When PT LOOK last counted the animations' advances.
+	double AdvancesSince = 0.0;
 	// Whether the helper has the level's shadow masks (Scene.Lightmaps).
 	bool LightmapsSent = false;
 	std::vector<uint32_t> Pixels;
@@ -269,6 +273,11 @@ private:
 	INT LightmapProbeSurf = -1;
 	FVector LightmapProbePoint;
 	uint32_t LightmapProbeUntil = 0;
+	// PT LOOK TIME: the engine's lightmap at the spot every frame for a while.
+	INT LightmapSeriesSurf = -1;
+	FVector LightmapSeriesPoint;
+	int LightmapSeriesFrames = 0;
+	uint32_t LightmapSeriesLastFrame = 0;
 	// PT TILES: log what the canvas hands the device in the frame after,
 	// armed by the command and live from that frame's Lock.
 	bool LogDrawsArmed = false;

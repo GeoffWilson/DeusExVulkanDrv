@@ -189,10 +189,28 @@ std::string Shaders::Trace()
 			// third vertices; the first takes up the remainder.
 			// Emission.xy is how fast an auto panning surface slides, in
 			// texture widths a second, and zero for everything else.
-			return attr.UV01.xy * (1.0 - bary.x - bary.y)
-			     + attr.UV01.zw * bary.x
-			     + attr.UV2Tex.xy * bary.y
-			     + attr.Emission.xy * Time;
+			vec2 uv = attr.UV01.xy * (1.0 - bary.x - bary.y)
+			        + attr.UV01.zw * bary.x
+			        + attr.UV2Tex.xy * bary.y
+			        + attr.Emission.xy * Time;
+
+			// The engine's small wave (PF_SmallWavy, which marks the surface
+			// with an Albedo.w of 2): its texture swaying on the level's clock
+			// by 8 sin t + 4 cos 2.3t texels across and 8 cos t + 4 sin 2.3t
+			// down, as Render.dll pans it, in widths of the texture's own
+			// size - the material's w, its width plus 4096 times its height.
+			if (attr.Albedo.w > 1.5)
+			{
+				int index = int(attr.UV2Tex.z);
+				if (index >= 0 && index < 1024)
+				{
+					float packed = materials[index].w;
+					vec2 size = vec2(mod(packed, 4096.0), floor(packed / 4096.0));
+					if (size.x > 0.0 && size.y > 0.0)
+						uv += vec2(8.0 * sin(Time) + 4.0 * cos(2.3 * Time), 8.0 * cos(Time) + 4.0 * sin(2.3 * Time)) / size;
+				}
+			}
+			return uv;
 		}
 
 		// Which mip level a hit samples its texture at, from how wide the ray's
@@ -726,8 +744,18 @@ std::string Shaders::Trace()
 		// drift towards new randoms over about a second. So a torch or a fire
 		// flickers across the surfaces it lights rather than as a whole, and
 		// shimmer ripples slowly. The texel becomes a cell of the level.
-		float waver(vec3 position, float pattern)
+		float waver(vec3 position, float pattern, vec3 lightPosition)
 		{
+			// The slow and fast waves (Render.dll's FUN_10b03de0 and
+			// FUN_10b040b0): rings running out from the light at 35 units a
+			// second, 64 units apart, or 32 for the fast one - 0.7 + 0.3 sin
+			// of the whole units out, less 35 a second, in turns of that.
+			if (pattern > 5.5)
+			{
+				float wavelength = pattern > 6.5 ? 32.0 : 64.0;
+				float away = floor(distance(position, lightPosition));
+				return 0.7 + 0.3 * sin((away - 35.0 * Time) * (6.2831853 / wavelength));
+			}
 			if (pattern < 3.5)
 				return 0.95 + 0.05 * cellNoise(position, Counts.x);
 			if (pattern < 4.5)
@@ -896,7 +924,7 @@ std::string Shaders::Trace()
 			{
 				// The wavers, which Render.dll applies to each lightmap
 				// texel a light reaches: see waver().
-				disco = waver(position, light.Flags.w);
+				disco = waver(position, light.Flags.w, light.PositionRadius.xyz);
 			}
 			else if (light.Flags.w > -0.5)
 			{
@@ -919,14 +947,17 @@ std::string Shaders::Trace()
 				}
 				else if (light.Flags.w < 1.5)
 				{
-					// Searchlight: four beams, each a quarter turn apart
-					// and an eighth wide, sweeping round. Dark in the
-					// first half of each quarter, and ramping up across
-					// the beam to its trailing edge. C's fmod keeps the
-					// sign, which is what the engine used.
+					// Searchlight: one beam a quarter turn wide, sweeping
+					// round once every 8 pi of the offset - four times the
+					// angle around the light plus the offset, folded by 8 pi
+					// (Render.dll's FUN_10b03770 pushes 8 pi, not 2 pi, to
+					// its fmod, which a police car's lights coming round
+					// four times too fast gave away), lit from pi to 3 pi,
+					// brightest in the middle. C's fmod keeps the sign,
+					// which is what the engine used.
 					float x = 4.0 * yaw + light.DirectionCone.x;
-					x = x - 6.2831853 * trunc(x / 6.2831853);
-					if (x < 3.1415927)
+					x = x - 25.132741 * trunc(x / 25.132741);
+					if (x < 3.1415927 || x > 9.424778)
 						return false;
 					disco = 0.5 + 0.5 * cos(x);
 					float nearAxis = across2 * 6.0e-5;

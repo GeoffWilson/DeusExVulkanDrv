@@ -20,6 +20,13 @@ struct CachedTexture
 	bool Masked = false;
 	// Which link of an animation chain is currently in the image.
 	UTexture* LastFrame = nullptr;
+	// A texture that draws itself - fire, the static the vision augmentation
+	// dresses people in - with its new picture, waiting to go in before the
+	// tiles are drawn (TextureCache::RecordChanges), the frame it was taken
+	// on, and where it is staged.
+	std::vector<uint32_t> NewPixels;
+	uint32_t ChangedFrame = 0;
+	std::unique_ptr<VulkanBuffer> Staging;
 	std::unique_ptr<VulkanImage> Image;
 	std::unique_ptr<VulkanImageView> View;
 	std::unique_ptr<VulkanDescriptorSet> Sets[4];
@@ -71,7 +78,15 @@ public:
 
 	void Clear();
 
+	// A new frame: a texture that changes is taken again at most once a frame.
+	void BeginFrame() { Frame++; }
+	// The frame's changed textures copied in, once the frame before is done
+	// drawing with them.
+	void RecordChanges(VulkanCommandBuffer* commands);
+
 private:
+	uint32_t Frame = 1;
+	std::vector<CachedTexture*> Changed;
 	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked);
 
 

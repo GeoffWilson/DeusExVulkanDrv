@@ -1538,6 +1538,8 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 		TileBatches.clear();
 		InsetViews.clear();
 		CollectedThisFrame = false;
+		if (Textures)
+			Textures->BeginFrame();
 		LogDraws = LogDrawsArmed;
 		LogDrawsArmed = false;
 		LoggedDraws = 0;
@@ -1699,7 +1701,10 @@ bool UPathTracerRenderDevice::SendScene()
 			if (!sent.Width || Scene.FixedFrames.count(sent.Source) || !TextureCache::Animates(sent.Source))
 				continue;
 			if (TextureCache::AnimatedPixels(sent.Source, sent.Masked, time, sent.Width, sent.Height, sent.LastFrame, Pixels))
+			{
 				Tracer->TexturePixels((uint32_t)i, (uint32_t)sent.Width, (uint32_t)sent.Height, Pixels.data());
+				sent.Advances++;
+			}
 		}
 	}
 	Timings.Textures += NowMs() - texturesStart;
@@ -2006,7 +2011,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		}
 
 		// HUD, menus and console on top of the traced world, and the game's
-		// Brightness over the lot.
+		// Brightness over the lot - with the new pictures of the 2D textures
+		// that draw themselves, now the last frame is done with them.
+		if (Textures)
+			Textures->RecordChanges(commands.get());
 		RenderTiles(commands.get());
 		ApplyBrightness(commands.get());
 
@@ -2274,6 +2282,9 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		// The same for whatever is under the crosshair.
 		if (ParseCommand(&Cmd, TEXT("LOOK")))
 		{
+			// PT LOOK TIME: the engine's own lightmap at the spot as well,
+			// every frame for four seconds, with the level's clock.
+			const bool series = ParseCommand(&Cmd, TEXT("TIME"));
 			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
 			if (!player || !player->XLevel)
 				return 1;
@@ -2311,6 +2322,23 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 						package = package->GetOuter();
 					if (package)
 						appFindPackageFile(package->GetName(), NULL, file);
+					// How it animates, as the engine paces it, and how often
+					// the trace has actually taken a new frame of it since the
+					// last look.
+					if (texture->AnimNext || texture->bRealtime || texture->bParametric)
+					{
+						int chain = 1;
+						for (UTexture* t = texture->AnimNext; t && t != texture && chain < 1000; t = t->AnimNext)
+							chain++;
+						const double now = appSeconds();
+						for (SentTexture& sent : SentTextures)
+							if (sent.Source == texture)
+								debugf(TEXT("PT: animation: %d frames, MaxFrameRate %.2f MinFrameRate %.2f, realtime %d; the trace took %d new frames in the last %.2f seconds"),
+									chain, texture->MaxFrameRate, texture->MinFrameRate, (int)texture->bRealtime, (int)sent.Advances, now - AdvancesSince);
+						for (SentTexture& sent : SentTextures)
+							sent.Advances = 0;
+						AdvancesSince = now;
+					}
 					Ar.Logf(TEXT("PT: texture %dx%d from %s%s"), (int)texture->USize, (int)texture->VSize, file[0] ? file : TEXT("?"),
 						texture->bHasComp && texture->CompMips.Num() > 0
 							? *FString::Printf(TEXT(", S3TC %dx%d%s"), (int)texture->CompMips(0).USize, (int)texture->CompMips(0).VSize, UseS3TC ? TEXT("") : TEXT(" (UseS3TC off)"))
@@ -2332,6 +2360,12 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				LightmapProbeSurf = node.iSurf;
 				LightmapProbePoint = hit.Location;
 				LightmapProbeUntil = FrameIndex + 30;
+				if (series)
+				{
+					LightmapSeriesSurf = node.iSurf;
+					LightmapSeriesPoint = hit.Location;
+					LightmapSeriesFrames = 480;
+				}
 				// The lights the level's build baked into this surface's
 				// lightmap, and how much of each one's shadow mask it left lit:
 				// what the engine's own shadows are made of.
@@ -2716,6 +2750,33 @@ void UPathTracerRenderDevice::Exit()
 // for the surface, which is the ground truth PT LOOK compares the trace with.
 void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet)
 {
+	// PT LOOK TIME: the texel at the spot, once a frame, with the level's
+	// clock and the real one, and whether the engine rebuilt the lightmap -
+	// how fast the engine's own lighting effects really run.
+	if (LightmapSeriesFrames > 0 && FrameIndex != LightmapSeriesLastFrame && Surface.LightMap && Surface.Level && Facet.Polys)
+	{
+		UModel* m = Surface.Level->Model;
+		bool mine = false;
+		for (FSavedPoly* p = Facet.Polys; p && !mine; p = p->Next)
+			mine = p->iNode >= 0 && p->iNode < m->Nodes.Num() && m->Nodes(p->iNode).iSurf == LightmapSeriesSurf;
+		FLightMapIndex* index = mine ? m->GetLightMapIndex(LightmapSeriesSurf) : nullptr;
+		FTextureInfo* lm = Surface.LightMap;
+		if (index && lm->Mips[0] && lm->Mips[0]->DataPtr && lm->UClamp > 0 && lm->VClamp > 0)
+		{
+			const FBspSurf& surf = m->Surfs(LightmapSeriesSurf);
+			const FVector d = LightmapSeriesPoint - m->Points(surf.pBase);
+			const float u = ((d | m->Vectors(surf.vTextureU)) - index->Pan.X) / index->UScale;
+			const float v = ((d | m->Vectors(surf.vTextureV)) - index->Pan.Y) / index->VScale;
+			const INT x = Clamp(appRound(u), 0, lm->UClamp - 1), y = Clamp(appRound(v), 0, lm->VClamp - 1);
+			const FColor& t = ((const FColor*)lm->Mips[0]->DataPtr)[x + y * lm->Mips[0]->USize];
+			ALevelInfo* info = Surface.Level->GetLevelInfo();
+			debugf(TEXT("PT LOOK TIME: level %.4f real %.4f lightmap %d %d %d%s"), info ? info->TimeSeconds : 0.0f, appSeconds(),
+				(int)t.B, (int)t.G, (int)t.R, lm->bRealtimeChanged ? TEXT(" rebuilt") : TEXT(""));
+			LightmapSeriesLastFrame = FrameIndex;
+			LightmapSeriesFrames--;
+		}
+	}
+
 	if (LightmapProbeSurf < 0)
 		return;
 	if (FrameIndex > LightmapProbeUntil)

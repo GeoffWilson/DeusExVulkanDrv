@@ -259,6 +259,17 @@ bool LevelScene::BuildStatic(ULevel* level)
 	// light that moves, and a lamp that is shot out stops being one - none of
 	// which a list built once at level load can express.
 
+	// Where to look for the engine's rarer effects, which the trace has.
+	int wavySurfaces = 0, waveLights = 0;
+	for (INT i = 0; i < level->Model->Surfs.Num(); i++)
+		if (level->Model->Surfs(i).PolyFlags & PF_SmallWavy)
+			wavySurfaces++;
+	for (INT i = 0; i < level->Actors.Num(); i++)
+		if (level->Actors(i) && (level->Actors(i)->LightEffect == LE_SlowWave || level->Actors(i)->LightEffect == LE_FastWave))
+			waveLights++;
+	if (wavySurfaces || waveLights)
+		debugf(TEXT("PathTracer: %d small wavy surfaces, %d lights with slow or fast waves"), wavySurfaces, waveLights);
+
 	SourceLevel = level;
 	SourceNodeCount = level->Model->Nodes.Num();
 	GeometryAdded = true;
@@ -564,6 +575,10 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 			if (panU != 0.0f || panV != 0.0f)
 				attr.Albedo.w = 1.0f;
 		}
+		// A small wavy surface - water, mostly - sways its texture on the
+		// level's clock (surfaceUV in the shader), and keeps no history either.
+		if ((surf.PolyFlags & PF_SmallWavy) && uScale > 0.0f)
+			attr.Albedo.w = 2.0f;
 
 		auto surfaceUV = [&](const FVector& point) -> vec2
 		{
@@ -721,7 +736,8 @@ void LevelScene::AddLight(AActor* actor)
 	// ever pulsed, blinked or flickered.
 	float brightness = actor->LightBrightness / 255.0f;
 	const bool waver = actor->LightEffect == LE_TorchWaver || actor->LightEffect == LE_FireWaver || actor->LightEffect == LE_WateryShimmer;
-	bool changing = actor->LightEffect == LE_Disco || actor->LightEffect == LE_Searchlight || actor->LightEffect == LE_Rotor || waver;
+	const bool waves = actor->LightEffect == LE_SlowWave || actor->LightEffect == LE_FastWave;
+	bool changing = actor->LightEffect == LE_Disco || actor->LightEffect == LE_Searchlight || actor->LightEffect == LE_Rotor || waver || waves;
 	const double seconds = actor->Level ? (double)actor->Level->TimeSeconds : 0.0;
 	const double cycle = seconds * 35.0 / Max((int)actor->LightPeriod, 1) + actor->LightPhase / 256.0;
 	const float wave = (float)std::sin(cycle * 2.0 * PI);
@@ -784,12 +800,14 @@ void LevelScene::AddLight(AActor* actor)
 	}
 	// Patterns worked out in the shader with the engine's own formulas, read
 	// out of Render.dll: 0 disco, 1 searchlight, 2 rotor, 3 torch waver,
-	// 4 fire waver, 5 watery shimmer, -1 none.
+	// 4 fire waver, 5 watery shimmer, 6 slow wave, 7 fast wave, -1 none.
 	float pattern = -1.0f;
 	if (actor->LightEffect == LE_Disco)
 		pattern = 0.0f;
 	else if (waver)
 		pattern = 3.0f + (float)(actor->LightEffect - LE_TorchWaver);
+	else if (waves)
+		pattern = actor->LightEffect == LE_SlowWave ? 6.0f : 7.0f;
 	else if (actor->LightEffect == LE_Rotor)
 	{
 		pattern = 2.0f;
@@ -804,12 +822,12 @@ void LevelScene::AddLight(AActor* actor)
 		pattern = 1.0f;
 		// The sweep's offset: the clock over the period, plus the phase in
 		// 64ths of a turn, plus a whole turn. Worked out here in double
-		// precision and brought down to one turn above two, so the shader's
-		// angle stays positive the way the engine's does once any time has
-		// passed.
+		// precision and brought down to within one sweep above one, 8 pi
+		// (see the shader), so the shader's angle stays positive the way
+		// the engine's does once any time has passed.
 		const double sweep = actor->LightPeriod ? seconds * 35.0 / actor->LightPeriod : 0.0;
 		double offset = actor->LightPhase * (PI / 32.0) + sweep + 2.0 * PI;
-		offset = std::fmod(offset, 2.0 * PI) + 4.0 * PI;
+		offset = std::fmod(offset, 8.0 * PI) + 8.0 * PI;
 		light.DirectionCone.x = (float)offset;
 	}
 
@@ -1347,6 +1365,10 @@ int LevelScene::TextureFor(UTexture* texture, bool masked, AActor* owner)
 	Textures.push_back(texture);
 	TextureMasked.push_back(masked);
 	TextureMaterials.push_back(Materials::For(texture, owner));
+	// w: the texture's own size, its width plus 4096 times its height, which
+	// the trace sways a small wavy surface's texture by (surfaceUV).
+	if (texture)
+		TextureMaterials.back().w = (float)Min((int)texture->USize, 4095) + 4096.0f * (float)Min((int)texture->VSize, 4095);
 	TextureIndex[key] = index;
 	return index;
 }
@@ -2214,6 +2236,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 			PlaceIterated(actor, mask, counts);
 
 		PlaceActor(actor, mask, false, counts);
+		if (actor->IsA(APawn::StaticClass()) && PlaceHeldItem((APawn*)actor, mask))
+			counts.Held++;
 	}
 
 	UnshadowFittings();
@@ -2233,8 +2257,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 	if (!SummaryLogged)
 	{
 		SummaryLogged = true;
-		debugf(TEXT("PathTracer placed: %d movers, %d meshes (%d animated), %d meshes skipped, %d hidden"),
-			counts.Brushes, counts.Meshes, counts.Animated, counts.Skipped, hiddenCount);
+		debugf(TEXT("PathTracer placed: %d movers, %d meshes (%d animated), %d meshes skipped, %d hidden, %d held weapons"),
+			counts.Brushes, counts.Meshes, counts.Animated, counts.Skipped, hiddenCount, counts.Held);
 	}
 
 	unguard;
@@ -2360,6 +2384,111 @@ void LevelScene::AddViewModel()
 	memcpy(ViewModelTransform, instance.Transform, sizeof(ViewModelTransform));
 	HaveViewModelTransform = true;
 	Instances.push_back(instance);
+
+	unguard;
+}
+
+// The weapon in a character's hands. A held weapon is a hidden actor, so
+// placing what the level lists as visible left every armed NPC gripping
+// nothing. The engine draws it itself, straight after the character
+// (Render.dll's DrawActorSprite): the pawn's Weapon, or empty handed its
+// SelectedItem, with the item's ThirdPersonMesh and ThirdPersonScale swapped
+// in, its rotation zeroed and the pawn's Style, in the frame DrawLodMesh left
+// from the character's weapon triangle - the mesh's first special face.
+bool LevelScene::PlaceHeldItem(APawn* pawn, uint32_t mask)
+{
+	guard(LevelScene::PlaceHeldItem);
+
+	ULodMesh* lod = Cast<ULodMesh>(pawn->Mesh);
+	if (pawn->DrawType != DT_Mesh || !lod || lod->SpecialFaces.Num() == 0 || lod->ModelVerts <= 0)
+		return false;
+	AInventory* item = pawn->Weapon ? (AInventory*)pawn->Weapon : pawn->SelectedItem;
+	if (!item || !item->ThirdPersonMesh || item->ThirdPersonMesh->AnimFrames <= 0 || item->ThirdPersonScale == 0.0f)
+		return false;
+	const FMeshFace& face = lod->SpecialFaces(0);
+	for (int i = 0; i < 3; i++)
+		if (face.iWedge[i] >= lod->SpecialVerts)
+			return false;
+
+	// The character's pose in world space, which GetFrame hands back with the
+	// attachment points first.
+	INT request = lod->ModelVerts;
+	HeldPoints.resize(lod->SpecialVerts + Max(lod->ModelVerts, lod->FrameVerts) + 1);
+	lod->GetFrame(&HeldPoints[0], sizeof(FVector), GMath.UnitCoords, pawn, request);
+	const FVector a = HeldPoints[face.iWedge[0]];
+	const FVector b = HeldPoints[face.iWedge[1]];
+	const FVector c = HeldPoints[face.iWedge[2]];
+
+	// The frame DrawLodMesh builds: X along the first edge, Y across the
+	// triangle, the origin halfway along the edge from the first corner to
+	// the third. It works in the view's space, whose axes are mirrored against
+	// the world's, so its two cross products change order here.
+	const FVector x = (b - a).SafeNormal();
+	const FVector y = ((a - c) ^ x).SafeNormal();
+	const FVector z = x ^ y;
+	const FVector origin = (a + c) * 0.5f;
+
+	UMesh* mesh = item->ThirdPersonMesh;
+	UTexture* skins[8] = {};
+	for (int i = 0; i < 8; i++)
+	{
+		if (item->GetSkin(i))
+			skins[i] = item->GetSkin(i);
+		else if (item->MultiSkins[i])
+			skins[i] = item->MultiSkins[i];
+		else if (i != 0 && i < mesh->Textures.Num() && mesh->Textures(i))
+			skins[i] = mesh->Textures(i);
+		else if (item->Skin)
+			skins[i] = item->Skin;
+		else if (i < mesh->Textures.Num())
+			skins[i] = mesh->Textures(i);
+	}
+
+	int frameA = 0, frameB = 0;
+	float alpha = 0.0f;
+	AnimationPose(mesh, item->AnimSequence, item->AnimFrame, frameA, frameB, alpha);
+	const int geometryIndex = GeometryForMesh(mesh, frameA, frameA, 0.0f, skins, -1, KindFromStyle(pawn->Style), nullptr, nullptr, item);
+	if (geometryIndex < 0)
+		return false;
+
+	// The item's own placement with its rotation zeroed, taken into the frame.
+	const float s = item->ThirdPersonScale;
+	const FVector axes[3] = { x, y, z };
+	const FVector offset = x * (item->PrePivot.X * s) + y * (item->PrePivot.Y * s) + z * (item->PrePivot.Z * s);
+	SceneInstance instance;
+	instance.GeometryIndex = geometryIndex;
+	instance.Mask = mask;
+	for (int col = 0; col < 3; col++)
+	{
+		instance.Transform[0 * 4 + col] = axes[col].X * s;
+		instance.Transform[1 * 4 + col] = axes[col].Y * s;
+		instance.Transform[2 * 4 + col] = axes[col].Z * s;
+	}
+	instance.Transform[0 * 4 + 3] = origin.X + offset.X;
+	instance.Transform[1 * 4 + 3] = origin.Y + offset.Y;
+	instance.Transform[2 * 4 + 3] = origin.Z + offset.Z;
+
+	// Its history is kept as any actor's is. The item is hidden, so nothing
+	// else places it under the same key.
+	PlacedPose pose;
+	pose.GeometryIndex = geometryIndex;
+	memcpy(pose.Transform, instance.Transform, sizeof(pose.Transform));
+	auto previous = PreviousPoses.find(item);
+	const bool moved = (previous == PreviousPoses.end()) || previous->second != pose;
+	CurrentPoses[item] = pose;
+	if (previous != PreviousPoses.end())
+	{
+		instance.HasPrevious = true;
+		memcpy(instance.PreviousTransform, previous->second.Transform, sizeof(instance.PreviousTransform));
+	}
+
+	// Lit where the character is: the engine hands the pawn over as the
+	// weapon's light sink.
+	const float glow = UnlitMeshGlow(item);
+	const vec3 ambient = item->bUnlit ? vec3(glow, glow, glow) : MeshAmbient(item, pawn->Region.Zone);
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved, item->ScaleGlow));
+	Instances.push_back(instance);
+	return true;
 
 	unguard;
 }

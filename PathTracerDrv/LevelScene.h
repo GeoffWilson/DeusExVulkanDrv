@@ -58,7 +58,7 @@ private:
 	// What was placed, for the log.
 	struct PlaceCounts
 	{
-		int Brushes = 0, Meshes = 0, Animated = 0, Skipped = 0;
+		int Brushes = 0, Meshes = 0, Animated = 0, Skipped = 0, Held = 0;
 	};
 	void PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCounts& counts);
 	// Meshes placed this frame that could be a light's fitting - any mesh
@@ -195,6 +195,9 @@ public:
 	// How many animated shapes were rebuilt this frame.
 	int MeshBuilds = 0;
 	void AddViewModel();
+	bool PlaceHeldItem(APawn* pawn, uint32_t mask);
+	// A character's posed points, reused from one to the next.
+	std::vector<FVector> HeldPoints;
 
 	// Every texture the scene references, in the order the shader's array binds
 	// them. An index rather than a pointer travels into the attribute buffer.

@@ -123,11 +123,23 @@ crash, flushed as they happen.
 - **A sharp HUD**, sampled the way the other devices sample it.
 - **The game's Brightness setting**, applied over the finished picture as
   VulkanDrv applies it; it did nothing before.
-- **Torch and fire waver and watery shimmer**, which lit as steady lights.
+- **Torch and fire waver and watery shimmer**, which lit as steady lights,
+  and the slow and fast waves that roll across a lit surface.
+- **Searchlights and police lights** turning at the engine's speed with one
+  beam, where they swept four beams round at four times the rate.
+- **Wavy water**: surfaces the map marks as wavy drift about as the engine
+  pans them, where they sat still.
+- **Characters hold their weapons**, which were missing from every armed
+  character's hands.
 - **Characters and objects lit as the engine lights them**, brighter and
   flatter than a wall under the same lamp, with a rim from a light behind.
 - **Animated textures on the engine's clock** - fire, water, screens - which
-  could run at the wrong speed, and stopped behind the pause menu.
+  could run at the wrong speed, and stopped behind the pause menu. A texture
+  with no speed of its own, which the engine steps once a frame, runs at its
+  animation's speed, or 30 frames a second, rather than at the frame rate: a
+  radar screen ran ten times too fast. And textures the game redraws
+  itself, such as the vision augmentation's static, keep moving, where they
+  froze on their first picture.
 - **Detail textures**, the fine grain over a wall or floor close up, as Deus
   Ex's own Direct3D renderer lays them on. The game's Detail Textures setting
   switches them.
@@ -158,7 +170,9 @@ straight out of `UModel` and the actor list:
 - the BSP, with its textures, panning, masked, translucent, modulated, unlit,
   mirrored and backdrop surfaces;
 - movers, meshes and characters, posed by the engine itself so animation blends,
-  facial animation and attachments come out as the game draws them, and shaded
+  facial animation and attachments come out as the game draws them, the
+  weapon a character holds fixed where the engine fixes it, to a hidden
+  triangle in the character's hand, and shaded
   with normals smoothed across their faces the way the engine smooths them, so
   a low polygon mesh looks as rounded as it does in the original;
 - sprites, particles (steam, smoke and sparks, and the laser beams, which the
@@ -218,9 +232,10 @@ source and was read by disassembly:
 - light types: pulse, subtle pulse, blink, flicker and strobe, on the engine's
   clock and with its exact formulas;
 - light effects: spotlights (a pawn's following where it looks), static spots,
-  non incidence, cylinder, disco, searchlight and rotor, and the torch and
+  non incidence, cylinder, disco, searchlight and rotor, the torch and
   fire wavers and watery shimmer, which flicker across the surfaces they
-  light a lightmap texel at a time;
+  light a lightmap texel at a time, and the slow and fast waves, bands of
+  light that roll outwards from the light;
 - zone ambient light as the engine works it out: `FGetHSV` at the zone's
   brightness, which puts it through the engine's brightness curve, close to a
   square root. A lightmap starts every texel at half of that, which the
@@ -526,7 +541,11 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   the trace is darker than the other devices, this says which lights the
   engine lets through walls - a map lit before its geometry was finished. For
   an actor it lists the lights in its reach, with their own values and the
-  trace's, and what a surface of it facing them would get.
+  trace's, and what a surface of it facing them would get. Looked at twice,
+  it says how fast the texture there animates: its frames, its speed, and how
+  many frames the trace took in between. `PT LOOK TIME` also logs the
+  engine's lightmap at the spot once a frame for the next 480 frames, to time
+  a light's effect against the engine's own.
 - `PT VIEW NORMALS | DEPTH | MOTION | DIFFUSE | SPECULAR | EMISSION | ALBEDO |
   HITDIST | HISTORY | MATERIAL`: shows one of the denoiser's inputs, how many
   frames each pixel has averaged, or each surface's material (red roughness,
