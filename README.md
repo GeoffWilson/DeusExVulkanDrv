@@ -93,9 +93,9 @@ save they were taken on:
 | --------------------------------------- | ------ | ------- |
 | DLSS Ray Reconstruction at Quality       | about 160 fps | 171.7 fps |
 | GPU a frame, DLSS                        | 5.8 ms | 5.79 ms |
-| NRD                                      | about 95 fps | 96.5 fps |
-| GPU a frame, NRD                         | 10.5 ms | 10.33 ms |
-| Reading the scene out of the engine (CPU)| 2.2 ms | 2.12 ms |
+| NRD                                      | about 95 fps | 97.1 fps |
+| GPU a frame, NRD                         | 10.5 ms | 10.24 ms |
+| Reading the scene out of the engine (CPU)| 2.2 / 2.3 ms | 2.12 / 2.03 ms |
 | One bounce rather than three             | 3.3 ms less GPU | 3.24 ms less |
 
 Every line agrees within the drift between two runs of the same bench, so the
@@ -103,10 +103,11 @@ handoff to the helper costs nothing measurable on either platform and the trace
 is the trace wherever it runs. The 1% lows were if anything steadier on Windows:
 about 155 against a 170 average with DLSS, where Proton's sits nearer 120.
 
-The Windows column is the shipped build except for the two NRD rows, which were
-measured on a locally built one before the difference below was understood.
-Both are GPU bound - the frame and the GPU time agree to a hundredth of a
-millisecond there - so what that build cost on the CPU does not reach them.
+`PT BENCH` wants a settled frame rate: the row it measures first, straight
+after a `PT DLSS` switch, came out 1.4 ms slower than the same settings
+measured again at the end, and slower than every row in between. Read its
+repeat of the settings as they are, at the foot of the table, as the baseline
+the rest should be compared against.
 
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
