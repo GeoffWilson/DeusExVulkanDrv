@@ -2286,7 +2286,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 	// Where the sky is seen from: the sky zone of whichever zone the viewer
 	// is in, or failing that the level's only one. The engine draws it from
-	// that point with the view's own direction, so it never shows parallax.
+	// that point, so it never shows parallax, looking the view's own way
+	// turned by the sky zone's rotation.
 	// Strobe lights all share one switch, flipped whenever the clock moves.
 	if (level && level->GetLevelInfo() && level->GetLevelInfo()->TimeSeconds != LastStrobeTime)
 	{
@@ -2311,6 +2312,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 		{
 			HasSky = true;
 			SkyOrigin = sky->Location;
+			SkyRotation = sky->Rotation;
 		}
 	}
 

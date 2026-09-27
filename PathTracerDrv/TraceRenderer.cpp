@@ -702,7 +702,7 @@ void TraceRenderer::UpdateDescriptors()
 // one, which reads as not having moved.
 void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 jitter, FrameUploads& uploads)
 {
-	const size_t header = 8;
+	const size_t header = 11;
 	const size_t count = Scene.Instances.size();
 	const size_t wanted = header + std::max<size_t>(count, 1) * 3;
 	if (!MotionBuffer || wanted > MotionCapacity)
@@ -724,6 +724,8 @@ void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 j
 	mapped[4] = vec4(jitter.x, jitter.y, frame.GlowLighting, 0.0f);
 	for (int i = 0; i < 3; i++)
 		mapped[5 + i] = frame.Flashlight[i];
+	for (int i = 0; i < 3; i++)
+		mapped[8 + i] = frame.SkyAxes[i];
 	for (size_t i = 0; i < count; i++)
 	{
 		const SceneInstance& instance = Scene.Instances[i];

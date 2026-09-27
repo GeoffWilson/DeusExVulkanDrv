@@ -114,8 +114,9 @@ static std::string TraceCommon()
 		layout(binding = 22, rgba16f) uniform writeonly image2D glossAlbedoImage;
 		// Last frame's camera, as the push constants carry it, this frame's
 		// fixed jitter in xy (see Disable bit 256), the flashlight (see
-		// flashlightAt), then each instance's last placement as three rows.
-		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 previousRows[]; };
+		// flashlightAt), which way the sky zone faces (TraceCommand's
+		// SkyAxes), then each instance's last placement as three rows.
+		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 skyAxes[3]; vec4 previousRows[]; };
 		// Each fog light's shadow cube, written by the pass before the trace
 		// (Shaders::FogShadows) and read by volumetricFog.
 		layout(binding = 26, std430) buffer FogShadows { float fogShadow[]; };
@@ -2113,8 +2114,11 @@ std::string Shaders::Trace()
 					float glow = attr.Emission.w > 1.1 ? pow(max(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].x, 0.0), 2.2) : 1.0;
 
 					// A window onto the sky zone. The engine draws the skybox from
-					// the sky zone's viewpoint in the same direction as the view,
-					// so the ray does exactly that: same direction, new start.
+					// the sky zone's viewpoint, looking the view's way turned by
+					// the sky zone's rotation, so the ray does exactly that:
+					// turned the same, from the new start. Unturned, Liberty
+					// Island's skyline stood well off to the side of where the
+					// engine puts it.
 					// Only once per path - a second window means there is no sky
 					// zone behind this one, and the stand-in sky is all there is.
 					if (kind > 4.5)
@@ -2125,6 +2129,7 @@ std::string Shaders::Trace()
 							primaryFogged = false;
 							glowWeights = 0.0;
 							origin = SkyOrigin.xyz;
+							direction = skyAxes[0].xyz * direction.x + skyAxes[1].xyz * direction.y + skyAxes[2].xyz * direction.z;
 							rayMin = RayEpsilon;
 							// The eye is at the sky zone's viewpoint now, so the
 							// cone starts again from a point there. Carried on from

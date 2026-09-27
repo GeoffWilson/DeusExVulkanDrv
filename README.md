@@ -235,7 +235,8 @@ straight out of `UModel` and the actor list:
 - the player: left out of the view from their own eyes, as the engine leaves
   it out, but seen in mirrors and anything else that reflects, and drawn in
   full when a conversation's camera looks on from outside;
-- the skybox, seen through the sky zone's own viewpoint as the engine draws it;
+- the skybox, seen through the sky zone's own viewpoint and turned by its
+  rotation, as the engine draws it;
 - the vision augmentation: its tints and labels, and the people and bodies it
   shows through walls, which the HUD draws as meshes over the view;
 - the views the HUD draws in windows of their own - a security computer's

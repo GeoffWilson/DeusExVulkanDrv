@@ -170,38 +170,48 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 	// example, where the hole around the arrow is the whole tile. Spreading the
 	// neighbouring opaque colour outwards leaves the alpha alone but gives the
 	// filter something harmless to blend towards.
+	//
+	// Across the texture's edges too, where nothing beside a hole is opaque:
+	// the scene's sampler repeats, so an edge is filtered with the opposite
+	// one. Liberty Island's skyline is opaque down to its bottom row and a
+	// hole along its top, and that row blended with the top's magenta key
+	// drew a purple line under the city.
 	if (masked)
 	{
 		std::vector<uint32_t> bled = pixels;
-		for (int pass = 0; pass < 2; pass++)
+		for (int y = 0; y < height; y++)
 		{
-			for (int y = 0; y < height; y++)
+			for (int x = 0; x < width; x++)
 			{
-				for (int x = 0; x < width; x++)
-				{
-					const size_t i = (size_t)y * width + x;
-					if ((pixels[i] >> 24) != 0)
-						continue;
+				const size_t i = (size_t)y * width + x;
+				if ((pixels[i] >> 24) != 0)
+					continue;
 
-					for (int dy = -1; dy <= 1; dy++)
+				bool found = false;
+				for (int across = 0; across < 2 && !found; across++)
+				{
+					for (int dy = -1; dy <= 1 && !found; dy++)
 					{
-						for (int dx = -1; dx <= 1; dx++)
+						for (int dx = -1; dx <= 1 && !found; dx++)
 						{
-							const int nx = x + dx, ny = y + dy;
-							if (nx < 0 || ny < 0 || nx >= width || ny >= height)
+							int nx = x + dx, ny = y + dy;
+							const bool outside = nx < 0 || ny < 0 || nx >= width || ny >= height;
+							if (outside != (across == 1))
 								continue;
+							nx = (nx + width) % width;
+							ny = (ny + height) % height;
 							const size_t n = (size_t)ny * width + nx;
 							if ((pixels[n] >> 24) == 0)
 								continue;
 							// Its colour, still fully transparent.
 							bled[i] = pixels[n] & 0x00ffffffu;
-							dy = dx = 2;
+							found = true;
 						}
 					}
 				}
 			}
-			pixels = bled;
 		}
+		pixels = bled;
 	}
 
 	auto cached = std::make_unique<CachedTexture>();

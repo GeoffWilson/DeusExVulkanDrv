@@ -241,9 +241,12 @@ public:
 	FVector ViewDown = FVector(0, 1, 0);
 	FVector ViewForward = FVector(0, 0, 1);
 
-	// The sky zone's viewpoint, if the level has one.
+	// The sky zone's viewpoint, if the level has one, and which way it faces:
+	// the engine turns the view by the SkyZoneInfo's rotation before looking
+	// into the skybox (see SkyAxes).
 	bool HasSky = false;
 	FVector SkyOrigin = FVector(0, 0, 0);
+	FRotator SkyRotation = FRotator(0, 0, 0);
 
 	// How many animated shapes were rebuilt this frame.
 	int MeshBuilds = 0;

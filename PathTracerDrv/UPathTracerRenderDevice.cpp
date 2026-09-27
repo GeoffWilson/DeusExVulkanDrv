@@ -2059,6 +2059,13 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.PreviousCamera[2] = previousCamera.Up;
 				frame.PreviousCamera[3] = previousCamera.Forward;
 				frame.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
+				// As Render.dll sets up its skybox camera: the view's coordinate
+				// system divided by the sky zone's rotation, which turns each
+				// axis by it - roll, then pitch, then yaw.
+				const FCoords sky = GMath.UnitCoords / Scene.SkyRotation;
+				frame.SkyAxes[0] = vec4(sky.XAxis.X, sky.XAxis.Y, sky.XAxis.Z, 0.0f);
+				frame.SkyAxes[1] = vec4(sky.YAxis.X, sky.YAxis.Y, sky.YAxis.Z, 0.0f);
+				frame.SkyAxes[2] = vec4(sky.ZAxis.X, sky.ZAxis.Y, sky.ZAxis.Z, 0.0f);
 				for (int i = 0; i < 3; i++)
 					frame.Flashlight[i] = Scene.Flashlight[i];
 				frame.GlowLighting = Max(GlowLighting, 0) / 100.0f;
