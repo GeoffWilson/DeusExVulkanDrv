@@ -1109,8 +1109,18 @@ UBOOL UPathTracerRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBO
 	{
 		SetForegroundWindow(window);
 		SetFocus(window);
-		ReclipCursorToWindow(window);
 	}
+
+	// The clip is not gated on wasActive, and must not be: the foreground can
+	// arrive during SetRes rather than before it, since hiding the splash hands
+	// it to the game window a moment after wasActive was read. Gated, the first
+	// SetRes of all skipped this and left the clip describing the 640x480
+	// window the engine captured while the client had become the whole screen,
+	// so every recentre came back as movement and mouse look span on startup
+	// until an alt-tab re-clipped it. The other three devices have always done
+	// this unconditionally. It is harmless when the game is not in front: the
+	// clip is the desktop then, which ReclipCursorToWindow leaves alone.
+	ReclipCursorToWindow(window);
 
 	SaveConfig();
 	Flush(1);
