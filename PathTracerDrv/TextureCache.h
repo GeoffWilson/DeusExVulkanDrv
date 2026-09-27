@@ -54,7 +54,10 @@ public:
 	// With its mips as the package stores them - the levels the other
 	// devices upload - end to end after it, top first; levels says how many,
 	// stopping at the first that is missing or is not half the one above.
-	static bool SceneMips(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height, int& levels);
+	// With s3tc, a texture that has an S3TC set comes as that instead, still
+	// in its blocks unless it is masked; format says which
+	// (TraceProtocol::TextureRgba8 or TextureBc1).
+	static bool SceneMips(UTexture* texture, bool masked, bool s3tc, std::vector<uint32_t>& pixels, int& width, int& height, int& levels, uint32_t& format);
 
 	// Whether a texture changes by itself - fire, water, a computer screen, the
 	// laser sight's dot, or a chain of frames cycled through.

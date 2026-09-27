@@ -265,14 +265,14 @@ void TraceClient::Lights(const std::vector<SceneLight>& lights, const std::vecto
 	memcpy(p + sizeof(c) + lights.size() * sizeof(SceneLight), fogLights.data(), fogLights.size() * sizeof(SceneLight));
 }
 
-void TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels)
+void TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels, uint32_t format)
 {
 	using namespace TraceProtocol;
 	if (!pixels)
 		width = height = 0;
 	if (!levels)
 		levels = 1;
-	const size_t pixelBytes = MipChainPixels(width, height, width && height ? levels : 0) * 4;
+	const size_t pixelBytes = MipChainBytes(format, width, height, width && height ? levels : 0);
 	const uint32_t bytes = Rounded(sizeof(TextureCommand) + pixelBytes);
 	uint8_t* p = Reserve(bytes);
 	if (!p)
@@ -284,6 +284,7 @@ void TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const
 	c.Height = height;
 	c.Animated = animated ? 1 : 0;
 	c.MipLevels = levels;
+	c.Format = format;
 	c.Material = material;
 	memcpy(p, &c, sizeof(c));
 	if (pixelBytes)

@@ -615,8 +615,9 @@ bool Helper::Batch()
 			TextureCommand c;
 			memcpy(&c, body, sizeof(c));
 			const uint32_t levels = std::max(std::min(c.MipLevels, 16u), 1u);
-			const bool hasPixels = c.Width && c.Height && header.Bytes >= sizeof(c) + MipChainPixels(c.Width, c.Height, levels) * 4;
-			Renderer->SetTexture(c.Index, c.Width, c.Height, levels, hasPixels ? (const uint32_t*)(body + sizeof(c)) : nullptr, c.Material);
+			const uint32_t format = c.Format == TextureBc1 ? TextureBc1 : TextureRgba8;
+			const bool hasPixels = c.Width && c.Height && header.Bytes >= sizeof(c) + MipChainBytes(format, c.Width, c.Height, levels);
+			Renderer->SetTexture(c.Index, c.Width, c.Height, levels, format, hasPixels ? (const uint32_t*)(body + sizeof(c)) : nullptr, c.Material);
 			break;
 		}
 

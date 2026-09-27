@@ -128,7 +128,7 @@ int main(int argc, char** argv)
 {
 	std::vector<const char*> args;
 	int dlss = -1;
-	bool still = false, reference = false, backlight = false, detail = false;
+	bool still = false, reference = false, backlight = false, detail = false, bc1 = false;
 	uint32_t lightSize = 0;
 	for (int i = 1; i < argc; i++)
 	{
@@ -144,6 +144,8 @@ int main(int argc, char** argv)
 			backlight = true;
 		else if (!strcmp(argv[i], "--detail"))
 			detail = true;
+		else if (!strcmp(argv[i], "--bc1"))
+			bc1 = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -297,7 +299,35 @@ int main(int argc, char** argv)
 		}
 
 		client.ResetScene();
-		client.Texture(0, 64, 64, checker.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false, checkerLevels);
+		// --bc1: the checker as S3TC blocks, as New Vision's textures come -
+		// each block one colour, the average of its texels, which the
+		// checker's squares are at the top levels.
+		std::vector<uint32_t> blocks;
+		if (bc1)
+		{
+			size_t level = 0;
+			for (uint32_t l = 0, size = 64; l < checkerLevels; l++, size = size > 1 ? size / 2 : 1)
+			{
+				const uint32_t across = std::max(1u, (size + 3) / 4);
+				for (uint32_t by = 0; by < across; by++)
+					for (uint32_t bx = 0; bx < across; bx++)
+					{
+						uint32_t sum[3] = {}, n = 0;
+						for (uint32_t y = by * 4; y < std::min(size, by * 4 + 4); y++)
+							for (uint32_t x = bx * 4; x < std::min(size, bx * 4 + 4); x++, n++)
+								for (int k = 0; k < 3; k++)
+									sum[k] += (checker[level + y * size + x] >> (k * 8)) & 255u;
+						const uint32_t r = sum[0] / n, g = sum[1] / n, b = sum[2] / n;
+						const uint32_t c = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+						blocks.push_back(c | (c << 16));
+						blocks.push_back(0);
+					}
+				level += (size_t)size * size;
+			}
+			client.Texture(0, 64, 64, blocks.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false, checkerLevels, 1);
+		}
+		else
+			client.Texture(0, 64, 64, checker.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false, checkerLevels);
 		if (detail)
 			client.Texture(1, 64, 64, stripes.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false);
 		client.Geometry(0, world);

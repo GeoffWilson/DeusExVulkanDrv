@@ -1778,6 +1778,7 @@ std::vector<VulkanCompatibleDevice> VulkanDeviceBuilder::FindDevices(const std::
 		enabledFeatures.Features.multiDrawIndirect = deviceFeatures.Features.multiDrawIndirect;
 		enabledFeatures.Features.independentBlend = deviceFeatures.Features.independentBlend;
 		enabledFeatures.Features.imageCubeArray = deviceFeatures.Features.imageCubeArray;
+		enabledFeatures.Features.textureCompressionBC = deviceFeatures.Features.textureCompressionBC;
 		// NRD's denoiser shaders write storage images declared without a format.
 		enabledFeatures.Features.shaderStorageImageWriteWithoutFormat = deviceFeatures.Features.shaderStorageImageWriteWithoutFormat;
 		enabledFeatures.BufferDeviceAddress.bufferDeviceAddress = deviceFeatures.BufferDeviceAddress.bufferDeviceAddress;

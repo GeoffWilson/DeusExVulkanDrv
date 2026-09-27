@@ -127,6 +127,7 @@ crash, flushed as they happen.
 - **Mipmapped textures**: the packages' own mip chains, the levels the other
   devices draw, chosen per ray by how wide its footprint is where it lands,
   so distant floors and walls no longer sparkle and crawl.
+- **New Vision**: its S3TC textures, eight times the originals' size.
 - **Materials off by default** until they have been checked by hand.
 - **Fixes:** a crash loading a save of the map already being played; a crash
   starting the game in a mode narrower than the screen under Proton's Wayland
@@ -201,6 +202,22 @@ full at 107; each after is 4.223 times finer and fades in a 4.223th as far out.
 They multiply the displayed colour, so the linear one takes them to the power
 2.2. The game's Detail Textures setting (`DetailTextures`) switches them, as it
 does in the other devices.
+
+New Vision's packages keep each original texture and add an S3TC version at
+eight times its size beside it; the path tracer uses those (`UseS3TC`), handed
+to the GPU still compressed - a level's worth unpacked would run to gigabytes -
+and read off disk only long enough to send, so the game's 32 bit process is
+not left holding them. The engine takes a package from the first entry in
+`Paths` that has one, so New Vision's two lines have to come before the
+stock ones in `[Core.System]`, not after them as its readme says:
+
+	Paths=..\System\*.u
+	Paths=..\NewVision\Maps\*.dx
+	Paths=..\NewVision\Textures\*.utx
+	Paths=..\Maps\*.dx
+	Paths=..\Textures\*.utx
+
+`PT LOOK` says which file a surface's texture came from, and its S3TC size.
 
 Textures are sampled with their mips - the chains the packages store, which
 are what the other devices upload - at a level chosen per ray from a cone
@@ -369,6 +386,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	PinnedUI=1.333333
 	LightSize=4
 	MaxAnisotropy=16
+	UseS3TC=True
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Exposure`: overall brightness, a byte around a midpoint of 128.
@@ -421,6 +439,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   starts sharp where something meets it and softens with distance, as a real
   one does. 0 casts from a point: hard all the way out, which NRD blurs
   evenly and DLSS keeps. `PT LIGHTSIZE n` changes it for the session.
+- `UseS3TC`: use the S3TC textures a package carries beside its originals,
+  as OpenGLDrv's setting of the same name does - New Vision's (below). On by
+  default; a package without them is unaffected.
 - `MaxAnisotropy`: the texture filter's anisotropy, as the other devices call
   it: how many samples it may take along a surface seen at a slant - a floor
   down a corridor - to keep it sharp without sparkling. 16 by default; 4 and 8

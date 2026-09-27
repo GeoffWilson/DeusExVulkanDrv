@@ -62,7 +62,7 @@ public:
 
 	// A texture array slot, made or remade: RGBA8 pixels, or none for one that
 	// is bound white, and what surfaces using it are made of.
-	void SetTexture(uint32_t index, uint32_t width, uint32_t height, uint32_t levels, const uint32_t* pixels, const vec4& material);
+	void SetTexture(uint32_t index, uint32_t width, uint32_t height, uint32_t levels, uint32_t format, const uint32_t* pixels, const vec4& material);
 	// New pixels for an existing slot, copied in as the next frame starts.
 	void SetTexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels);
 	void SetAnisotropy(uint32_t samples);
@@ -206,7 +206,7 @@ private:
 	{
 		std::unique_ptr<VulkanImage> Image;
 		std::unique_ptr<VulkanImageView> View;
-		uint32_t Width = 0, Height = 0, Levels = 1;
+		uint32_t Width = 0, Height = 0, Levels = 1, Format = 0;
 		vec4 Material;
 	};
 	std::vector<Slot> Slots;

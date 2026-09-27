@@ -307,6 +307,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	DLSSQuality = 1;
 	DetailTextures = 1;
 	MaxAnisotropy = 16.0f;
+	UseS3TC = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -324,6 +325,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("PinnedUI"), RF_Public) UFloatProperty(CPP_PROPERTY(PinnedUI), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LightSize"), RF_Public) UIntProperty(CPP_PROPERTY(LightSize), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("MaxAnisotropy"), RF_Public) UFloatProperty(CPP_PROPERTY(MaxAnisotropy), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("UseS3TC"), RF_Public) UBoolProperty(CPP_PROPERTY(UseS3TC), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
@@ -1493,14 +1495,18 @@ bool UPathTracerRenderDevice::SendScene()
 
 	const double texturesStart = NowMs();
 	const size_t firstNew = SentTextures.size();
-	int sentWithMips = 0, sentLevels = 0;
+	int sentWithMips = 0, sentLevels = 0, sentS3tc = 0;
 	for (size_t i = SentTextures.size(); i < Scene.Textures.size(); i++)
 	{
 		SentTexture sent;
 		sent.Source = Scene.Textures[i];
 		sent.Masked = Scene.TextureMasked[i];
 		int width = 0, height = 0, levels = 0;
-		const bool converted = TextureCache::SceneMips(sent.Source, sent.Masked, Pixels, width, height, levels);
+		uint32_t format = 0;
+		// A texture that changes sends its frames at its own size, so it
+		// keeps to its originals.
+		const bool s3tc = UseS3TC && !TextureCache::Animates(sent.Source);
+		const bool converted = TextureCache::SceneMips(sent.Source, sent.Masked, s3tc, Pixels, width, height, levels, format);
 		// Named, so a texture that comes out wrong on screen can be identified
 		// rather than guessed at.
 		if (!converted && TextureFailuresLogged < 24)
@@ -1518,17 +1524,19 @@ bool UPathTracerRenderDevice::SendScene()
 		// no mips to fall behind it.
 		const uint32_t sentMips = sent.Animated ? 1u : (uint32_t)levels;
 		Tracer->Texture((uint32_t)i, (uint32_t)sent.Width, (uint32_t)sent.Height, converted ? Pixels.data() : nullptr,
-			Scene.TextureMaterials[i], sent.Animated, sentMips);
+			Scene.TextureMaterials[i], sent.Animated, sentMips, format);
 		SentTextures.push_back(sent);
 		if (converted && sentMips > 1)
 		{
 			sentWithMips++;
 			sentLevels += (int)sentMips;
 		}
+		if (converted && (format == TraceProtocol::TextureBc1 || (s3tc && (sent.Source->bHasComp || sent.Source->Format == TEXF_DXT1))))
+			sentS3tc++;
 	}
 	if (SentTextures.size() > firstNew)
-		debugf(TEXT("PathTracer textures: %d sent, %d of them with mips (%.1f levels on average)"),
-			(int)(SentTextures.size() - firstNew), sentWithMips, sentWithMips ? sentLevels / (float)sentWithMips : 0.0f);
+		debugf(TEXT("PathTracer textures: %d sent, %d of them with mips (%.1f levels on average), %d in S3TC"),
+			(int)(SentTextures.size() - firstNew), sentWithMips, sentWithMips ? sentLevels / (float)sentWithMips : 0.0f, sentS3tc);
 
 	// Asked afresh every frame rather than remembered from the first sending,
 	// since a script can give a texture an animation chain after it was first
@@ -2097,6 +2105,22 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 					(texture && texture->GetOuter()) ? texture->GetOuter()->GetName() : TEXT("none"),
 					kind, m.x, m.y, m.z,
 					(texture && texture->DetailTexture) ? texture->DetailTexture->GetName() : TEXT("none"));
+				// Which file its package came from - the first of Paths to
+				// have it, as the engine looks - and whether it carries an
+				// S3TC set, New Vision's.
+				if (texture)
+				{
+					TCHAR file[256] = TEXT("");
+					UObject* package = texture->GetOuter();
+					while (package && package->GetOuter())
+						package = package->GetOuter();
+					if (package)
+						appFindPackageFile(package->GetName(), NULL, file);
+					Ar.Logf(TEXT("PT: texture %dx%d from %s%s"), (int)texture->USize, (int)texture->VSize, file[0] ? file : TEXT("?"),
+						texture->bHasComp && texture->CompMips.Num() > 0
+							? *FString::Printf(TEXT(", S3TC %dx%d%s"), (int)texture->CompMips(0).USize, (int)texture->CompMips(0).VSize, UseS3TC ? TEXT("") : TEXT(" (UseS3TC off)"))
+							: TEXT(", no S3TC"));
+				}
 				// Its zone's ambient: FGetHSV at the zone's brightness, of
 				// which a lightmap starts at half.
 				AZoneInfo* zone = node.iZone[1] < FBspNode::MAX_ZONES ? model->Zones[node.iZone[1]].ZoneActor : nullptr;

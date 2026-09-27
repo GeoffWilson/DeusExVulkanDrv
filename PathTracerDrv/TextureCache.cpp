@@ -1,5 +1,6 @@
 #include "Precomp.h"
 #include "TextureCache.h"
+#include "TraceProtocol.h"
 #include "UPathTracerRenderDevice.h"
 
 TextureCache::TextureCache(UPathTracerRenderDevice* renderer) : renderer(renderer)
@@ -81,6 +82,61 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 		const BYTE* src = mip->DataPtr;
 		for (size_t i = 0; i < pixels.size(); i++)
 			pixels[i] = 0xff000000u | ((uint32_t)src[i * 3 + 2] << 16) | ((uint32_t)src[i * 3 + 1] << 8) | (uint32_t)src[i * 3 + 0];
+		break;
+	}
+	case TEXF_DXT1:
+	{
+		// S3TC, as New Vision's textures are: 4x4 blocks of two RGB565
+		// colours and two bits a texel choosing between them and the two
+		// blended from them - or, when the first colour is the smaller, the
+		// one halfway and a transparent black, which is how a masked texture
+		// keeps its holes.
+		const BYTE* src = mip->DataPtr;
+		const int blocksWide = Max(1, (width + 3) / 4), blocksHigh = Max(1, (height + 3) / 4);
+		auto expand = [](uint32_t c) -> uint32_t
+		{
+			const uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+			return ((r << 3) | (r >> 2)) | (((g << 2) | (g >> 4)) << 8) | (((b << 3) | (b >> 2)) << 16);
+		};
+		auto blend = [](uint32_t a, uint32_t b, uint32_t wa, uint32_t wb, uint32_t d) -> uint32_t
+		{
+			uint32_t out = 0;
+			for (int k = 0; k < 3; k++)
+				out |= ((((a >> (k * 8)) & 255u) * wa + ((b >> (k * 8)) & 255u) * wb) / d) << (k * 8);
+			return out;
+		};
+		for (int by = 0; by < blocksHigh; by++)
+		{
+			for (int bx = 0; bx < blocksWide; bx++)
+			{
+				const BYTE* block = src + ((size_t)by * blocksWide + bx) * 8;
+				const uint32_t c0 = block[0] | (block[1] << 8), c1 = block[2] | (block[3] << 8);
+				const uint32_t bits = block[4] | (block[5] << 8) | (block[6] << 16) | ((uint32_t)block[7] << 24);
+				const uint32_t e0 = expand(c0), e1 = expand(c1);
+				uint32_t colours[4];
+				colours[0] = e0 | 0xff000000u;
+				colours[1] = e1 | 0xff000000u;
+				if (c0 > c1)
+				{
+					colours[2] = blend(e0, e1, 2, 1, 3) | 0xff000000u;
+					colours[3] = blend(e0, e1, 1, 2, 3) | 0xff000000u;
+				}
+				else
+				{
+					colours[2] = blend(e0, e1, 1, 1, 2) | 0xff000000u;
+					colours[3] = 0u;
+				}
+				for (int y = 0; y < 4; y++)
+				{
+					for (int x = 0; x < 4; x++)
+					{
+						const int px = bx * 4 + x, py = by * 4 + y;
+						if (px < width && py < height)
+							pixels[(size_t)py * width + px] = colours[(bits >> (2 * (y * 4 + x))) & 3u];
+					}
+				}
+			}
+		}
 		break;
 	}
 	default:
@@ -229,37 +285,80 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 // surfaces to a render device, and this runs at a different point entirely;
 // it also takes an FTextureInfo that the engine partly reads, which as an
 // uninitialised local was undefined behaviour.
-static bool MipPixels(UTexture* texture, INT level, bool masked, std::vector<uint32_t>& pixels, int& width, int& height)
+// A mip's data, off disk if it is not resident yet. This SDK's lazy arrays do
+// not load themselves when indexed (LOAD_ON_DEMAND is off), and read as empty
+// until something asks: the engine had loaded every top level by the time it
+// was wanted here, but never the levels below, so every texture went to the
+// helper without its mips.
+//
+// Through the engine's own vtable: the SDK declares TLazyArray<BYTE>'s
+// functions imported, and neither import library exports Load, so a direct
+// call cannot link. The pointer is volatile so the compiler, which knows the
+// member's type, cannot call it directly anyway.
+static void LoadMip(FMipmap& mip)
 {
-	if (!texture || texture->Mips.Num() <= level)
-		return false;
-	FMipmap& mip = texture->Mips(level);
-	// Off disk if it is not resident yet. This SDK's lazy arrays do not load
-	// themselves when indexed (LOAD_ON_DEMAND is off), and read as empty
-	// until something asks: the engine had loaded every top level by the
-	// time it was wanted here, but never the levels below, so every texture
-	// went to the helper without its mips.
-	//
-	// Through the engine's own vtable: the SDK declares TLazyArray<BYTE>'s
-	// functions imported, and neither import library exports Load, so a
-	// direct call cannot link. The pointer is volatile so the compiler, which
-	// knows the member's type, cannot call it directly anyway.
 	FLazyLoader* volatile loader = &mip.DataArray;
 	loader->Load();
+}
+
+// And back off again, for the S3TC sets, which nothing but the trace reads
+// and which once in the helper are no use here: a level's worth held in a
+// 32 bit process is hundreds of megabytes. The package keeps them on disk.
+static void UnloadMips(TArray<FMipmap>& chain)
+{
+	for (INT i = 0; i < chain.Num(); i++)
+	{
+		FLazyLoader* volatile loader = &chain(i).DataArray;
+		loader->Unload();
+	}
+}
+
+// How many bytes a mip of this format and size holds.
+static INT MipBytes(BYTE format, INT width, INT height)
+{
+	switch (format)
+	{
+	case TEXF_P8: return width * height;
+	case TEXF_DXT1: return Max(1, (width + 3) / 4) * Max(1, (height + 3) / 4) * 8;
+	case TEXF_RGB8: return width * height * 3;
+	case TEXF_RGBA8: return width * height * 4;
+	default: return 0;
+	}
+}
+
+// The S3TC set of a texture that has one, which the trace uses when S3TC is
+// on, as the other devices do: New Vision's packages keep each original and
+// add a version at eight times the size, in S3TC, beside it (bHasComp and
+// CompMips). A texture stored as S3TC outright has it in Mips.
+static TArray<FMipmap>* CompressedChain(UTexture* texture)
+{
+	if (texture->bHasComp && texture->CompFormat == TEXF_DXT1 && texture->CompMips.Num() > 0)
+		return &texture->CompMips;
+	if (texture->Format == TEXF_DXT1 && texture->Mips.Num() > 0)
+		return &texture->Mips;
+	return nullptr;
+}
+
+static bool MipPixels(UTexture* texture, TArray<FMipmap>& chain, BYTE format, INT level, bool masked, std::vector<uint32_t>& pixels, int& width, int& height)
+{
+	if (!texture || chain.Num() <= level)
+		return false;
+	FMipmap& mip = chain(level);
+	LoadMip(mip);
 	if (mip.USize <= 0 || mip.VSize <= 0 || mip.DataArray.Num() <= 0)
 		return false;
 
-	// The mip has to actually hold a full image. A lazy array that did not load,
-	// or a format whose bytes per pixel is not one, would otherwise be read past
-	// its end - which produces whatever palette entries happen to follow.
-	if (texture->Format == TEXF_P8 && mip.DataArray.Num() < mip.USize * mip.VSize)
+	// The mip has to actually hold a full image. A lazy array that did not load
+	// would otherwise be read past its end - which produces whatever palette
+	// entries happen to follow.
+	if (mip.DataArray.Num() < MipBytes(format, mip.USize, mip.VSize))
 		return false;
 
 	FTextureInfo info = {};
 	info.Texture = texture;
 	info.NumMips = 1;
 	info.Mips[0] = &mip;
-	info.Format = (ETextureFormat)texture->Format;
+	info.Format = (ETextureFormat)format;
 	info.USize = mip.USize;
 	info.VSize = mip.VSize;
 	info.Palette = (texture->Palette && texture->Palette->Colors.Num() > 0)
@@ -269,23 +368,73 @@ static bool MipPixels(UTexture* texture, INT level, bool masked, std::vector<uin
 	return TextureCache::ConvertPixels(info, masked, pixels, width, height);
 }
 
-bool TextureCache::SceneMips(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height, int& levels)
+bool TextureCache::SceneMips(UTexture* texture, bool masked, bool s3tc, std::vector<uint32_t>& pixels, int& width, int& height, int& levels, uint32_t& format)
 {
 	guard(TextureCache::SceneMips);
 	levels = 0;
-	if (!MipPixels(texture, 0, masked, pixels, width, height))
+	format = TraceProtocol::TextureRgba8;
+	if (!texture)
 		return false;
-	levels = 1;
-	std::vector<uint32_t> level;
-	for (INT i = 1; i < texture->Mips.Num(); i++)
+
+	TArray<FMipmap>* chain = &texture->Mips;
+	BYTE chainFormat = texture->Format;
+	if (TArray<FMipmap>* compressed = s3tc ? CompressedChain(texture) : nullptr)
 	{
-		int w = 0, h = 0;
-		if (!MipPixels(texture, i, masked, level, w, h) || w != Max(1, width >> i) || h != Max(1, height >> i))
-			break;
-		pixels.insert(pixels.end(), level.begin(), level.end());
-		levels++;
+		chain = compressed;
+		chainFormat = TEXF_DXT1;
+
+		// Handed over as it is, blocks and all: the GPU reads S3TC itself, and
+		// New Vision's textures unpacked would be eight times the size - a
+		// level's worth runs to gigabytes. Not a masked one, whose holes are
+		// looked for by colour when they are not in the blocks' alpha, and
+		// whose edges want the colour spread into them (ConvertPixels).
+		if (!masked)
+		{
+			pixels.clear();
+			for (INT i = 0; i < chain->Num(); i++)
+			{
+				FMipmap& mip = (*chain)(i);
+				LoadMip(mip);
+				if (i == 0)
+				{
+					width = mip.USize;
+					height = mip.VSize;
+				}
+				const INT bytes = MipBytes(TEXF_DXT1, mip.USize, mip.VSize);
+				if (mip.USize != Max(1, width >> i) || mip.VSize != Max(1, height >> i) || mip.DataArray.Num() < bytes || width <= 0 || height <= 0)
+					break;
+				const size_t start = pixels.size();
+				pixels.resize(start + bytes / 4);
+				appMemcpy(&pixels[start], &mip.DataArray(0), bytes);
+				levels++;
+			}
+			if (chain == &texture->CompMips)
+				UnloadMips(*chain);
+			if (levels > 0)
+			{
+				format = TraceProtocol::TextureBc1;
+				return true;
+			}
+		}
 	}
-	return true;
+
+	const bool converted = MipPixels(texture, *chain, chainFormat, 0, masked, pixels, width, height);
+	if (converted)
+	{
+		levels = 1;
+		std::vector<uint32_t> level;
+		for (INT i = 1; i < chain->Num(); i++)
+		{
+			int w = 0, h = 0;
+			if (!MipPixels(texture, *chain, chainFormat, i, masked, level, w, h) || w != Max(1, width >> i) || h != Max(1, height >> i))
+				break;
+			pixels.insert(pixels.end(), level.begin(), level.end());
+			levels++;
+		}
+	}
+	if (chain == &texture->CompMips)
+		UnloadMips(*chain);
+	return converted;
 	unguard;
 }
 
@@ -339,7 +488,7 @@ bool TextureCache::AnimatedPixels(UTexture* texture, bool masked, double time, i
 	lastFrame = frame;
 
 	int w = 0, h = 0;
-	if (!MipPixels(frame, 0, masked, pixels, w, h) || w != width || h != height)
+	if (!MipPixels(frame, frame->Mips, frame->Format, 0, masked, pixels, w, h) || w != width || h != height)
 		return false;
 	return true;
 

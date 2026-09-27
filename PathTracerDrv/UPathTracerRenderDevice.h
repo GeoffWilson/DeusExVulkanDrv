@@ -138,6 +138,13 @@ public:
 	// PT DLSS switches it for the session and sets the quality.
 	BITFIELD UseDLSS;
 	INT DLSSQuality;
+	// Use the S3TC textures a package carries beside its originals - New
+	// Vision's, eight times the size - as OpenGLDrv's UseS3TC does. On by
+	// default: a package without them is unaffected. Only the trace reads
+	// them; the engine's own pass under this device (SupportsTC stays off)
+	// keeps to the originals, so a 32 bit process is not left holding every
+	// S3TC set in a level once it has gone to the helper.
+	BITFIELD UseS3TC;
 	// On a screen wider than 4:3, keep the height of view the game's field of
 	// view gives at 4:3 and widen it to the screen ("Hor+"), rather than keep
 	// the width and crop the top and bottom as the engine does. See

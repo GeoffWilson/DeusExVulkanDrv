@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 7;
+	static const uint32_t Version = 8;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -190,10 +190,19 @@ namespace TraceProtocol
 		uint32_t FogCount;
 	};
 
-	// A texture array slot: its pixels as RGBA8, MipLevels levels of them end
-	// to end from Width * Height down, each half the last (or none for a
-	// texture the device could not convert, which is bound white), and what
-	// the surfaces using it are made of.
+	// How a texture's pixels come: RGBA8, or S3TC's 4x4 blocks as they were
+	// stored (BC1) - New Vision's, which unpacked would be eight times the
+	// size.
+	enum TextureFormat : uint32_t
+	{
+		TextureRgba8 = 0,
+		TextureBc1 = 1,
+	};
+
+	// A texture array slot: its pixels, MipLevels levels of them end to end
+	// from Width * Height down, each half the last (or none for a texture the
+	// device could not convert, which is bound white), in Format, and what the
+	// surfaces using it are made of.
 	struct TextureCommand
 	{
 		CommandHeader H;
@@ -202,16 +211,24 @@ namespace TraceProtocol
 		uint32_t Height;
 		uint32_t Animated;          // its pixels change: keep them uploadable
 		uint32_t MipLevels;
-		uint32_t Pad;
+		uint32_t Format;            // a TextureFormat
 		vec4 Material;
 	};
 
-	// How many pixels a chain of mips from width x height holds.
-	inline size_t MipChainPixels(uint32_t width, uint32_t height, uint32_t levels)
+	// How many bytes one mip of width x height holds in a format.
+	inline size_t MipBytes(uint32_t format, uint32_t width, uint32_t height)
+	{
+		if (format == TextureBc1)
+			return (size_t)((width + 3) / 4 ? (width + 3) / 4 : 1) * ((height + 3) / 4 ? (height + 3) / 4 : 1) * 8;
+		return (size_t)width * height * 4;
+	}
+
+	// How many bytes a chain of mips from width x height holds.
+	inline size_t MipChainBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t levels)
 	{
 		size_t total = 0;
 		for (uint32_t i = 0; i < levels; i++)
-			total += (size_t)(width >> i ? width >> i : 1) * (height >> i ? height >> i : 1);
+			total += MipBytes(format, width >> i ? width >> i : 1, height >> i ? height >> i : 1);
 		return total;
 	}
 

@@ -305,7 +305,7 @@ void TraceRenderer::BindWhite(uint32_t index)
 // end in pixels: sampled at the level the width of a ray's footprint calls
 // for, as the other devices sample theirs, rather than always at the top -
 // which is what made distant floors and walls sparkle.
-void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, uint32_t levels, const uint32_t* pixels, const vec4& material)
+void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, uint32_t levels, uint32_t format, const uint32_t* pixels, const vec4& material)
 {
 	if (index >= (uint32_t)MaxTextures)
 		return;
@@ -327,16 +327,20 @@ void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, 
 	slot.Width = width;
 	slot.Height = height;
 	slot.Levels = std::max(levels, 1u);
+	slot.Format = format;
 	slot.Material = material;
+	// S3TC is sampled as it is stored. BC1 with its alpha: a block can mark
+	// texels transparent, and some that are not masked use it anyway.
+	const VkFormat vkFormat = format == TraceProtocol::TextureBc1 ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK : VK_FORMAT_R8G8B8A8_UNORM;
 	slot.Image = ImageBuilder()
-		.Format(VK_FORMAT_R8G8B8A8_UNORM)
+		.Format(vkFormat)
 		.Size(width, height, (int)slot.Levels)
 		.Usage(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
 		.DebugName("PathTracerSceneTexture")
 		.Create(Device);
-	slot.View = ImageViewBuilder().Image(slot.Image.get(), VK_FORMAT_R8G8B8A8_UNORM).DebugName("PathTracerSceneTextureView").Create(Device);
+	slot.View = ImageViewBuilder().Image(slot.Image.get(), vkFormat).DebugName("PathTracerSceneTextureView").Create(Device);
 
-	const size_t bytes = TraceProtocol::MipChainPixels(width, height, slot.Levels) * 4;
+	const size_t bytes = TraceProtocol::MipChainBytes(format, width, height, slot.Levels);
 	auto staging = BufferBuilder()
 		.Size(bytes)
 		.Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY)
@@ -348,7 +352,7 @@ void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, 
 	VulkanImage* image = slot.Image.get();
 	VulkanBuffer* src = staging.get();
 	const int levelCount = (int)slot.Levels;
-	Context->ExecuteImmediate([image, src, width, height, levelCount](VulkanCommandBuffer* cmd)
+	Context->ExecuteImmediate([image, src, width, height, levelCount, format](VulkanCommandBuffer* cmd)
 	{
 		PipelineBarrier()
 			.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, levelCount)
@@ -363,7 +367,7 @@ void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, 
 			regions[i].imageSubresource.mipLevel = (uint32_t)i;
 			regions[i].imageSubresource.layerCount = 1;
 			regions[i].imageExtent = { w, h, 1 };
-			offset += (VkDeviceSize)w * h * 4;
+			offset += (VkDeviceSize)TraceProtocol::MipBytes(format, w, h);
 		}
 		cmd->copyBufferToImage(src->buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levelCount, regions);
 		PipelineBarrier()
@@ -384,10 +388,10 @@ void TraceRenderer::SetTexturePixels(uint32_t index, uint32_t width, uint32_t he
 	// script can give one an animation - has only its top level sent from
 	// then on, and mips left as they were would show its first frame from a
 	// distance. It becomes a single level instead, as a changing texture is.
-	if (Slots[index].Levels > 1)
+	if (Slots[index].Levels > 1 || Slots[index].Format != TraceProtocol::TextureRgba8)
 	{
 		const vec4 material = Slots[index].Material;
-		SetTexture(index, width, height, 1, pixels, material);
+		SetTexture(index, width, height, 1, TraceProtocol::TextureRgba8, pixels, material);
 		return;
 	}
 
