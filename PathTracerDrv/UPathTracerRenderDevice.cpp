@@ -1978,10 +1978,11 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				UTexture* texture = node.iSurf < model->Surfs.Num() ? model->Surfs(node.iSurf).Texture : nullptr;
 				const TCHAR* kind = nullptr;
 				const vec4 m = Materials::For(texture, nullptr, &kind);
-				Ar.Logf(TEXT("PT: surface %s (group %s): %s, roughness %.2f metalness %.2f reflectance %.2f"),
+				Ar.Logf(TEXT("PT: surface %s (group %s): %s, roughness %.2f metalness %.2f reflectance %.2f, detail texture %s"),
 					texture ? texture->GetName() : TEXT("none"),
 					(texture && texture->GetOuter()) ? texture->GetOuter()->GetName() : TEXT("none"),
-					kind, m.x, m.y, m.z);
+					kind, m.x, m.y, m.z,
+					(texture && texture->DetailTexture) ? texture->DetailTexture->GetName() : TEXT("none"));
 			}
 			Ar.Logf(TEXT("PT: %s written to the log"), (hit.Actor && hit.Actor != player->Level) ? hit.Actor->GetName() : TEXT("nothing but the level"));
 			return 1;
