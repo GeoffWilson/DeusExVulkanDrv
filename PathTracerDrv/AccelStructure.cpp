@@ -270,7 +270,7 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 	{
 		const vec4& p = scene.Lights[i].PositionRadius;
 		const float r = reachOf(i);
-		const bool cylinder = scene.Lights[i].Flags.y > 0.5f;
+		const bool cylinder = std::fmod(scene.Lights[i].Flags.y, 2.0f) > 0.5f;
 		float d2 = 0.0f;
 		const float centre[3] = { p.x, p.y, p.z };
 		const int cell[3] = { x, y, z };
@@ -290,7 +290,7 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 	{
 		const vec4& p = scene.Lights[i].PositionRadius;
 		const float r = reachOf(i);
-		const bool cylinder = scene.Lights[i].Flags.y > 0.5f;
+		const bool cylinder = std::fmod(scene.Lights[i].Flags.y, 2.0f) > 0.5f;
 		int x0, x1, y0, y1, z0, z1;
 		cellRange(p.x, r, 0, x0, x1);
 		cellRange(p.y, r, 1, y0, y1);

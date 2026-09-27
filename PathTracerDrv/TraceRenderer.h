@@ -21,7 +21,7 @@ struct TracePushConstants
 	vec4 CameraUp;
 	vec4 CameraForward;
 	uint32_t Counts[4];   // frame, light count, bounces, accumulated frames
-	vec4 Params;          // exposure, sky intensity, ray epsilon, debug mode
+	vec4 Params;          // exposure, sky intensity, 1 for the engine's lighting, debug mode
 	// How many slots of the texture array hold a real texture. Zero means the
 	// device could not offer descriptor indexing, and every surface falls back
 	// to the single averaged colour it carries.

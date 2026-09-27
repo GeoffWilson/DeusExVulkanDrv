@@ -164,8 +164,9 @@ struct SceneLight
 	// xyz which way a spotlight points; w the cosine of its cone's edge, or
 	// -1 for a light that shines every way.
 	vec4 DirectionCone;
-	// x no incidence falloff, y distance measured horizontally (a cylinder),
-	// z brightness changes from frame to frame, w the light's pattern: 0
+	// x no incidence falloff, y 1 for distance measured horizontally (a
+	// cylinder) plus 2 for a light baked into the level's lightmaps, z
+	// brightness changes from frame to frame, w the light's pattern: 0
 	// disco, 1 searchlight (its sweep offset in DirectionCone.x), 2 rotor
 	// (which way it turns, 1 or -1, in DirectionCone.x), -1 none.
 	vec4 Flags;

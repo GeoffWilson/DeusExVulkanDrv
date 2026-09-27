@@ -1,6 +1,32 @@
 #include "TracePrecomp.h"
 #include "Shaders.h"
 
+// The curve that brings the linear picture into the display's range, shared
+// by every pass that can finish it. Reinhard's compresses everything, the
+// darks least; the neutral one leaves all but the brightest fifth as it is,
+// as the engine's own devices draw it, and bends only that fifth towards white
+// - a shoulder rather than the devices' hard clip.
+static std::string ToneMapGlsl()
+{
+	return R"(
+		vec3 toneMap(vec3 c, bool neutral)
+		{
+			c = max(c, vec3(0.0));
+			if (!neutral)
+				return c / (c + vec3(1.0));
+			const float start = 0.8;
+			float peak = max(c.r, max(c.g, c.b));
+			if (peak < start)
+				return c;
+			const float d = 1.0 - start;
+			float newPeak = 1.0 - d * d / (peak + d - start);
+			c *= newPeak / peak;
+			float g = 1.0 - 1.0 / (0.15 * (peak - newPeak) + 1.0);
+			return mix(c, vec3(newPeak), g);
+		}
+	)";
+}
+
 std::string Shaders::Trace()
 {
 	// MSVC caps a single string literal at 16384 bytes - clang-cl does not -
@@ -100,17 +126,25 @@ std::string Shaders::Trace()
 			vec4 CameraUp;        // xyz, already scaled by the vertical half extent
 			vec4 CameraForward;   // xyz unit vector down the middle of the view
 			uvec4 Counts;         // x frame, y light count, z bounces (glossy bounces << 8, light radius << 16, mip bias in signed sixteenths << 24), w accumulated frames
-			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w debug mode
+			vec4 Params;          // x exposure, y sky intensity, z 1 for the engine's lighting (see directLight), w debug mode
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
 		#define GlossBounces ((Counts.z >> 8u) & 255u)
 		#define LightRadius float((Counts.z >> 16u) & 255u)
 		#define MipBias (float(int(Counts.z) >> 24) / 16.0)
+		// Whether the level's surfaces take their lights as the engine's
+		// lightmaps do, or each by a straight line out to its radius in
+		// linear light: see directLight.
+		#define EngineLighting (Params.z > 0.5)
+
+		// How far a ray starts from the surface it leaves, in world units:
+		// these levels are big.
+		const float RayEpsilon = 0.5;
 
 		// Which instances each kind of ray sees, against SceneInstance::Mask.
 		// The view's own rays and shadows miss the viewer's body while the
@@ -552,6 +586,7 @@ std::string Shaders::Trace()
 		}
 	)";
 
+	source += ToneMapGlsl();
 	source += R"(
 		// Should traversal accept this candidate triangle?
 		//
@@ -617,6 +652,10 @@ std::string Shaders::Trace()
 		// Set when the light sampled is one whose brightness is changing -
 		// pulsing, blinking, flickering. The same short history applies.
 		bool litByChangingLight = false;
+		// With the engine's lighting, the light the ambient gives the point
+		// directLight last lit, linear: the ambient is in the same sum as the
+		// lights.
+		vec3 lightmapAmbient = vec3(0.0);
 
 		bool occluded(vec3 origin, vec3 dir, float dist)
 		{
@@ -625,7 +664,7 @@ std::string Shaders::Trace()
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, topLevel,
 				gl_RayFlagsTerminateOnFirstHitEXT | ((Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : 0u),
-				ShadowRays, origin, Params.z, dir, dist);
+				ShadowRays, origin, RayEpsilon, dir, dist);
 			// A hole in a grate lets light through, so a candidate only counts
 			// as occluding once its texel is known to be there.
 			// Light passes through glass and through the holes in a grate, so a
@@ -650,45 +689,6 @@ std::string Shaders::Trace()
 			return true;
 		}
 
-		// The engine's falloff, which is what its own lightmaps were baked with:
-		// linear to zero at the radius rather than an inverse square that never
-		// quite reaches it. Keeping it means a level lights the way its author
-		// saw it, which matters more here than being physically right.
-		// Pick one light in proportion to what it would contribute if nothing
-		// were in the way, then trace a single shadow ray at it.
-		//
-		// Choosing uniformly instead is what made this scene look black. A Deus
-		// Ex level holds hundreds of lights and a given surface is in range of
-		// perhaps two, so a uniform pick misses almost every time and the few
-		// that land are scaled back up by the light count. The average is right
-		// and every individual pixel is wrong, which is exactly the salt and
-		// pepper of bright speckles on near black.
-		//
-		// The loop is over every light, but only to weigh them - a distance and
-		// a dot product each, no rays. The one shadow ray is still the
-		// expensive part, and now it is nearly always aimed at a light that
-		// actually reaches the surface.
-		// specialLit is the surface's PF_SpecialLit: such a surface is lit only
-		// by lights marked bSpecialLit, and every other surface only by the
-		// rest. A special light carries its radius negated.
-		// With every light rather than one chosen at random, and no shadow ray
-		// when "everyLight" is set: the same answer each frame. For glass and
-		// water, whose own lighting is added over what lies behind them and
-		// never passes through the denoiser.
-		//
-		// Returns the light a matte surface would take, to be multiplied by its
-		// colour. For a glossy surface's highlight it also says which light
-		// was sampled - its direction, and its brightness here before the
-		// angle to the surface, already divided by the chance of choosing it
-		// - or zero when it was blocked or there was none. The light is chosen
-		// by what it adds to the matte part, as it always was, and the
-		// highlight is worked out by the caller for that light alone: weighing
-		// every light in reach by its highlight cost more than the highlight
-		// was worth. A light only gives one where it also lights the surface,
-		// so nothing is missed, only noisier where a highlight is bright and
-		// its light dim. None of the material is needed in here, which keeps
-		// it out of the registers across the light loop.
-		// everyLight gives no light to sample: it is only asked of glass.
 		// A value from 0 to 1 for each 32 unit cell of the level - about a
 		// lightmap texel - and each step, blended between neighbouring cells
 		// the way a lightmap's texels are filtered.
@@ -748,29 +748,253 @@ std::string Shaders::Trace()
 			return response;
 		}
 
-		// meshGlow is 1.4 times the actor's ScaleGlow for a point on a mesh,
-		// which the engine scales its mesh lighting by, and negative anywhere
-		// else; viewDir is the way the ray that found the point was going.
-		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, out vec3 lightDirection, out vec3 lightBase)
+		// One light at a point: what it gives there before anything gets in
+		// its way, and which way and how far it is. False where it gives
+		// nothing. meshGlow is 1.4 times the actor's ScaleGlow for a point on
+		// a mesh, which the engine scales its mesh lighting by, and negative
+		// anywhere else; viewDir is the way the ray that found the point was
+		// going.
+		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir,
+			out vec3 value, out vec3 base, out vec3 dir, out float distance, out bool behind)
+		{
+			value = vec3(0.0);
+			base = vec3(0.0);
+			dir = vec3(0.0, 0.0, 1.0);
+			distance = 0.0;
+			behind = false;
+			SceneLight light = lights[i];
+
+			bool lightSpecial = light.PositionRadius.w < 0.0;
+			if (lightSpecial != specialLit)
+				return false;
+
+			vec3 toLight = light.PositionRadius.xyz - position;
+			distance = length(toLight);
+			float radius = abs(light.PositionRadius.w);
+			// A cylinder light's reach is measured across the floor, not
+			// up and down.
+			float reach = mod(light.Flags.y, 2.0) > 0.5 ? length(toLight.xy) : distance;
+			if (reach >= radius || distance <= 0.0001)
+				return false;
+
+			dir = toLight / distance;
+			float cosTheta = dot(normal, dir);
+			// A mesh takes light from behind it too: the engine's sheen
+			// needs no more than the light lying along the surface.
+			bool mesh = meshGlow >= 0.0;
+			if (cosTheta <= 0.0 && !mesh)
+				return false;
+			// Non incidence: as bright on a surface edge on as face on.
+			if (light.Flags.x > 0.5)
+				cosTheta = 1.0;
+			// A mesh as the engine lights one; see meshResponse.
+			float response = mesh ? meshResponse(cosTheta, dir, normal, viewDir) * meshGlow : cosTheta;
+			if (response <= 0.0)
+				return false;
+
+			// A spotlight, bright along its axis and fading to nothing at
+			// the cone's edge, with the engine's squared falloff.
+			float spot = 1.0;
+			if (light.DirectionCone.w >= 0.0)
+			{
+				float along = dot(-dir, light.DirectionCone.xyz);
+				float edge = light.DirectionCone.w;
+				if (along <= edge)
+					return false;
+				float f = (along - edge) / max(1.0 - edge, 0.0001);
+				spot = f * f;
+			}
+
+			// Patterned lights, each as Render.dll draws it. All three
+			// work from the angle around the light and fade their pattern
+			// near the light's vertical axis, measured in world units.
+			float disco = 1.0;
+			if (light.Flags.w > 2.5)
+			{
+				// The wavers, which Render.dll applies to each lightmap
+				// texel a light reaches: see waver().
+				disco = waver(position, light.Flags.w);
+			}
+			else if (light.Flags.w > -0.5)
+			{
+				vec3 v = -dir;
+				float across2 = (v.x * v.x + v.y * v.y) * distance * distance;
+				float yaw = atan(v.x, v.y);
+				if (light.Flags.w < 0.5)
+				{
+					// Disco: eleven bands around and eleven down from the
+					// light, both drifting at five radians a second, so
+					// the patches travel up and down as well as round.
+					float t = Time * 5.0;
+					float a = 0.5 + 0.5 * cos(11.0 * yaw + t);
+					float b = 0.5 + 0.5 * cos(11.0 * atan(sqrt(v.x * v.x + v.y * v.y), v.z) + t);
+					float f = a + b - a * b;
+					float nearAxis = across2 * 5.0e-5;
+					if (nearAxis < 1.0)
+						f *= nearAxis;
+					disco = 1.0 - f;
+				}
+				else if (light.Flags.w < 1.5)
+				{
+					// Searchlight: four beams, each a quarter turn apart
+					// and an eighth wide, sweeping round. Dark in the
+					// first half of each quarter, and ramping up across
+					// the beam to its trailing edge. C's fmod keeps the
+					// sign, which is what the engine used.
+					float x = 4.0 * yaw + light.DirectionCone.x;
+					x = x - 6.2831853 * trunc(x / 6.2831853);
+					if (x < 3.1415927)
+						return false;
+					disco = 0.5 + 0.5 * cos(x);
+					float nearAxis = across2 * 6.0e-5;
+					if (nearAxis < 1.0)
+						disco *= nearAxis;
+				}
+				else
+				{
+					// Rotor: six blades turning at three and a half
+					// radians a second - the way DirectionCone.x says -
+					// filling in to full brightness near the axis.
+					disco = 0.5 + 0.5 * cos(6.0 * yaw + light.DirectionCone.x * Time * 3.5);
+					float nearAxis = across2 * 1.0e-4;
+					if (nearAxis < 1.0)
+						disco = 1.0 - nearAxis + nearAxis * disco;
+				}
+				if (disco <= 0.0)
+					return false;
+			}
+
+			// Linear to zero at the radius, as the engine lights a mesh and as
+			// the linear lighting lights everything; the engine's lighting
+			// takes the level's surfaces by its lightmaps' curve below.
+			float falloff = 1.0 - reach / radius;
+			float shade = light.ColorBrightness.a * spot * disco;
+
+			// A mesh's light is summed as the engine sums it, in the colours
+			// as displayed - the engine's lighting arithmetic is all done on
+			// them - and made linear once the sum is clamped: see the end.
+			if (mesh)
+			{
+				base = pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) * (shade * falloff);
+				value = base * response;
+			}
+			else if (!EngineLighting)
+			{
+				base = light.ColorBrightness.rgb * (shade * falloff);
+				value = base * response;
+			}
+			else
+			{
+				// The level's surfaces as Render.dll builds their lightmaps:
+				// the light's colour at its brightness, cone and pattern, times
+				// 1 - 3x^2 + 2x^3 of the way x out to its radius and the
+				// cosine, all as displayed, and no brighter than full - summed
+				// as displayed, as the engine sums them, and made linear at the
+				// end, where overlapping lights come out brighter together than
+				// apart. A light baked into the lightmaps counts twice what a
+				// dynamic one does: its shadow mask is filtered out to 255
+				// where a light without one is filled at 127.
+				float x = reach / radius;
+				float lit = shade * (1.0 - x * x * (3.0 - 2.0 * x)) * (light.Flags.y > 1.5 ? 2.0 : 1.0);
+				base = pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) * lit;
+				value = min(base * response, vec3(1.0));
+			}
+			behind = cosTheta <= 0.0;
+			return luminance(value) > 0.0;
+		}
+
+		// Does a light reach the point? Shadowed as by a light the size of a
+		// lamp rather than a point: the shadow ray goes to a random point on
+		// a disc around the light, facing the surface, so a shadow is sharp
+		// where whatever casts it meets the surface and softens as the two
+		// part, as a real one does: the penumbra grows with the distance from
+		// the caster, and what is averaged over frames or denoised is that
+		// penumbra rather than an edge blurred evenly. Brightness and falloff
+		// stay the engine's, from the light's centre.
+		//
+		// A light behind a mesh reaches it only as the engine's sheen, which a
+		// shadow ray could not show: it would start into the mesh itself. The
+		// engine never shadows a mesh at all, so that part is left unshadowed.
+		bool lightReaches(vec3 position, vec3 dir, float distance, bool behind)
+		{
+			vec3 shadowDir = dir;
+			float shadowDistance = distance;
+			if (LightRadius > 0.0)
+			{
+				vec3 across = normalize(cross(dir, abs(dir.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
+				vec3 along = cross(dir, across);
+				// Kept well in front of a surface the light is close to.
+				float r = min(LightRadius, distance * 0.5) * sqrt(randomFloat());
+				float a = 6.2831853 * randomFloat();
+				vec3 toTarget = dir * distance + (across * cos(a) + along * sin(a)) * r;
+				shadowDistance = length(toTarget);
+				shadowDir = toTarget / shadowDistance;
+			}
+			return behind || !occluded(position, shadowDir, shadowDistance - RayEpsilon * 2.0);
+		}
+
+		// The light a point takes from the lights.
+		//
+		// Pick one light in proportion to what it would contribute if nothing
+		// were in the way, then trace a single shadow ray at it. Choosing
+		// uniformly instead is what made this scene look black: a Deus Ex
+		// level holds hundreds of lights and a given surface is in range of
+		// perhaps two, so a uniform pick misses almost every time. The loop is
+		// over every light in the point's cell, but only to weigh them - a
+		// distance and a dot product each, no rays.
+		//
+		// With the engine's lighting the strongest few are each traced
+		// instead, and one pick stands for the rest: the engine's curve is
+		// taken of what actually reaches the point, which one ray at a random
+		// light cannot say. A point where most of the lights in reach are
+		// behind walls otherwise takes the curve of all of them, far too
+		// bright. strongest is how many.
+		//
+		// specialLit is the surface's PF_SpecialLit: such a surface is lit
+		// only by lights marked bSpecialLit, and every other surface only by
+		// the rest. A special light carries its radius negated. With every
+		// light rather than one chosen at random, and no shadow ray, when
+		// "everyLight" is set: the same answer each frame, for glass and
+		// water, whose own lighting is added over what lies behind them and
+		// never passes through the denoiser.
+		//
+		// Returns the light a matte surface would take, to be multiplied by
+		// its colour. For a glossy surface's highlight it also says which
+		// light it came from - its direction, and its brightness here before
+		// the angle to the surface - or zero when it was blocked or there was
+		// none. The light is chosen by what it adds to the matte part, and
+		// the highlight is worked out by the caller for that light alone:
+		// weighing every light by its highlight cost more than the highlight
+		// was worth. shownAmbient is the zone's ambient on a level surface as
+		// displayed, which with the engine's lighting goes into the sum with
+		// the lights, and what it then gives is left in lightmapAmbient.
+		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, vec3 shownAmbient, uint strongest,
+			out vec3 lightDirection, out vec3 lightBase)
 		{
 			lightDirection = normal;
 			lightBase = vec3(0.0);
+			bool engineSum = EngineLighting && meshGlow < 0.0;
+			// A lightmap's full is drawn at twice the texture's brightness.
+			lightmapAmbient = EngineLighting ? pow(2.0 * min(shownAmbient, vec3(1.0)), vec3(2.2)) : vec3(0.0);
 			if ((Disable & 1u) != 0u)
 				return vec3(0.0);
 			uint count = Counts.y;
 			if (count == 0u)
 				return vec3(0.0);
+			if (!engineSum || everyLight)
+				strongest = 0u;
+			strongest = min(strongest, 4u);
 
-			float weightSum = 0.0;
 			vec3 total = vec3(0.0);
 			bool anyChanging = false;
+			// The strongest lights, heaviest first, and one pick from the rest
+			// in proportion to its weight.
+			uint strongIndex[4];
+			float strongWeight[4];
+			uint strongCount = 0u;
+			float restWeight = 0.0;
 			int chosen = -1;
 			float chosenWeight = 0.0;
-			vec3 chosenDir = vec3(0.0);
-			float chosenDistance = 0.0;
-			bool chosenBehind = false;
-			vec3 chosenValue = vec3(0.0);
-			vec3 chosenBase = vec3(0.0);
 
 			// Only the lights listed for the cell this point is in. A point
 			// outside the grid is beyond every light's reach.
@@ -787,198 +1011,128 @@ std::string Shaders::Trace()
 			for (uint k = 0u; k < listCount; k++)
 			{
 				uint i = lightGrid[listStart + k];
-				SceneLight light = lights[i];
-
-				bool lightSpecial = light.PositionRadius.w < 0.0;
-				if (lightSpecial != specialLit)
+				vec3 value, base, dir;
+				float distance;
+				bool behind;
+				if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, value, base, dir, distance, behind))
 					continue;
-
-				vec3 toLight = light.PositionRadius.xyz - position;
-				float distance = length(toLight);
-				float radius = abs(light.PositionRadius.w);
-				// A cylinder light's reach is measured across the floor, not
-				// up and down.
-				float reach = light.Flags.y > 0.5 ? length(toLight.xy) : distance;
-				if (reach >= radius || distance <= 0.0001)
-					continue;
-
-				vec3 dir = toLight / distance;
-				float cosTheta = dot(normal, dir);
-				// A mesh takes light from behind it too: the engine's sheen
-				// needs no more than the light lying along the surface.
-				bool mesh = meshGlow >= 0.0;
-				if (cosTheta <= 0.0 && !mesh)
-					continue;
-				// Non incidence: as bright on a surface edge on as face on.
-				if (light.Flags.x > 0.5)
-					cosTheta = 1.0;
-				// A mesh as the engine lights one; see meshResponse.
-				float response = mesh ? meshResponse(cosTheta, dir, normal, viewDir) * meshGlow : cosTheta;
-				if (response <= 0.0)
-					continue;
-
-				// A spotlight, bright along its axis and fading to nothing at
-				// the cone's edge, with the engine's squared falloff.
-				float spot = 1.0;
-				if (light.DirectionCone.w >= 0.0)
-				{
-					float along = dot(-dir, light.DirectionCone.xyz);
-					float edge = light.DirectionCone.w;
-					if (along <= edge)
-						continue;
-					float f = (along - edge) / max(1.0 - edge, 0.0001);
-					spot = f * f;
-				}
-
-				// Linear to zero at the radius. The comment here used to say
-				// linear and then square it, which is the curve the baked
-				// lightmaps used rather than the one the engine applies to
-				// dynamic lighting. Squaring it costs most of a light's useful
-				// range: the player's light augmentation has a radius of only
-				// 100 units, so at one metre it had already fallen to a quarter
-				// and at two metres to nothing.
-				// Patterned lights, each as Render.dll draws it. All three
-				// work from the angle around the light and fade their pattern
-				// near the light's vertical axis, measured in world units.
-				float disco = 1.0;
-				if (light.Flags.w > 2.5)
-				{
-					// The wavers, which Render.dll applies to each lightmap
-					// texel a light reaches: see waver().
-					disco = waver(position, light.Flags.w);
-				}
-				else if (light.Flags.w > -0.5)
-				{
-					vec3 v = -dir;
-					float across2 = (v.x * v.x + v.y * v.y) * distance * distance;
-					float yaw = atan(v.x, v.y);
-					if (light.Flags.w < 0.5)
-					{
-						// Disco: eleven bands around and eleven down from the
-						// light, both drifting at five radians a second, so
-						// the patches travel up and down as well as round.
-						float t = Time * 5.0;
-						float a = 0.5 + 0.5 * cos(11.0 * yaw + t);
-						float b = 0.5 + 0.5 * cos(11.0 * atan(sqrt(v.x * v.x + v.y * v.y), v.z) + t);
-						float f = a + b - a * b;
-						float nearAxis = across2 * 5.0e-5;
-						if (nearAxis < 1.0)
-							f *= nearAxis;
-						disco = 1.0 - f;
-					}
-					else if (light.Flags.w < 1.5)
-					{
-						// Searchlight: four beams, each a quarter turn apart
-						// and an eighth wide, sweeping round. Dark in the
-						// first half of each quarter, and ramping up across
-						// the beam to its trailing edge. C's fmod keeps the
-						// sign, which is what the engine used.
-						float x = 4.0 * yaw + light.DirectionCone.x;
-						x = x - 6.2831853 * trunc(x / 6.2831853);
-						if (x < 3.1415927)
-							continue;
-						disco = 0.5 + 0.5 * cos(x);
-						float nearAxis = across2 * 6.0e-5;
-						if (nearAxis < 1.0)
-							disco *= nearAxis;
-					}
-					else
-					{
-						// Rotor: six blades turning at three and a half
-						// radians a second - the way DirectionCone.x says -
-						// filling in to full brightness near the axis.
-						disco = 0.5 + 0.5 * cos(6.0 * yaw + light.DirectionCone.x * Time * 3.5);
-						float nearAxis = across2 * 1.0e-4;
-						if (nearAxis < 1.0)
-							disco = 1.0 - nearAxis + nearAxis * disco;
-					}
-					if (disco <= 0.0)
-						continue;
-				}
-
-				float falloff = 1.0 - reach / radius;
-
-				// A mesh's light is summed as the engine sums it, in the colours
-				// as displayed - the engine's lighting arithmetic is all done on
-				// them - and made linear once the sum is clamped: see the end.
-				vec3 colour = mesh ? pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) : light.ColorBrightness.rgb;
-				vec3 base = colour * (light.ColorBrightness.a * falloff * spot * disco);
-				vec3 value = base * response;
 				float weight = luminance(value);
-				if (weight <= 0.0)
-					continue;
-
-				weightSum += weight;
 				total += value;
-				anyChanging = anyChanging || light.Flags.z > 0.5;
+				anyChanging = anyChanging || lights[i].Flags.z > 0.5;
+
+				// Kept among the strongest if it is one, pushing out the
+				// weakest of them into the rest.
+				uint candidate = i;
+				float candidateWeight = weight;
+				for (uint t = 0u; t < strongest; t++)
+				{
+					if (t == strongCount)
+					{
+						strongIndex[t] = candidate;
+						strongWeight[t] = candidateWeight;
+						strongCount++;
+						candidateWeight = 0.0;
+						break;
+					}
+					if (candidateWeight > strongWeight[t])
+					{
+						uint heldIndex = strongIndex[t];
+						float held = strongWeight[t];
+						strongIndex[t] = candidate;
+						strongWeight[t] = candidateWeight;
+						candidate = heldIndex;
+						candidateWeight = held;
+					}
+				}
 				// Reservoir sampling: each candidate replaces the held one with
 				// probability equal to its share of the weight seen so far, so
 				// one pass leaves a sample drawn in proportion to weight.
-				if (randomFloat() < weight / weightSum)
+				if (candidateWeight > 0.0)
 				{
-					chosen = int(i);
-					chosenWeight = weight;
-					chosenDir = dir;
-					chosenDistance = distance;
-					chosenBehind = cosTheta <= 0.0;
-					chosenValue = value;
-					chosenBase = base;
+					restWeight += candidateWeight;
+					if (randomFloat() < candidateWeight / restWeight)
+					{
+						chosen = int(candidate);
+						chosenWeight = candidateWeight;
+					}
 				}
 			}
 
-			// A mesh's is returned as the engine has it, in displayed terms
-			// and unclamped: its ambient goes on before the clamp (meshLight).
 			if (everyLight)
 			{
 				if (anyChanging)
 					litByChangingLight = true;
+				if (engineSum)
+				{
+					vec3 shown = shownAmbient + total;
+					vec3 made = pow(2.0 * min(shown, vec3(1.0)), vec3(2.2)) / max(shown, vec3(1.0e-6));
+					lightmapAmbient = made * shownAmbient;
+					return made * total;
+				}
+				// A mesh's is returned as the engine has it, in displayed terms
+				// and unclamped: its ambient goes on before the clamp
+				// (meshLight).
 				return total;
 			}
 
-			if (chosen < 0 || chosenWeight <= 0.0)
-				return vec3(0.0);
-
-			if (lights[chosen].Flags.z > 0.5)
-				litByChangingLight = true;
-
-			// Shadowed as by a light the size of a lamp rather than a point. The
-			// shadow ray goes to a random point on a disc around the light,
-			// facing the surface, so a shadow is sharp where whatever casts it
-			// meets the surface and softens as the two part, as a real one
-			// does: the penumbra grows with the distance from the caster, and
-			// what is averaged over frames or denoised is that penumbra rather
-			// than an edge blurred evenly. Brightness and falloff stay the
-			// engine's, from the light's centre.
-			vec3 shadowDir = chosenDir;
-			float shadowDistance = chosenDistance;
-			if (LightRadius > 0.0)
+			// What reaches the point: the strongest lights each traced, and
+			// the pick standing for the rest, divided by the chance it was
+			// picked with. The highlight follows the strongest light that got
+			// through, or else the pick.
+			vec3 reaches = vec3(0.0);
+			float highlightWeight = 0.0;
+			for (uint t = 0u; t < strongCount; t++)
 			{
-				vec3 across = normalize(cross(chosenDir, abs(chosenDir.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
-				vec3 along = cross(chosenDir, across);
-				// Kept well in front of a surface the light is close to.
-				float r = min(LightRadius, chosenDistance * 0.5) * sqrt(randomFloat());
-				float a = 6.2831853 * randomFloat();
-				vec3 toTarget = chosenDir * chosenDistance + (across * cos(a) + along * sin(a)) * r;
-				shadowDistance = length(toTarget);
-				shadowDir = toTarget / shadowDistance;
+				vec3 value, base, dir;
+				float distance;
+				bool behind;
+				lightAt(strongIndex[t], position, normal, specialLit, meshGlow, viewDir, value, base, dir, distance, behind);
+				if (lights[strongIndex[t]].Flags.z > 0.5)
+					litByChangingLight = true;
+				if (!lightReaches(position, dir, distance, behind))
+					continue;
+				reaches += value;
+				if (strongWeight[t] > highlightWeight)
+				{
+					highlightWeight = strongWeight[t];
+					lightDirection = dir;
+					lightBase = base;
+				}
 			}
-			// A light behind a mesh reaches it only as the engine's sheen, which
-			// a shadow ray could not show: it would start into the mesh itself.
-			// The engine never shadows a mesh at all, so that part is left
-			// unshadowed.
-			if (!chosenBehind && occluded(position, shadowDir, shadowDistance - Params.z * 2.0))
-				return vec3(0.0);
+			if (chosen >= 0 && chosenWeight > 0.0)
+			{
+				vec3 value, base, dir;
+				float distance;
+				bool behind;
+				lightAt(uint(chosen), position, normal, specialLit, meshGlow, viewDir, value, base, dir, distance, behind);
+				if (lights[chosen].Flags.z > 0.5)
+					litByChangingLight = true;
+				if (lightReaches(position, dir, distance, behind))
+				{
+					float scale = restWeight / chosenWeight;
+					reaches += value * scale;
+					if (highlightWeight <= 0.0)
+					{
+						lightDirection = dir;
+						lightBase = base * scale;
+					}
+				}
+			}
 
-			// Divide by the probability it was chosen with, which is its share
-			// of the total weight.
-			// The highlight keeps the true angle to the light, whatever non
-			// incidence does to the matte part.
-			float scale = weightSum / chosenWeight;
-			lightDirection = chosenDir;
-			lightBase = chosenBase * scale;
+			// Added up as the engine does it: the ambient and the lights as
+			// displayed, clamped at full, drawn at twice the texture's
+			// brightness as every device draws a lightmap, and made linear.
+			if (engineSum)
+			{
+				vec3 shown = shownAmbient + reaches;
+				vec3 made = pow(2.0 * min(shown, vec3(1.0)), vec3(2.2)) / max(shown, vec3(1.0e-6));
+				lightmapAmbient = made * shownAmbient;
+				lightBase *= made;
+				return made * reaches;
+			}
 			// The estimate is the total in proportion, sampled by its weight,
 			// so for a mesh, clamping it clamps the total near enough.
-			return chosenValue * scale;
+			return reaches;
 		}
 
 		// A lit mesh's light as the engine finishes it: its ambient added to
@@ -1137,7 +1291,7 @@ std::string Shaders::Trace()
 			// flush against it. A laser dot sits on a wall, and stepping a whole
 			// unit past it skipped the wall entirely and put a hole in the level.
 			// The layer just passed is refused by name instead: see passedLayers.
-			float rayMin = Params.z;
+			float rayMin = RayEpsilon;
 
 			// What this pixel is looking at, recorded on the first bounce so the
 			// accumulated history can be checked against it.
@@ -1219,7 +1373,7 @@ std::string Shaders::Trace()
 					// A mirror keeps the view's cone; a glossy reflection spreads.
 					coneWidth = surfaceConeWidth;
 					coneSpread = pendingGloss ? 0.1 : pixelSpread;
-					rayMin = Params.z;
+					rayMin = RayEpsilon;
 					passes = 0u;
 					hitDistance = 0.0;
 					wantHitDistance = true;
@@ -1379,7 +1533,7 @@ std::string Shaders::Trace()
 						{
 							inSky = true;
 							origin = SkyOrigin.xyz;
-							rayMin = Params.z;
+							rayMin = RayEpsilon;
 							if (passes < 8u)
 							{
 								passes++;
@@ -1439,8 +1593,9 @@ std::string Shaders::Trace()
 							{
 								vec3 surroundings = linearAmbient(attr, rayQueryGetIntersectionInstanceIdEXT(rq, true));
 								vec3 unusedDirection, unusedBase;
-								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, -1.0, direction, unusedDirection, unusedBase)
-									+ attr.Albedo.rgb * surroundings;
+								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, -1.0, direction,
+									pow(surroundings, vec3(1.0 / 2.2)), 0u, unusedDirection, unusedBase);
+								contribution += attr.Albedo.rgb * (EngineLighting ? lightmapAmbient : surroundings);
 							}
 							radiance += throughput * contribution;
 						}
@@ -1533,7 +1688,7 @@ std::string Shaders::Trace()
 						if (mirror)
 						{
 							pendingSpecular = true;
-							specularOrigin = lifted + faceNormal * Params.z;
+							specularOrigin = lifted + faceNormal * RayEpsilon;
 							specularDirection = aboveFace(reflect(direction, surfaceNormal), faceNormal);
 						}
 						surfaceRoughness = mirror ? 0.0 : (material.glossy ? material.roughness : 1.0);
@@ -1550,7 +1705,7 @@ std::string Shaders::Trace()
 							if (sampleGlossy(material, f0, surfaceNormal, toEye, L, weight))
 							{
 								pendingGloss = true;
-								specularOrigin = lifted + faceNormal * Params.z;
+								specularOrigin = lifted + faceNormal * RayEpsilon;
 								specularDirection = aboveFace(L, faceNormal);
 								// Divided by the colour it is put back with.
 								reflectionThroughput = weight / max(shineAlbedo, vec3(1.0e-4));
@@ -1571,8 +1726,8 @@ std::string Shaders::Trace()
 						// marble has an albedo near 0.1, and multiplying the
 						// reflection by that made it invisible.
 						throughput *= mirrorTint;
-						origin = lifted + faceNormal * Params.z;
-						rayMin = Params.z;
+						origin = lifted + faceNormal * RayEpsilon;
+						rayMin = RayEpsilon;
 						direction = aboveFace(reflect(direction, normal), faceNormal);
 						continue;
 					}
@@ -1640,7 +1795,9 @@ std::string Shaders::Trace()
 						float flags = abs(instanceAmbient[hitInstance].w);
 						meshGlow = 1.4 * (flags > 0.5 ? flags - 1.0 : 1.0);
 					}
-					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, meshGlow, direction, lightDirection, lightBase);
+					vec3 ambient = linearAmbient(attr, hitInstance);
+					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, meshGlow, direction,
+						pow(ambient, vec3(1.0 / 2.2)), firstSurface ? 4u : 1u, lightDirection, lightBase);
 					if (meshGlow >= 0.0)
 						lit = meshLight(lit, instanceAmbient[hitInstance].rgb);
 
@@ -1675,9 +1832,8 @@ std::string Shaders::Trace()
 					// as light arriving evenly from everywhere, which is what keeps
 					// metal from going black where no light reaches it.
 					// A lit mesh's is in its light already, as the engine adds it.
-					vec3 ambient = linearAmbient(attr, hitInstance);
 					if (meshGlow < 0.0)
-						radiance += throughput * shade * ambient;
+						radiance += throughput * shade * (EngineLighting ? lightmapAmbient : ambient);
 					if (glossCapture)
 						reflectionEmission += ambient;
 					else if (!captured)
@@ -1734,8 +1890,8 @@ std::string Shaders::Trace()
 						throughput /= p;
 					}
 
-					origin = lifted + faceNormal * Params.z;
-					rayMin = Params.z;
+					origin = lifted + faceNormal * RayEpsilon;
+					rayMin = RayEpsilon;
 					if (!glossyBounce)
 						direction = cosineDirection(normal);
 					direction = aboveFace(direction, faceNormal);
@@ -1988,9 +2144,8 @@ std::string Shaders::Trace()
 			// Tonemap and encode here rather than in a present pass: the result
 			// is blitted straight to the swap chain, so this is the last thing
 			// that happens to the pixel.
-			vec3 mapped = result * Params.x;
-			mapped = mapped / (mapped + vec3(1.0));
-			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
+			vec3 mapped = toneMap(result * Params.x, (Disable & 8192u) != 0u);
+			mapped = pow(mapped, vec3(1.0 / 2.2));
 			if (Params.w > 2.5)
 			{
 				// A view of one part: no fog or flash over it. The history view
@@ -2055,8 +2210,9 @@ std::string Shaders::Composite()
 		layout(push_constant) uniform PushConstants
 		{
 			vec4 Flash;      // x the picture's scale, yzw the flash colour
-			vec4 Finish;     // x exposure, y 1 when there are glossy reflections to add
+			vec4 Finish;     // x exposure, y 1 when there are glossy reflections to add, z 1 for the neutral tone curve
 		};
+	)" + ToneMapGlsl() + R"(
 
 		// The same finish the trace gives its own picture: the lighting put
 		// back on its surfaces, tonemapped, then the fog and the screen flash
@@ -2074,9 +2230,8 @@ std::string Shaders::Composite()
 			if (Finish.y > 0.5)
 				result += imageLoad(glossAlbedoImage, pixel).rgb * max(imageLoad(glossImage, pixel).rgb, vec3(0.0));
 
-			vec3 mapped = result * Finish.x;
-			mapped = mapped / (mapped + vec3(1.0));
-			mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
+			vec3 mapped = toneMap(result * Finish.x, Finish.z > 0.5);
+			mapped = pow(mapped, vec3(1.0 / 2.2));
 
 			vec4 fog = imageLoad(fogImage, pixel);
 			mapped = fog.rgb + mapped * (1.0 - fog.a);
@@ -2106,7 +2261,9 @@ std::string Shaders::Finish()
 		layout(push_constant) uniform PushConstants
 		{
 			vec4 Flash;      // x the picture's scale, yzw the flash colour
+			vec4 Mode;       // x 1 for the neutral tone curve
 		};
+	)" + ToneMapGlsl() + R"(
 
 		void main()
 		{
@@ -2115,8 +2272,7 @@ std::string Shaders::Finish()
 			if (pixel.x >= size.x || pixel.y >= size.y)
 				return;
 
-			vec3 mapped = max(imageLoad(reconstructedImage, pixel).rgb, vec3(0.0));
-			mapped = mapped / (mapped + vec3(1.0));
+			vec3 mapped = toneMap(imageLoad(reconstructedImage, pixel).rgb, Mode.x > 0.5);
 			mapped = pow(mapped, vec3(1.0 / 2.2));
 
 			vec4 fog = texture(fogTexture, (vec2(pixel) + vec2(0.5)) / vec2(size));

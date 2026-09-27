@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 8;
+	static const uint32_t Version = 9;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -267,6 +267,10 @@ namespace TraceProtocol
 		uint32_t DlssQuality;       // 0 DLAA, 1 quality, 2 balanced, 3 performance, 4 ultra performance
 		uint32_t LightSize;         // radius shadows are cast from around each light, in world units; 0 a point
 		uint32_t MaxAnisotropy;     // most samples the texture filter takes along a footprint; 1 or less, none
+		// 1 when the level's surfaces take their lights as the engine's
+		// lightmaps do, 0 each linearly. The device's Lighting.
+		uint32_t Lighting;
+		uint32_t Spare;
 		// Origin, right, up and forward, as the trace shader's push constants
 		// carry them - w holding the screen flash - and the same for last frame.
 		vec4 Camera[4];

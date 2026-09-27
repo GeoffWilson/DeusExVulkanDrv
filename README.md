@@ -93,6 +93,15 @@ crash, flushed as they happen.
 
 ### New in 1.2
 
+- **The level lit as the engine lights it**: each light's falloff, its
+  brightness and the zone's ambient added up the way the engine builds its
+  lightmaps, and drawn at the brightness every device draws them at - but
+  with traced shadows (`Lighting`). The pools of light, the saturated colour
+  and the contrast of the original are back, where the lighting before was
+  flatter, greyer and dimmer. See How it works below.
+- **A neutral tone curve**, which leaves all but the brightest fifth of the
+  picture as the other devices draw it (`NeutralToneMap`); and a new default
+  `Exposure` of 90.
 - **DLSS Ray Reconstruction**, NVIDIA's denoiser and upscaler, on an RTX GPU,
   and the default there at Quality (`DLSS`, `PT DLSS`); see Noise below.
 - **Faster frames.** The CPU gathers and records the next frame while the GPU
@@ -169,6 +178,23 @@ with the engine's own `FGetHSV` and reaching `LightRadius * 25`, and everything
 the engine does to them is reproduced from `Render.dll` - which has no public
 source and was read by disassembly:
 
+- the level's surfaces as the engine builds their lightmaps (`Lighting=Engine`,
+  the default): each light by 1 - 3x^2 + 2x^3 of the way x out to its radius
+  and by the cosine, a light baked into the map at twice a dynamic one (the
+  engine filters a shadow mask out to 255, where a light without one is
+  filled at 127), added up with the zone's ambient as displayed colours,
+  clamped, and drawn at twice the texture's brightness, as every device draws
+  a lightmap. Adding lights as displayed colours is where the original's pools
+  of light and its saturation come from: overlapping lights come out brighter
+  together than light adds up. The trace takes that sum of the lights that
+  actually reach the point - a shadow ray at each of the four strongest in
+  reach and at one picked from the rest - so shadows are traced ones, and a
+  light behind a wall adds nothing. Rebuilt from the map's shadow masks, this
+  matches the engine's own lightmaps, which `PT LOOK` reads, to about 1.5%. It
+  costs about 0.9 ms of GPU time a frame (a Vandenberg room, RTX 4090, traced
+  at 1280x960). `Lighting=Linear` lights them as before 1.2, each light linear
+  to nothing at its radius in linear light: flatter, greyer and dimmer;
+
 - light types: pulse, subtle pulse, blink, flicker and strobe, on the engine's
   clock and with its exact formulas;
 - light effects: spotlights (a pawn's following where it looks), static spots,
@@ -177,8 +203,8 @@ source and was read by disassembly:
   light a lightmap texel at a time;
 - zone ambient light as the engine works it out: `FGetHSV` at the zone's
   brightness, which puts it through the engine's brightness curve, close to a
-  square root. A lightmap starts every texel at half of that; a lit mesh gets
-  all of it, with its own `AmbientGlow` (a pickup's pulse at 255), added to
+  square root. A lightmap starts every texel at half of that, which the
+  devices draw doubled; a lit mesh gets all of it, with its own `AmbientGlow` (a pickup's pulse at 255), added to
   its lights before they are clamped. Few zones set one - most of the game has
   none - but where they do, ambient-lit walls were twice as bright as the
   engine draws them;
@@ -354,7 +380,9 @@ that frames the view follows from that:
 In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 
 	Bounces=3
-	Exposure=128
+	Lighting=Engine
+	Exposure=90
+	NeutralToneMap=True
 	SkyIntensity=128
 	MaxAccumulatedFrames=256
 	LightScale=100
@@ -376,7 +404,20 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	UseS3TC=True
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
-- `Exposure`: overall brightness, a byte around a midpoint of 128.
+- `Lighting`: `Engine`, the default, lights the level's surfaces as the engine
+  builds its lightmaps, with traced shadows; `Linear` as before 1.2. See How it
+  works above. `PT LIGHTING` switches it for the session.
+- `Exposure`: overall brightness, a byte: the light is scaled by
+  0.2 + Exposure / 127.5, so 102 draws an unlit surface exactly as the other
+  devices do. 90, the default, sits a little under that, since bounced light -
+  which the rasterised game has none of - adds to every lit surface. An ini
+  from before 1.2 keeps its old 128, which is now too bright: set it to 90.
+  `PT EXPOSURE n` changes it for the session.
+- `NeutralToneMap`: the tone curve that brings the traced light into the
+  screen's range. On by default: all but the brightest fifth is left as the
+  other devices draw it, and only that is rounded off towards white. Off,
+  Reinhard's, as before 1.2, which compresses everything and greys bright
+  colours. `PT TONEMAP` switches it for the session.
 - `SkyIntensity`: the stand-in sky used only where a level has no sky zone.
 - `MaxAccumulatedFrames`: how long a still picture keeps refining.
 - `LightScale`: a percentage applied to every light's brightness.
@@ -459,7 +500,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   its material, its detail texture and its zone's ambient, and logs every light
   that reaches the spot: what the engine's lightmap takes from it and what the
   trace does, whether the level's own geometry blocks it, and which lights the
-  map's build baked into the surface with how much of each it left lit. Where
+  map's build baked into the surface with how much of each it left lit, and
+  reads the engine's own lightmap there, as the engine built it. Where
   the trace is darker than the other devices, this says which lights the
   engine lets through walls - a map lit before its geometry was finished. For
   an actor it lists the lights in its reach, with their own values and the
@@ -473,6 +515,10 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE]`: DLSS
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in.
+- `PT LIGHTING [ENGINE | LINEAR]`: the level lit as `Lighting` says, or the
+  other way.
+- `PT EXPOSURE n`, `PT TONEMAP`: the exposure, as `Exposure`, and the tone
+  curve, as `NeutralToneMap`.
 - `PT MESHLIGHT`: meshes lit as the engine lights them, or as flat surfaces are.
 - `PT DETAIL`: detail textures on or off, as the game's setting.
 - `PT MIPS`: mipmaps off and on, to compare: off, every texture is read at
@@ -495,14 +541,11 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
   while denoising.
 - A character's motion vectors follow the whole character, not its animation.
   No ghosting has been seen, but it is not exact.
-- The lighting is faithful to the engine's numbers, not yet tuned for how a
-  path traced version of them should look. Some scenes are darker or flatter
-  than the rasterised game - most where a map's lightmaps take light from
-  lamps behind its walls, which the trace keeps shadowed; `PT LOOK` at a
-  surface lists which.
-- Lights on the level fade over their radius as 1 - x. The engine's lightmaps
-  fade them as 1 - 3x^2 + 2x^3, brighter near a light and darker towards the
-  edge of its reach.
+- Lit surfaces come out brighter than in the rasterised game, by about a
+  third on screen in the rooms measured, even with direct light alone, for a
+  reason not yet found; the default `Exposure` takes up most of it. Where a
+  map's lightmaps take light from lamps behind its walls, the trace keeps
+  those shadowed, and the spot is darker; `PT LOOK` at a surface lists which.
 
 ### Building it on Windows
 

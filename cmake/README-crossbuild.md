@@ -64,7 +64,9 @@ average towards what the trace converges on - what a denoiser should arrive
 at - and `--backlight` puts the light behind the red box, so its shadow runs
 towards the camera; `--lightsize n` casts shadows from a light of that
 radius; `--detail` gives the floor a striped detail texture; `--bc1` sends
-its checker as S3TC blocks, as New Vision's textures go. The Windows SDK that `xwin` fetches carries the Direct3D
+its checker as S3TC blocks, as New Vision's textures go; `--engine-lighting`
+lights it as the device's default `Lighting=Engine` does, where the harness
+otherwise keeps to the linear lighting its scene was made for. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 

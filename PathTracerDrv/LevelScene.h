@@ -121,6 +121,10 @@ private:
 		}
 	};
 	int MirroredSurfaces = 0;
+	// The lights the level's build baked into its lightmaps, with a shadow
+	// mask on each surface they reach, which the engine counts at twice the
+	// brightness of a light without one.
+	std::unordered_set<AActor*> BakedLights;
 	std::unordered_map<AActor*, PlacedPose> PreviousPoses;
 	std::unordered_map<AActor*, PlacedPose> CurrentPoses;
 	// The first person weapon's last placement, which is not an actor's

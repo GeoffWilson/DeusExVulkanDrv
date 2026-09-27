@@ -188,6 +188,7 @@ void LevelScene::Clear()
 	SourceLevel = nullptr;
 	SourceNodeCount = 0;
 	MirroredSurfaces = 0;
+	BakedLights.clear();
 }
 
 bool LevelScene::BuildStatic(ULevel* level)
@@ -240,6 +241,11 @@ bool LevelScene::BuildStatic(ULevel* level)
 	// light augmentation turns the player into a light, a thrown flare is a
 	// light that moves, and a lamp that is shot out stops being one - none of
 	// which a list built once at level load can express.
+
+	BakedLights.clear();
+	for (INT i = 0; i < level->Model->Lights.Num(); i++)
+		if (level->Model->Lights(i))
+			BakedLights.insert(level->Model->Lights(i));
 
 	SourceLevel = level;
 	SourceNodeCount = level->Model->Nodes.Num();
@@ -641,7 +647,7 @@ void LevelScene::AddLight(AActor* actor)
 
 	light.Flags = vec4(
 		actor->LightEffect == LE_NonIncidence ? 1.0f : 0.0f,
-		actor->LightEffect == LE_Cylinder ? 1.0f : 0.0f,
+		(actor->LightEffect == LE_Cylinder ? 1.0f : 0.0f) + (BakedLights.count(actor) ? 2.0f : 0.0f),
 		changing ? 1.0f : 0.0f,
 		pattern);
 

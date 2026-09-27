@@ -130,6 +130,7 @@ int main(int argc, char** argv)
 	int dlss = -1;
 	bool still = false, reference = false, backlight = false, detail = false, bc1 = false;
 	uint32_t lightSize = 0;
+	uint32_t engineLighting = 0;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -146,6 +147,8 @@ int main(int argc, char** argv)
 			detail = true;
 		else if (!strcmp(argv[i], "--bc1"))
 			bc1 = true;
+		else if (!strcmp(argv[i], "--engine-lighting"))
+			engineLighting = 1;
 		else
 			args.push_back(argv[i]);
 	}
@@ -349,6 +352,7 @@ int main(int argc, char** argv)
 		frame.Denoise = reference ? TraceProtocol::DenoiseOff : dlss >= 0 ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd;
 		frame.LightSize = lightSize;
 		frame.MaxAnisotropy = 16;
+		frame.Lighting = engineLighting;
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
 		frame.Timing = 1;

@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <thread>
+#include <unordered_set>
 
 static double NowMs()
 {
@@ -287,7 +288,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	SupportsLazyTextures = 0;
 
 	Bounces = 3;
-	Exposure = 128;
+	Exposure = 90;
 	SkyIntensity = 128;
 	MaxAccumulatedFrames = 256;
 	VkDeviceIndex = 0;
@@ -308,6 +309,8 @@ void UPathTracerRenderDevice::StaticConstructor()
 	DetailTextures = 1;
 	MaxAnisotropy = 16.0f;
 	UseS3TC = 1;
+	Lighting = 1;
+	NeutralToneMap = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -326,6 +329,11 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("LightSize"), RF_Public) UIntProperty(CPP_PROPERTY(LightSize), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("MaxAnisotropy"), RF_Public) UFloatProperty(CPP_PROPERTY(MaxAnisotropy), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseS3TC"), RF_Public) UBoolProperty(CPP_PROPERTY(UseS3TC), TEXT("Display"), CPF_Config);
+	UEnum* lightings = new(GetClass(), TEXT("Lightings"))UEnum(nullptr);
+	new(lightings->Names)FName(TEXT("Linear"));
+	new(lightings->Names)FName(TEXT("Engine"));
+	new(GetClass(), TEXT("Lighting"), RF_Public) UByteProperty(CPP_PROPERTY(Lighting), TEXT("Display"), CPF_Config, lightings);
+	new(GetClass(), TEXT("NeutralToneMap"), RF_Public) UBoolProperty(CPP_PROPERTY(NeutralToneMap), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
@@ -346,6 +354,8 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	WidescreenFovEnabled = UseWidescreenFOV != 0;
 	PinnedAspect = UsablePinnedAspect(PinnedUI);
 	LightSizeNow = Clamp(LightSize, 0, 255);
+	EngineLightingNow = Lighting != 0;
+	NeutralToneMapNow = NeutralToneMap != 0;
 
 	// Started afresh once per run: the engine can make a new device mid
 	// session, and what led up to that is the part worth keeping.
@@ -557,15 +567,20 @@ void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
 // gets from it on the scale where 1 is full brightness - its colour at
 // FGetHSV's full brightness, times its brightness and the level's, times
 // 1 - 3x^2 + 2x^3 of the way x out to its radius, times the cosine at the
-// surface, as Render.dll builds a lightmap - whether the level's own geometry
-// is in the way, which is all that shadows a lightmap, and the linear light
-// the trace takes from it. Written to the log, strongest first.
+// surface, twice over for a light with a shadow mask, as Render.dll builds a
+// lightmap - whether the level's own geometry is in the way, which is all
+// that shadows a lightmap, and what the trace takes from it: the engine's own
+// figure with its lighting, linear light with the linear. Written to the
+// log, strongest first.
 void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, FOutputDevice& Ar)
 {
-	struct Entry { AActor* Light; float Engine[3]; float Traced[3]; float Distance, Radius, Cosine; bool Clear; };
+	struct Entry { AActor* Light; float Engine[3]; float Traced[3]; float Distance, Radius, Cosine; bool Clear, Baked; };
 	std::vector<Entry> entries;
 	const FVector from = point + normal * 2.0f;
 	const float levelBrightness = level->GetLevelInfo() ? (float)level->GetLevelInfo()->Brightness : 1.0f;
+	std::unordered_set<AActor*> baked;
+	for (INT i = 0; level->Model && i < level->Model->Lights.Num(); i++)
+		baked.insert(level->Model->Lights(i));
 	for (INT i = 0; i < level->Actors.Num(); i++)
 	{
 		AActor* light = level->Actors(i);
@@ -581,8 +596,9 @@ void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& p
 		const float cosine = (toLight | normal) / distance;
 		if (cosine <= 0.0f && light->LightEffect != LE_NonIncidence)
 			continue;
-		float incidence = light->LightEffect == LE_NonIncidence ? 1.0f : cosine;
+		const float incidence = light->LightEffect == LE_NonIncidence ? 1.0f : cosine;
 		// A spotlight's cone, as the trace and Render.dll take it.
+		float spot = 1.0f;
 		if (light->LightEffect == LE_Spotlight || light->LightEffect == LE_StaticSpot)
 		{
 			APawn* pawn = Cast<APawn>(light);
@@ -591,20 +607,24 @@ void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& p
 			if (along <= edge)
 				continue;
 			const float f = (along - edge) / Max(1.0f - edge, 0.0001f);
-			incidence *= f * f;
+			spot = f * f;
 		}
 		const float x = distance / radius;
 		const float smooth = 1.0f - 3.0f * x * x + 2.0f * x * x * x;
 		const float brightness = light->LightBrightness / 255.0f;
+		const float mask = baked.count(light) ? 2.0f : 1.0f;
 		const FPlane c = FGetHSV(light->LightHue, light->LightSaturation, 255);
 		Entry e;
 		e.Light = light;
 		const float colour[3] = { c.X, c.Y, c.Z };
 		for (int k = 0; k < 3; k++)
 		{
-			e.Engine[k] = colour[k] * brightness * levelBrightness * smooth * incidence;
-			e.Traced[k] = powf(colour[k], 2.2f) * brightness * (1.0f - x) * incidence;
+			e.Engine[k] = Min(mask * colour[k] * brightness * levelBrightness * smooth * spot * incidence, 1.0f);
+			e.Traced[k] = EngineLightingNow
+				? Min(mask * colour[k] * brightness * smooth * spot * incidence, 1.0f)
+				: powf(colour[k], 2.2f) * brightness * (1.0f - x) * spot * incidence;
 		}
+		e.Baked = baked.count(light) != 0;
 		e.Distance = distance;
 		e.Radius = radius;
 		e.Cosine = cosine;
@@ -633,13 +653,15 @@ void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& p
 	for (size_t i = 0; i < entries.size() && i < 24; i++)
 	{
 		const Entry& e = entries[i];
-		debugf(TEXT("  %s %s: brightness %d hue %d saturation %d, %.0f of %.0f away, cosine %.2f, %s; engine %.3f %.3f %.3f, trace %.4f %.4f %.4f"),
+		debugf(TEXT("  %s %s: brightness %d hue %d saturation %d, %.0f of %.0f away, cosine %.2f, %s, %s; engine %.3f %.3f %.3f, trace %.4f %.4f %.4f"),
 			e.Light->GetName(), e.Light->GetClass()->GetName(), (int)e.Light->LightBrightness, (int)e.Light->LightHue,
 			(int)e.Light->LightSaturation, e.Distance, e.Radius, e.Cosine, e.Clear ? TEXT("clear") : TEXT("BLOCKED"),
+			e.Baked ? TEXT("baked") : TEXT("dynamic"),
 			e.Engine[0], e.Engine[1], e.Engine[2], e.Traced[0], e.Traced[1], e.Traced[2]);
 	}
-	debugf(TEXT("  engine's lightmap, unclear lights too: %.3f %.3f %.3f; the clear ones: %.3f %.3f %.3f (1 is full brightness, before the ambient); trace, the clear ones: %.4f %.4f %.4f linear"),
-		engineAll[0], engineAll[1], engineAll[2], engineClear[0], engineClear[1], engineClear[2], tracedClear[0], tracedClear[1], tracedClear[2]);
+	debugf(TEXT("  engine's lightmap, unclear lights too: %.3f %.3f %.3f; the clear ones: %.3f %.3f %.3f (1 is the lightmap's full, which the devices draw at twice the texture, before the ambient); trace, the clear ones: %.4f %.4f %.4f %s"),
+		engineAll[0], engineAll[1], engineAll[2], engineClear[0], engineClear[1], engineClear[2], tracedClear[0], tracedClear[1], tracedClear[2],
+		EngineLightingNow ? TEXT("as displayed, summed as the engine sums them") : TEXT("linear"));
 	Ar.Logf(TEXT("PT: %d lights reach this point, %d unblocked; engine lightmap %.2f, trace %.3f (green); details in the log"),
 		(int)entries.size(), clearCount, engineClear[1], tracedClear[1]);
 }
@@ -1675,13 +1697,14 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.GlossBounces = (uint32_t)Clamp(GlossBounces, 0, 255);
 				// DetailTextures is the engine's own switch, the one the
 				// display settings set, and is honoured as it changes.
-				frame.DisableBits = DisableBits | (DetailTextures ? 0u : 2048u);
+				frame.DisableBits = DisableBits | (DetailTextures ? 0u : 2048u) | (NeutralToneMapNow ? 8192u : 0u);
 				frame.ViewMode = (uint32_t)ViewMode;
 				frame.DebugMode = (uint32_t)DebugMode;
 				frame.Denoise = !DenoiseEnabled ? TraceProtocol::DenoiseOff : (DlssEnabled ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd);
 				frame.DlssQuality = (uint32_t)DlssQualityNow;
 				frame.LightSize = (uint32_t)LightSizeNow;
 				frame.MaxAnisotropy = (uint32_t)Clamp(appRound(MaxAnisotropy), 0, 16);
+				frame.Lighting = EngineLightingNow ? 1 : 0;
 				frame.Materials = MaterialsEnabled ? 1 : 0;
 				frame.RestartDenoiser = DenoiseRestart ? 1 : 0;
 				frame.Timing = LogTimings ? 1 : 0;
@@ -2134,6 +2157,9 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 					Ar.Logf(TEXT("PT: zone %s has no ambient"), zone ? zone->GetName() : TEXT("none"));
 				DescribeLightingAt(player->XLevel, hit.Location, hit.Normal, texture,
 					node.iSurf < model->Surfs.Num() && (model->Surfs(node.iSurf).PolyFlags & PF_SpecialLit) != 0, Ar);
+				LightmapProbeSurf = node.iSurf;
+				LightmapProbePoint = hit.Location;
+				LightmapProbeUntil = FrameIndex + 30;
 				// The lights the level's build baked into this surface's
 				// lightmap, and how much of each one's shadow mask it left lit:
 				// what the engine's own shadows are made of.
@@ -2268,6 +2294,40 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		{
 			WidescreenFovEnabled = !WidescreenFovEnabled;
 			Ar.Logf(TEXT("PT: widescreen field of view %s"), WidescreenFovEnabled ? TEXT("on (Hor+)") : TEXT("off (the engine's own, cropped top and bottom)"));
+			handled = true;
+		}
+		// The exposure for the session, as the ini's Exposure: 0 to 255 for
+		// 0.2 to 2.2.
+		if (ParseCommand(&Cmd, TEXT("EXPOSURE")))
+		{
+			while (*Cmd == ' ')
+				Cmd++;
+			if (*Cmd)
+				Exposure = (BYTE)Clamp(appAtoi(Cmd), 0, 255);
+			Ar.Logf(TEXT("PT: exposure %d, %.2f  (PT EXPOSURE 0-255; 102 is 1.0)"), (int)Exposure, 0.2f + Exposure * (2.0f / 255.0f));
+			handled = true;
+		}
+		// Reinhard's tone curve or the neutral one; see the shaders' toneMap.
+		if (ParseCommand(&Cmd, TEXT("TONEMAP")))
+		{
+			NeutralToneMapNow = !NeutralToneMapNow;
+			Ar.Logf(TEXT("PT: %s tone curve"), NeutralToneMapNow ? TEXT("the neutral") : TEXT("Reinhard's"));
+			handled = true;
+		}
+		// The engine's lighting or the linear; with no word, the other one.
+		if (ParseCommand(&Cmd, TEXT("LIGHTING")))
+		{
+			if (ParseCommand(&Cmd, TEXT("ENGINE")))
+				EngineLightingNow = true;
+			else if (ParseCommand(&Cmd, TEXT("LINEAR")))
+				EngineLightingNow = false;
+			else
+				EngineLightingNow = !EngineLightingNow;
+			AccumulatedFrames = 0;
+			DenoiseRestart = true;
+			Ar.Logf(TEXT("PT: %s  (PT LIGHTING [ENGINE | LINEAR])"), EngineLightingNow
+				? TEXT("the engine's lighting: its lightmaps' falloff and sum, with traced shadows")
+				: TEXT("linear lighting: each light straight down to nothing at its radius"));
 			handled = true;
 		}
 		if (ParseCommand(&Cmd, TEXT("LIGHTSIZE")))
@@ -2459,7 +2519,83 @@ void UPathTracerRenderDevice::Exit()
 
 // --- Everything the engine pushes that this device does not use --------------
 
-void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet) {}
+// The engine's surfaces are traced from the level itself, so nothing is drawn
+// here. What arrives is still worth one look: the lightmap the engine built
+// for the surface, which is the ground truth PT LOOK compares the trace with.
+void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet)
+{
+	if (LightmapProbeSurf < 0)
+		return;
+	if (FrameIndex > LightmapProbeUntil)
+	{
+		debugf(TEXT("PT: the engine did not draw that surface's lightmap in the frames after PT LOOK"));
+		LightmapProbeSurf = -1;
+		return;
+	}
+	UModel* model = Surface.Level ? Surface.Level->Model : nullptr;
+	if (!model || !Facet.Polys)
+		return;
+	FSavedPoly* poly = nullptr;
+	for (FSavedPoly* p = Facet.Polys; p && !poly; p = p->Next)
+		if (p->iNode >= 0 && p->iNode < model->Nodes.Num() && model->Nodes(p->iNode).iSurf == LightmapProbeSurf && p->NumPts >= 3)
+			poly = p;
+	if (!poly)
+		return;
+	LightmapProbeSurf = -1;
+
+	FTextureInfo* lm = Surface.LightMap;
+	if (!lm || !lm->Mips[0] || !lm->Mips[0]->DataPtr)
+	{
+		debugf(TEXT("PT: the engine drew that surface with no lightmap"));
+		return;
+	}
+	// The facet's mapping is in the same space as its points, which may be
+	// the camera's: find the probe point in whichever space lies on the
+	// polygon's plane.
+	const FVector a = poly->Pts[0]->Point, b = poly->Pts[1]->Point, c = poly->Pts[2]->Point;
+	const FVector normal = ((b - a) ^ (c - a)).SafeNormal();
+	const FVector world = LightmapProbePoint;
+	const FVector camera = LightmapProbePoint.TransformPointBy(Frame->Coords);
+	const float offWorld = Abs((world - a) | normal), offCamera = Abs((camera - a) | normal);
+	const FVector point = offCamera < offWorld ? camera : world;
+	const FCoords& map = Facet.MapCoords;
+	const float u = ((map.XAxis | point) - (map.XAxis | map.Origin) - lm->Pan.X) / lm->UScale;
+	const float v = ((map.YAxis | point) - (map.YAxis | map.Origin) - lm->Pan.Y) / lm->VScale;
+
+	// RGBA7 texels, their B field red as the devices read it, each seven
+	// bits; a device uploads them doubled and blends them doubled again, so
+	// 127 draws a texture at twice its brightness.
+	const INT pitch = lm->Mips[0]->USize;
+	const FColor* texels = (const FColor*)lm->Mips[0]->DataPtr;
+	auto texel = [&](INT x, INT y, int k) -> float
+	{
+		x = Clamp(x, 0, Max(lm->UClamp, 1) - 1);
+		y = Clamp(y, 0, Max(lm->VClamp, 1) - 1);
+		const FColor& t = texels[x + y * pitch];
+		return (float)(k == 0 ? t.B : (k == 1 ? t.G : t.R));
+	};
+	const INT x0 = appFloor(u), y0 = appFloor(v);
+	const float fu = u - x0, fv = v - y0;
+	float value[3], peak[3] = {}, mean[3] = {};
+	for (int k = 0; k < 3; k++)
+	{
+		value[k] = (texel(x0, y0, k) * (1 - fu) + texel(x0 + 1, y0, k) * fu) * (1 - fv)
+			+ (texel(x0, y0 + 1, k) * (1 - fu) + texel(x0 + 1, y0 + 1, k) * fu) * fv;
+		for (INT y = 0; y < lm->VClamp; y++)
+			for (INT x = 0; x < lm->UClamp; x++)
+			{
+				const float t = texel(x, y, k);
+				peak[k] = Max(peak[k], t);
+				mean[k] += t;
+			}
+		mean[k] /= Max(lm->UClamp * lm->VClamp, 1);
+	}
+	debugf(TEXT("PT: the engine's own lightmap there (%s space, %.2f off the plane): texel %.1f %.1f of %dx%d; %.1f %.1f %.1f of 127, so drawn at %.3f %.3f %.3f of the texture; the whole lightmap peaks at %.0f %.0f %.0f and averages %.1f %.1f %.1f"),
+		offCamera < offWorld ? TEXT("camera") : TEXT("world"), Min(offWorld, offCamera), u, v, lm->UClamp, lm->VClamp,
+		value[0], value[1], value[2], value[0] * 4.0f / 255.0f, value[1] * 4.0f / 255.0f, value[2] * 4.0f / 255.0f,
+		peak[0], peak[1], peak[2], mean[0], mean[1], mean[2]);
+}
+
 void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span) {}
 // The engine's 2D drawing: HUD, menus, console, subtitles, the mouse cursor.
 //

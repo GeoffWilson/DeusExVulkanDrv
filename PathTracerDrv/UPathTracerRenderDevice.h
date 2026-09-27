@@ -166,6 +166,21 @@ public:
 	// PT LIGHTSIZE n changes it for the session.
 	INT LightSize;
 	FLOAT MaxAnisotropy;
+	// How the level's surfaces take their lights ("Lighting" in the ini).
+	// Engine, the default, as Render.dll builds its lightmaps: each light by
+	// its falloff and the cosine as displayed, a light baked into the level
+	// at twice a dynamic one, added up as displayed colours with the zone's
+	// ambient and drawn at twice the texture as every device draws a
+	// lightmap - but of the lights the trace finds reaching the point, so
+	// the shadows are real ones. Linear, as before 1.2: each light linear
+	// to nothing at its radius, in linear light, flatter and dimmer. PT
+	// LIGHTING switches it for the session.
+	BYTE Lighting;
+	// The tone curve: the neutral one, the default, leaves all but the
+	// brightest fifth as it is, as the engine's own devices draw it, and
+	// bends only that towards white; off, Reinhard's, which compresses
+	// everything. PT TONEMAP switches it for the session.
+	BITFIELD NeutralToneMap;
 
 private:
 	FString DescribeDenoiser() const;
@@ -242,6 +257,15 @@ private:
 	bool WidescreenFovEnabled = true;
 	float PinnedAspect = 4.0f / 3.0f;
 	int LightSizeNow = 4;
+	// PT LIGHTING and PT TONEMAP, for the session.
+	bool EngineLightingNow = true;
+	bool NeutralToneMapNow = true;
+	// PT LOOK's probe of the engine's own lightmap: the surface and point it
+	// hit, read from the lightmap the engine hands DrawComplexSurface for
+	// that surface over the next few frames.
+	INT LightmapProbeSurf = -1;
+	FVector LightmapProbePoint;
+	uint32_t LightmapProbeUntil = 0;
 	bool DenoiseRestart = true;
 	// Which part of the picture PT VIEW shows in its place, as the trace
 	// shader numbers them; 0 for the picture itself.

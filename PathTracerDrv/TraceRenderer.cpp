@@ -172,7 +172,7 @@ void TraceRenderer::CreateFinishPipeline()
 
 	FinishPipelineLayout = PipelineLayoutBuilder()
 		.AddSetLayout(FinishLayout.get())
-		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vec4))
+		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vec4) * 2)
 		.DebugName("PathTracerFinishPipelineLayout")
 		.Create(Device);
 
@@ -839,7 +839,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	PushConstants.Params = vec4(
 		frame.Exposure,
 		frame.SkyIntensity,
-		0.5f,     // ray epsilon, in world units: these levels are big
+		frame.Lighting ? 1.0f : 0.0f,
 		(float)(frame.ViewMode ? frame.ViewMode : frame.DebugMode));
 
 	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
@@ -882,7 +882,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 
 		struct { vec4 Flash; vec4 Exposure; } finish;
 		finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
-		finish.Exposure = vec4(frame.Exposure, Denoise->HasSpecular() ? 1.0f : 0.0f, 0.0f, 0.0f);
+		finish.Exposure = vec4(frame.Exposure, Denoise->HasSpecular() ? 1.0f : 0.0f, (frame.DisableBits & 8192u) ? 1.0f : 0.0f, 0.0f);
 		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
 		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, CompositeSet.get());
 		commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
@@ -923,10 +923,12 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
 		if (reconstructed)
 		{
-			const vec4 flash(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
+			struct { vec4 Flash; vec4 Mode; } finish;
+			finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
+			finish.Mode = vec4((frame.DisableBits & 8192u) ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
 			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipeline.get());
 			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipelineLayout.get(), 0, FinishSet.get());
-			commands->pushConstants(FinishPipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(flash), &flash);
+			commands->pushConstants(FinishPipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
 			commands->dispatch((OutputWidth + 7) / 8, (OutputHeight + 7) / 8, 1);
 		}
 		LastDenoiser = reconstructed ? DenoiseDlss : DenoiseOff;
