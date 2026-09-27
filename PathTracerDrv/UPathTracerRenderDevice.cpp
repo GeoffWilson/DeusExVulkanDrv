@@ -1328,6 +1328,11 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 {
 	guardSlow(UPathTracerRenderDevice::SetSceneNode);
 
+	if (LogDraws && LoggedDraws++ < 400)
+		debugf(TEXT("PT TILES: scene node %dx%d at %d %d, from %.0f %.0f %.0f, viewport actor %s"),
+			Frame->X, Frame->Y, Frame->XB, Frame->YB, Frame->Coords.Origin.X, Frame->Coords.Origin.Y, Frame->Coords.Origin.Z,
+			(Frame->Viewport && Frame->Viewport->Actor) ? Frame->Viewport->Actor->GetName() : TEXT("none"));
+
 	// The first scene node of a frame is the player's view. Later ones are
 	// mirrors, skyboxes and the weapon, which this device does not yet treat
 	// separately - taking the first keeps the camera stable.
@@ -1446,6 +1451,9 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 		FlashFog = InFlashFog;
 		TileVertices.clear();
 		TileBatches.clear();
+		LogDraws = LogDrawsArmed;
+		LogDrawsArmed = false;
+		LoggedDraws = 0;
 	}
 	catch (const std::exception& e)
 	{
@@ -2302,6 +2310,14 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		}
 		// The engine's own shadow masks on its baked lights, with the
 		// engine's lighting (Disable bit 16384 leaves them out).
+		// Every 2D draw of the next frame, to the log: what the HUD and the
+		// menus hand this device, to find what it leaves out.
+		if (ParseCommand(&Cmd, TEXT("TILES")))
+		{
+			LogDrawsArmed = true;
+			Ar.Logf(TEXT("PT: the next frame's 2D draws go to the log"));
+			return 1;
+		}
 		if (ParseCommand(&Cmd, TEXT("BAKEDSHADOWS")))
 		{
 			DisableBits ^= 16384u;
@@ -2641,7 +2657,86 @@ void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo
 	}
 }
 
-void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span) {}
+// A mesh the engine draws. The level's own come with the span buffer they
+// were found visible through, and the trace has them already; so does the
+// first person weapon, which the canvas draws over the view without one.
+//
+// What the trace does not have is the vision augmentation's heat sources: the
+// HUD (AugmentationDisplayWindow, through Extension's XGC::DrawActor) draws
+// every person and body in reach over the view, through walls, unlit, at
+// twice its glow and in the style it set - translucent - each skin swapped
+// for static by GetGridTexture: WhiteStatic, or in multiplayer Virus_SFX or
+// Wepn_Prifle_SFX for an enemy or an ally (and BlackMaskTex, black, which
+// adds nothing). Those are drawn here, over the traced picture with the rest
+// of the HUD, in the order it draws them.
+void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span)
+{
+	guardSlow(UPathTracerRenderDevice::DrawGouraudPolygon);
+
+	if (LogDraws && LoggedDraws++ < 400)
+		debugf(TEXT("PT TILES: mesh polygon %s, %d corners, first at %.0f %.0f, flags 0x%x%s"),
+			Info.Texture ? Info.Texture->GetFullName() : TEXT("none"), NumPts, NumPts > 0 ? Pts[0]->ScreenX : 0.0f, NumPts > 0 ? Pts[0]->ScreenY : 0.0f,
+			(int)PolyFlags, Span ? TEXT(", in the level") : TEXT(""));
+
+	if (Span || !Textures || TraceWidth <= 0 || TraceHeight <= 0 || NumPts < 3 || !Info.Texture)
+		return;
+	static const FName whiteStatic(TEXT("WhiteStatic")), virus(TEXT("Virus_SFX")), rifle(TEXT("Wepn_Prifle_SFX"));
+	const FName name = Info.Texture->GetFName();
+	if (name != whiteStatic && name != virus && name != rifle)
+		return;
+	if (!LoggedVisionMesh)
+	{
+		debugf(TEXT("PathTracer: drawing the vision augmentation's heat sources over the view (%s, flags 0x%x)"), Info.Texture->GetFullName(), (int)PolyFlags);
+		LoggedVisionMesh = true;
+	}
+
+	const DWORD flags = PolyFlags | Info.Texture->PolyFlags;
+	const bool masked = (flags & PF_Masked) != 0 && (flags & PF_Modulated) == 0;
+	CachedTexture* texture = Textures->Get(Info, masked);
+	if (!texture)
+		return;
+	const int blendMode = (flags & PF_Translucent) ? 1 : ((flags & PF_Modulated) ? 2 : 0);
+	const int samplerMode = (PolyFlags & PF_NoSmooth) ? 1 : 0;
+	if (!TileSet(texture, samplerMode))
+		return;
+
+	// Placed as a tile is: in the frame's pixels, offset to where the frame
+	// sits, and to where the UI does when it is pinned.
+	const float sx = 2.0f / (float)TraceWidth;
+	const float sy = 2.0f / (float)TraceHeight;
+	const float uScale = Info.USize > 0 ? 1.0f / (Info.UScale * Info.USize) : 0.0f;
+	const float vScale = Info.VSize > 0 ? 1.0f / (Info.VScale * Info.VSize) : 0.0f;
+	auto corner = [&](const FTransTexture* p) -> TileVertex
+	{
+		const float x = p->ScreenX + Frame->XB + (float)UiOffsetX;
+		const float y = p->ScreenY + Frame->YB;
+		const vec4 colour = (flags & PF_Modulated) ? vec4(1.0f, 1.0f, 1.0f, 1.0f) : vec4(p->Light.X, p->Light.Y, p->Light.Z, 1.0f);
+		return { vec2(x * sx - 1.0f, y * sy - 1.0f), vec2(p->U * uScale, p->V * vScale), colour };
+	};
+
+	if (TileBatches.empty() || TileBatches.back().Texture != texture || TileBatches.back().BlendMode != blendMode ||
+		TileBatches.back().SamplerMode != samplerMode)
+	{
+		TileBatch batch;
+		batch.Texture = texture;
+		batch.BlendMode = blendMode;
+		batch.SamplerMode = samplerMode;
+		batch.FirstVertex = (int)TileVertices.size();
+		batch.VertexCount = 0;
+		TileBatches.push_back(batch);
+	}
+	// A fan, as the engine gives a polygon.
+	const TileVertex first = corner(Pts[0]);
+	for (int i = 1; i + 1 < NumPts; i++)
+	{
+		TileVertices.push_back(first);
+		TileVertices.push_back(corner(Pts[i]));
+		TileVertices.push_back(corner(Pts[i + 1]));
+		TileBatches.back().VertexCount += 3;
+	}
+
+	unguardSlow;
+}
 // The engine's 2D drawing: HUD, menus, console, subtitles, the mouse cursor.
 //
 // Collected here rather than drawn, because the traced image does not exist yet
@@ -2650,6 +2745,11 @@ void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo
 void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags)
 {
 	guardSlow(UPathTracerRenderDevice::DrawTile);
+
+	if (LogDraws && LoggedDraws++ < 400)
+		debugf(TEXT("PT TILES: tile %s at %.0f %.0f size %.0f %.0f flags 0x%x colour %.2f %.2f %.2f%s"),
+			Info.Texture ? Info.Texture->GetFullName() : TEXT("none"), X, Y, XL, YL, (int)PolyFlags, Color.X, Color.Y, Color.Z,
+			Span ? TEXT(", in the level") : TEXT(""));
 
 	if (!Textures || TraceWidth <= 0 || TraceHeight <= 0)
 		return;
@@ -2764,9 +2864,21 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 
 	unguardSlow;
 }
-void UPathTracerRenderDevice::Draw2DLine(FSceneNode* Frame, FPlane Color, DWORD LineFlags, FVector P1, FVector P2) {}
-void UPathTracerRenderDevice::Draw2DPoint(FSceneNode* Frame, FPlane Color, DWORD LineFlags, FLOAT X1, FLOAT Y1, FLOAT X2, FLOAT Y2, FLOAT Z) {}
-void UPathTracerRenderDevice::ClearZ(FSceneNode* Frame) {}
+void UPathTracerRenderDevice::Draw2DLine(FSceneNode* Frame, FPlane Color, DWORD LineFlags, FVector P1, FVector P2)
+{
+	if (LogDraws && LoggedDraws++ < 400)
+		debugf(TEXT("PT TILES: line from %.0f %.0f to %.0f %.0f (not drawn)"), P1.X, P1.Y, P2.X, P2.Y);
+}
+void UPathTracerRenderDevice::Draw2DPoint(FSceneNode* Frame, FPlane Color, DWORD LineFlags, FLOAT X1, FLOAT Y1, FLOAT X2, FLOAT Y2, FLOAT Z)
+{
+	if (LogDraws && LoggedDraws++ < 400)
+		debugf(TEXT("PT TILES: point %.0f %.0f to %.0f %.0f (not drawn)"), X1, Y1, X2, Y2);
+}
+void UPathTracerRenderDevice::ClearZ(FSceneNode* Frame)
+{
+	if (LogDraws && LoggedDraws++ < 400)
+		debugf(TEXT("PT TILES: clear depth"));
+}
 void UPathTracerRenderDevice::PushHit(const BYTE* Data, INT Count) {}
 void UPathTracerRenderDevice::PopHit(INT Count, UBOOL bForce) {}
 void UPathTracerRenderDevice::GetStats(TCHAR* Result) { Result[0] = 0; }

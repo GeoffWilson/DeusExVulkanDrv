@@ -2230,6 +2230,25 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 
 
+// A tool in the player's hands - a lockpick, a multitool, the key ring, a
+// medkit. Deus Ex holds one in its player's inHand rather than as the pawn's
+// Weapon, and draws it as a weapon is drawn (DeusExPlayer.RenderOverlays).
+static AInventory* HeldTool(APawn* pawn)
+{
+	// Looked up once for the player's class rather than every frame.
+	static UClass* lookedUp = nullptr;
+	static UObjectProperty* property = nullptr;
+	if (pawn->GetClass() != lookedUp)
+	{
+		lookedUp = pawn->GetClass();
+		property = FindField<UObjectProperty>(lookedUp, TEXT("inHand"));
+	}
+	if (!property)
+		return nullptr;
+	AInventory* item = Cast<AInventory>(*(UObject**)((BYTE*)pawn + property->Offset));
+	return (item && !item->IsA(AWeapon::StaticClass())) ? item : nullptr;
+}
+
 // The weapon or tool in the player's hands.
 //
 // The engine draws this as a separate view space pass with its own field of
@@ -2242,10 +2261,12 @@ void LevelScene::AddViewModel()
 
 	// Seen from behind, the view is not from the eyes it would be drawn at.
 	APawn* pawn = Cast<APawn>(ViewActor);
-	if (!pawn || !pawn->Weapon || ViewFromBehind)
+	if (!pawn || ViewFromBehind)
 		return;
 
-	AInventory* item = pawn->Weapon;
+	AInventory* item = pawn->Weapon ? (AInventory*)pawn->Weapon : HeldTool(pawn);
+	if (!item)
+		return;
 
 	// Deus Ex puts the first person model on the inventory actor's own Mesh and
 	// hides the actor, rather than filling in PlayerViewMesh - which is why the

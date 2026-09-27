@@ -249,6 +249,7 @@ private:
 	// Said once in the log, so it can be seen that the engine's own sprites
 	// in the level are arriving and being left to the trace: see DrawTile.
 	bool LoggedWorldSprite = false;
+	bool LoggedVisionMesh = false;
 
 	// PT DENOISE, PT DLSS, PT MATERIALS, PT WIDESCREEN and PT PINNEDUI, for
 	// the session; the helper follows.
@@ -268,6 +269,11 @@ private:
 	INT LightmapProbeSurf = -1;
 	FVector LightmapProbePoint;
 	uint32_t LightmapProbeUntil = 0;
+	// PT TILES: log what the canvas hands the device in the frame after,
+	// armed by the command and live from that frame's Lock.
+	bool LogDrawsArmed = false;
+	bool LogDraws = false;
+	int LoggedDraws = 0;
 	bool DenoiseRestart = true;
 	// Which part of the picture PT VIEW shows in its place, as the trace
 	// shader numbers them; 0 for the picture itself.

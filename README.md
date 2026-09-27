@@ -163,12 +163,15 @@ straight out of `UModel` and the actor list:
   a low polygon mesh looks as rounded as it does in the original;
 - sprites, particles (steam, smoke and sparks, and the laser beams, which the
   engine draws through a render iterator), decals, environment mapped meshes,
-  the first person weapon, and animated and procedural textures (fire, water,
-  and the "wet" textures that ripple another texture);
+  the first person weapon or tool - a lockpick, a multitool, the key ring -
+  and animated and procedural textures (fire, water, and the "wet" textures
+  that ripple another texture);
 - the player: left out of the view from their own eyes, as the engine leaves
   it out, but seen in mirrors and anything else that reflects, and drawn in
   full when a conversation's camera looks on from outside;
-- the skybox, seen through the sky zone's own viewpoint as the engine draws it.
+- the skybox, seen through the sky zone's own viewpoint as the engine draws it;
+- the vision augmentation: its tints and labels, and the people and bodies it
+  shows through walls, which the HUD draws as meshes over the view.
 
 The static world is built into a bottom level acceleration structure once per
 level; everything that moves is rebuilt only when its shape changes, and placed
@@ -548,6 +551,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).
 - `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
+- `PT TILES`: logs every 2D draw of the next frame - each tile and mesh the
+  HUD and the menus hand the device, and each view - to find what it leaves
+  out.
 
 The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
 
@@ -562,6 +568,9 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
   which.
 - Some lockers come out about three times as bright as in the rasterised
   game; not yet looked into.
+- The views drawn inside the HUD - a security computer's cameras, the spy
+  drone's, the targeting augmentation's zoom - are blank: only the player's
+  own view is traced.
 
 ### Building it on Windows
 
