@@ -126,8 +126,10 @@ crash, flushed as they happen.
   under a hanging lamp dark and the ceiling above it lit.
 - **Mipmapped textures**: the packages' own mip chains, the levels the other
   devices draw, chosen per ray by how wide its footprint is where it lands,
-  so distant floors and walls no longer sparkle and crawl.
-- **New Vision**: its S3TC textures, eight times the originals' size.
+  and filtered anisotropically on the level's surfaces (`MaxAnisotropy`), so
+  distant floors and walls no longer sparkle and crawl, and a floor seen down
+  a corridor stays sharp.
+- **New Vision**'s high resolution textures (`UseS3TC`); see New Vision below.
 - **Materials off by default** until they have been checked by hand.
 - **Fixes:** a crash loading a save of the map already being played; a crash
   starting the game in a mode narrower than the screen under Proton's Wayland
@@ -203,22 +205,6 @@ They multiply the displayed colour, so the linear one takes them to the power
 2.2. The game's Detail Textures setting (`DetailTextures`) switches them, as it
 does in the other devices.
 
-New Vision's packages keep each original texture and add an S3TC version at
-eight times its size beside it; the path tracer uses those (`UseS3TC`), handed
-to the GPU still compressed - a level's worth unpacked would run to gigabytes -
-and read off disk only long enough to send, so the game's 32 bit process is
-not left holding them. The engine takes a package from the first entry in
-`Paths` that has one, so New Vision's two lines have to come before the
-stock ones in `[Core.System]`, not after them as its readme says:
-
-	Paths=..\System\*.u
-	Paths=..\NewVision\Maps\*.dx
-	Paths=..\NewVision\Textures\*.utx
-	Paths=..\Maps\*.dx
-	Paths=..\Textures\*.utx
-
-`PT LOOK` says which file a surface's texture came from, and its S3TC size.
-
 Textures are sampled with their mips - the chains the packages store, which
 are what the other devices upload - at a level chosen per ray from a cone
 traced alongside it ("Texture Level of Detail Strategies for Real-Time Ray
@@ -230,9 +216,10 @@ level, its movers, decals, sprites - how its texture coordinates change
 across it too: from those the footprint's two axes go to the texture unit,
 which filters anisotropically along the longer (`MaxAnisotropy`), so a floor
 seen at a glance down a corridor stays sharp and still. A mesh's is filtered
-by the middle of its footprint's two axes. Masked textures are still tested for holes at their
-full size, so a grille keeps its bars. A texture that changes as it is drawn -
-fire, water, a screen - is sent without mips, as its frames are.
+by the middle of its footprint's two axes. Masked textures are still tested
+for holes at their full size, so a grille keeps its bars. A texture that
+changes as it is drawn - fire, water, a screen - is sent without mips, as its
+frames are.
 
 Each shaded point samples one light, chosen in proportion to its contribution
 from the lights listed for its cell of a uniform grid over the level, and fires
@@ -440,8 +427,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   one does. 0 casts from a point: hard all the way out, which NRD blurs
   evenly and DLSS keeps. `PT LIGHTSIZE n` changes it for the session.
 - `UseS3TC`: use the S3TC textures a package carries beside its originals,
-  as OpenGLDrv's setting of the same name does - New Vision's (below). On by
-  default; a package without them is unaffected.
+  as OpenGLDrv's setting of the same name does - New Vision's (see New Vision
+  below). On by default; a package without them is unaffected.
 - `MaxAnisotropy`: the texture filter's anisotropy, as the other devices call
   it: how many samples it may take along a surface seen at a slant - a floor
   down a corridor - to keep it sharp without sparkling. 16 by default; 4 and 8
@@ -510,7 +497,12 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
   No ghosting has been seen, but it is not exact.
 - The lighting is faithful to the engine's numbers, not yet tuned for how a
   path traced version of them should look. Some scenes are darker or flatter
-  than the rasterised game.
+  than the rasterised game - most where a map's lightmaps take light from
+  lamps behind its walls, which the trace keeps shadowed; `PT LOOK` at a
+  surface lists which.
+- Lights on the level fade over their radius as 1 - x. The engine's lightmaps
+  fade them as 1 - 3x^2 + 2x^3, brighter near a light and darker towards the
+  edge of its reach.
 
 ### Building it on Windows
 
@@ -565,6 +557,9 @@ but had evidently never been built or run for it; the fixes that took were:
   becomes a popup of the game's window, and starting in a fullscreen mode
   narrower than the monitor ended the process with the compositor's
   "destroyed popup not top most popup". The same goes for every device here.
+- **S3TC textures** - New Vision's - were uploaded without the Vulkan device's
+  BC texture compression enabled, which NVIDIA's driver tolerates and the
+  Vulkan specification does not allow. ZVulkan enables it now.
 
 And what was added:
 
@@ -599,6 +594,39 @@ The rest of its settings, from upstream: `UseVSync`, `Hdr`, `HdrScale`, `Bloom`,
 `GammaOffset`, `LightMode`, `LODBias`, `VkDeviceIndex`, `VkDebug`,
 `VkExclusiveFullscreen`. `GetVkDevices` in the console lists the GPUs to choose
 from.
+
+## New Vision
+
+[New Vision](https://www.moddb.com/mods/new-vision) replaces the game's world
+textures with versions at up to eight times their size, and fourteen of its maps
+with its own. Its packages keep each original texture and carry an S3TC
+(DXT1) version beside it, which the engine hands only to a device that asks
+for S3TC. Every device here does: VulkanDrv, D3D11Drv and D3D12Drv with no
+setting, PathTracerDrv with `UseS3TC`, on by default.
+
+To install it, copy its `NewVision` folder into the game's folder, beside
+`System`, and add its two paths to the `[Core.System]` section of the ini -
+**before** the stock `Maps` and `Textures` lines:
+
+	Paths=..\System\*.u
+	Paths=..\NewVision\Maps\*.dx
+	Paths=..\NewVision\Textures\*.utx
+	Paths=..\Maps\*.dx
+	Paths=..\Textures\*.utx
+
+The engine loads a package from the first path that has one, so added after
+the stock lines, as New Vision's own readme says, the stock packages are
+found first and nothing changes, in any device. Removing the two lines puts
+the game back as it was.
+
+In the path tracer the S3TC textures go to the GPU still compressed - a
+level's worth unpacked runs to gigabytes - and are read off disk only long
+enough to be sent, so the game's 32 bit process is not left holding them.
+Masked ones are unpacked, so their holes work as they did. A level takes a
+little longer to load. `PT LOOK` at a wall says which file its texture came
+from and the size of its S3TC version, and the log's `PathTracer textures:`
+line counts how many went as S3TC. `UseS3TC=False` goes back to the original
+textures while leaving the paths alone.
 
 ## Building
 
