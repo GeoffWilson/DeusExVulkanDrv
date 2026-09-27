@@ -2395,6 +2395,10 @@ void LevelScene::CollectDynamic(ULevel* level)
 			mask = InstanceSeenReflected;
 		if (actor->bOwnerNoSee && actor->Owner == ViewActor)
 			mask = InstanceSeenReflected;
+		// In photo mode the body is seen from outside once the camera has
+		// left its head, where it would otherwise start inside it.
+		if (PhotoMode && (actor == ViewActor || (actor->bOwnerNoSee && actor->Owner == ViewActor)))
+			mask = (ViewOrigin - PhotoEye).SizeSquared() > 48.0f * 48.0f ? InstanceSeenFromOutside : InstanceSeenReflected;
 		if (actor->bOnlyOwnerSee && actor->Owner != ViewActor)
 			continue;
 
@@ -2428,7 +2432,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 	CollectDecals(level);
 	lap(6);
 	const size_t beforeViewModel = Instances.size();
-	AddViewModel();
+	if (!PhotoMode)
+		AddViewModel();
 	lap(7);
 	// No weapon this frame: the next one drawn has no previous placement.
 	if (Instances.size() == beforeViewModel)

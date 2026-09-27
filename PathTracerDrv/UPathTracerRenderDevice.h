@@ -443,6 +443,81 @@ private:
 	void AdvanceBench();
 	void LogBench();
 
+	// PT PHOTO: the world held still and a camera flown free through it,
+	// the picture refined sample by sample while the camera rests, and
+	// saved to a file. See PhotoMode.cpp.
+	struct PhotoState
+	{
+		// Frames the camera holds still before the preview gives way to the
+		// picture refined sample by sample, so that stopping to look around
+		// does not start it over and over; the most samples a pixel averages,
+		// as the trace shader's history keeps count; and the bounces a
+		// photo's paths are allowed, more than a frame can afford.
+		static const int SettleFrames = 8;
+		static const uint32_t MaxSamples = 4095;
+		static const int PathBounces = 8;
+		static const int GlossyBounces = 3;
+
+		bool Active = false;
+		// The player and level it began in, and what it changed on them,
+		// put back as it ends.
+		APlayerPawn* Pawn = nullptr;
+		ULevel* Level = nullptr;
+		FName State;
+		BYTE Physics = 0;
+		FVector Velocity = FVector(0, 0, 0), Acceleration = FVector(0, 0, 0);
+		FRotator Rotation = FRotator(0, 0, 0), ViewRotation = FRotator(0, 0, 0);
+		FLOAT EyeHeight = 0.0f;
+		bool PlayersOnly = false;
+		// The body's pose when it began, drawn in place of the one the
+		// flying plays.
+		FName AnimSequence;
+		FLOAT AnimFrame = 0.0f, AnimRate = 0.0f, TweenRate = 0.0f, AnimLast = 0.0f, AnimMinRate = 0.0f, OldAnimRate = 0.0f;
+		FPlane SimAnim = FPlane(0, 0, 0, 0);
+		// The key bindings set aside, by key, and the input they came from.
+		UInput* Input = nullptr;
+		std::vector<std::pair<int, FString>> Bindings;
+		// The free camera: where the body's eyes were, and where the camera
+		// is now.
+		FVector Eye = FVector(0, 0, 0);
+		FVector Position = FVector(0, 0, 0);
+		double LastMs = 0.0;
+		// The level's clock and the flashlight, held as they were.
+		float Time = 0.0f;
+		vec4 Flashlight[3] = {};
+		// Frames the camera has held still, and whether the picture is
+		// being refined rather than denoised.
+		int StillFrames = 0;
+		bool Accumulating = false;
+		// The lens, for the session: the aperture's radius in world units,
+		// 0 a pinhole, and the distance in focus, 0 for whatever the middle
+		// of the view meets (the trace shader's photoFocus).
+		float Aperture = 0.0f;
+		float Focus = 0.0f;
+		// The picture on its way to a file: asked for, then copied out of
+		// the frame after the Brightness, then written once the frame is.
+		bool SavePending = false;
+		bool SaveRecorded = false;
+		int SaveWidth = 0, SaveHeight = 0;
+		uint32_t SaveSamples = 0;
+		std::unique_ptr<VulkanImage> SaveImage;
+		std::unique_ptr<VulkanBuffer> SaveBuffer;
+	} Photo;
+	void PhotoCommand(const TCHAR* Cmd, FOutputDevice& Ar);
+	bool StartPhoto(FOutputDevice& Ar);
+	void EndPhoto(const TCHAR* why);
+	void CheckPhoto();
+	void RepairPhotoSave();
+	void MovePhotoCamera();
+	void SwapPhotoPose();
+	bool PhotoConsoleOpen();
+	void RecordPhotoSave(VulkanCommandBuffer* commands);
+	void WritePhoto();
+	// Whether the 2D is left out of this frame: in photo mode, unless the
+	// console is open to type into, and never in the frame a photo is taken
+	// from.
+	bool PhotoHidesTiles() { return Photo.Active && (Photo.SavePending || !PhotoConsoleOpen()); }
+
 	// Every frame's length, Unlock to Unlock, for the frame rate and the
 	// slowest frames in the timings log.
 	std::vector<float> FrameIntervals;

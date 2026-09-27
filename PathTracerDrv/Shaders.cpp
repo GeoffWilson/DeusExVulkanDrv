@@ -115,8 +115,9 @@ static std::string TraceCommon()
 		// Last frame's camera, as the push constants carry it, this frame's
 		// fixed jitter in xy (see Disable bit 256), the flashlight (see
 		// flashlightAt), which way the sky zone faces (TraceCommand's
-		// SkyAxes), then each instance's last placement as three rows.
-		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 skyAxes[3]; vec4 previousRows[]; };
+		// SkyAxes), photo mode's lens (PhotoLens), then each instance's last
+		// placement as three rows.
+		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 skyAxes[3]; vec4 photoLens; vec4 previousRows[]; };
 		// Each fog light's shadow cube, written by the pass before the trace
 		// (Shaders::FogShadows) and read by volumetricFog.
 		layout(binding = 26, std430) buffer FogShadows { float fogShadow[]; };
@@ -144,7 +145,7 @@ static std::string TraceCommon()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -1804,6 +1805,56 @@ static std::string TraceCommon()
 		}
 	)";
 
+	source += R"(
+		// Photo mode's focus when none is set: how far ahead the middle of the
+		// view meets something, as the view sees it rather than as the
+		// engine's collision would - through glass, smoke and the holes in a
+		// grate, as the view ray passes them, and far off at a window onto
+		// the sky. Every pixel traces the same ray, so all agree.
+		float photoFocus()
+		{
+			vec3 dir = normalize(CameraForward.xyz);
+			vec3 from = CameraOrigin.xyz;
+			float travelled = 0.0;
+			float start = RayEpsilon;
+			ivec2 passed[8];
+			uint passedCount = 0u;
+			for (uint layer = 0u; layer < 8u; layer++)
+			{
+				rayQueryEXT rq;
+				rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsNoneEXT, ViewRays, from, start, dir, 100000.0);
+				while (rayQueryProceedEXT(rq))
+				{
+					if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+					{
+						ivec2 candidate = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, false), rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+						bool seen = false;
+						for (uint p = 0u; p < passedCount; p++)
+							seen = seen || passed[p] == candidate;
+						if (!seen && confirmCandidate(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), candidate.y,
+								rayQueryGetIntersectionBarycentricsEXT(rq, false), false, dir, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
+							rayQueryConfirmIntersectionEXT(rq);
+					}
+				}
+				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+					return 100000.0;
+				float t = rayQueryGetIntersectionTEXT(rq, true);
+				int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+				float kind = tris[rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) + primitive].UV2Tex.w;
+				if (kind > 4.5)
+					return 100000.0;
+				if ((kind < 1.5 || kind > 2.5) && kind < 3.5)
+					return max(travelled + t, 1.0);
+				// Translucent or modulated: looked through, as the view is.
+				travelled += t;
+				from += dir * t;
+				start = 0.0;
+				passed[passedCount++] = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, true), primitive);
+			}
+			return max(travelled, 1.0);
+		}
+	)";
+
 	return source;
 }
 
@@ -1837,6 +1888,20 @@ std::string Shaders::Trace()
 			vec3 origin = CameraOrigin.xyz;
 			vec3 direction = normalize(CameraForward.xyz + CameraRight.xyz * uv.x + CameraUp.xyz * uv.y);
 			vec3 viewDirection = direction;
+
+			// Photo mode's depth of field: a thin lens, each sample's ray from
+			// a point spread over its aperture through where the pinhole's
+			// ray meets the plane in focus, so that plane alone is sharp.
+			bool photo = (Disable & 524288u) != 0u;
+			if (photo && photoLens.x > 0.0)
+			{
+				float focusDistance = photoLens.y > 0.0 ? photoLens.y : photoFocus();
+				vec3 focus = origin + direction * (focusDistance / dot(direction, CameraForward.xyz));
+				float r = photoLens.x * sqrt(randomFloat());
+				float a = 6.28318531 * randomFloat();
+				origin += (normalize(CameraRight.xyz) * cos(a) + normalize(CameraUp.xyz) * sin(a)) * r;
+				direction = normalize(focus - origin);
+			}
 
 			// The ray's footprint, for choosing mip levels (surfaceLod): a cone
 			// a pixel across at the eye - an output pixel across when Ray
@@ -2746,7 +2811,9 @@ std::string Shaders::Trace()
 			const float shadowUnit = 4096.0;
 			float recentShadow = floor(stored.a / shadowUnit);
 			float samples = stored.a - recentShadow * shadowUnit;
-			if (primaryMoverShadow)
+			if (photo)
+				recentShadow = 0.0;
+			else if (primaryMoverShadow)
 				recentShadow = 8.0;
 			else
 				recentShadow = max(recentShadow - 1.0, 0.0);
@@ -2755,6 +2822,13 @@ std::string Shaders::Trace()
 			{
 				// The device invalidated everything, typically a camera move.
 				samples = 0.0;
+			}
+			else if (photo)
+			{
+				// Photo mode: the world is frozen and the view still, so every
+				// frame is another sample of the same picture - whatever the
+				// jitter, the lens or a flickering light puts under the pixel
+				// this time.
 			}
 			else if (primaryChanged)
 			{

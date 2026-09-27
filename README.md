@@ -141,6 +141,13 @@ crash, flushed as they happen.
   the bounces so nothing is counted twice: the same light, with far less
   noise - and turned up tenfold by default, so that neon spills its colour
   onto the walls around it (`GlowLighting`, `PT GLOW n`).
+- **Photo mode.** `PT PHOTO` holds the world still and lets the camera fly
+  free through it, through walls and out of the level, with the usual
+  movement keys and mouse. JC is left standing where he was, for the camera
+  to look back at. Hold still and the picture refines: the denoiser gives way
+  to every frame's samples averaged, up to 4095 a pixel, with more bounces
+  than play can afford. Fire saves it as a PNG in `Photos` beside `System`,
+  and `PT PHOTO APERTURE n` adds depth of field. See the commands below.
 
 ### New in 1.2
 
@@ -677,6 +684,26 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT GLOWSAMPLING`: glowing surfaces found only by the bounces that reach
   them, as before, or sampled as lights as well, to compare. The two should
   settle to the same picture.
+- `PT PHOTO`: photo mode on or off. The world is held still - the level's own
+  players only switch, so nothing else moves, fires, talks or triggers - and
+  the camera flies free with the movement keys and the mouse: jump and
+  crouch rise and sink, and the walk key goes slowly. The HUD, the weapon and
+  the screen flashes are left out, and JC stands where he was. While the
+  camera moves the picture is denoised; once it has held still for a moment
+  it refines instead, every frame's samples averaged, up to 4095 a pixel.
+  Fire (or `PT PHOTO SAVE`) saves the picture as a PNG in `Photos`, beside
+  `System`, named for the map and the time; the console says where, and how
+  many samples it had. Every key but moving, looking, the console, the menu,
+  pause and screenshots is set aside while it is on - QuickSave takes the
+  photo - and `PT PHOTO`, or opening the menu or any screen, ends it and puts
+  JC back as he was. It starts only while JC walks or swims, not in a
+  conversation or a cutscene.
+- `PT PHOTO APERTURE n`, `PT PHOTO FOCUS n | AUTO`: depth of field for photo
+  mode. The aperture is the lens's radius in world units - 0, the default, is
+  a pinhole with everything sharp, and 2 to 10 blur a room's background - and
+  the focus is how far ahead is sharp, or by default whatever the middle of
+  the view shows, JC included - looking through glass, smoke and grates as
+  the view does, and far off at the sky.
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).

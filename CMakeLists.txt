@@ -282,6 +282,7 @@ add_library(PathTracerDrv SHARED
 	"${PATHTRACERDRV_DIR}/Materials.cpp"
 	"${PATHTRACERDRV_DIR}/mat.cpp"
 	"${PATHTRACERDRV_DIR}/PathTracerDrv.cpp"
+	"${PATHTRACERDRV_DIR}/PhotoMode.cpp"
 	"${PATHTRACERDRV_DIR}/Precomp.cpp"
 	"${PATHTRACERDRV_DIR}/Shaders.cpp"
 	"${PATHTRACERDRV_DIR}/TextureCache.cpp"
@@ -290,7 +291,8 @@ add_library(PathTracerDrv SHARED
 
 target_include_directories(PathTracerDrv PRIVATE "${PATHTRACERDRV_DIR}")
 configure_deusex_renderdevice(PathTracerDrv PATHTRACERDRV_EXPORTS)
-target_link_libraries(PathTracerDrv PRIVATE zvulkan)
+# ole32 and windowscodecs for photo mode's PNGs (PhotoMode.cpp).
+target_link_libraries(PathTracerDrv PRIVATE zvulkan ole32 windowscodecs)
 
 # Drives the helper with a made up scene and writes what it traces to a file,
 # so the helper and the channel can be checked without the game.

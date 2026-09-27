@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 14;
+	static const uint32_t Version = 15;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -325,6 +325,11 @@ namespace TraceProtocol
 		// xyz which way, w its intensity; its colour, linear, w how much of
 		// it the air scatters back. All zero while it is off.
 		vec4 Flashlight[3];
+		// Photo mode's lens, as the trace shader's photoLens has it: x the
+		// aperture's radius in world units, 0 for a pinhole; y how far ahead
+		// it is focused, 0 for whatever the middle of the view meets (the
+		// shader's photoFocus). Read only while Disable bit 524288 is set.
+		vec4 PhotoLens;
 		TraceInset Insets[MaxInsets];
 	};
 

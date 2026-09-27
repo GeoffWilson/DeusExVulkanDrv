@@ -245,6 +245,10 @@ enum InstanceMask : uint32_t
 	// which the window hides while it draws, and whose inside the view
 	// would otherwise start in.
 	InstanceSeenByWindows = 0x10,
+	// The viewer's own body in photo mode, once the camera has flown away
+	// from its eyes: seen by the view, by bounces and by shadow rays, but
+	// still not by the flashlight's, whose lamp is at those eyes.
+	InstanceSeenFromOutside = 0x16,
 };
 
 struct SceneInstance

@@ -231,6 +231,12 @@ public:
 	// person conversation - so its own body is drawn like anyone else's and
 	// its first person weapon is not.
 	bool ViewFromBehind = false;
+	// Photo mode (the device's PT PHOTO): the view flies free, and the
+	// viewer's body stays where it stood - its eyes at PhotoEye - shown as
+	// anyone else's once the camera is away from them, with no first person
+	// weapon at all.
+	bool PhotoMode = false;
+	FVector PhotoEye = FVector(0, 0, 0);
 
 	// The view's own basis, as world space directions: X right, Y down,
 	// Z forward, which is how the engine orients a scene node. Needed to place

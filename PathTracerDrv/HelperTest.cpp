@@ -10,6 +10,7 @@
 //   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still]
 //                            [--lightsize radius] [--reference] [--backlight]
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
+//                            [--photo aperture]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -39,6 +40,13 @@
 // level's glowing surfaces are; --glow-unsampled the same strip found only by
 // the bounces that reach it. With --reference the two should come to the
 // same picture, the sampled one with less noise on the way.
+//
+// --photo refines the picture as photo mode does (the device's PT PHOTO):
+// --reference, with every frame taken as another sample whatever changes
+// under a pixel, and a lens of that radius focused - as photo mode focuses by
+// default - on what the middle of the view meets, which is the box, so the
+// floor before it and the wall behind it blur and the box stays sharp. 0 is
+// a pinhole.
 //
 // Frames are taken the way the render device takes them: the next is asked
 // for before the last is waited for, so the helper records one while the GPU
@@ -149,6 +157,7 @@ int main(int argc, char** argv)
 	bool bakedMask = false;
 	bool inset = false;
 	bool fog = false, flashlight = false, dark = false, fogUnshadowed = false, glowStrip = false, glowUnsampled = false;
+	float photoAperture = -1.0f;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -183,6 +192,11 @@ int main(int argc, char** argv)
 			glowStrip = true;
 		else if (!strcmp(argv[i], "--glow-unsampled"))
 			glowStrip = glowUnsampled = true;
+		else if (!strcmp(argv[i], "--photo") && i + 1 < argc)
+		{
+			photoAperture = (float)atof(argv[++i]);
+			reference = still = true;
+		}
 		else
 			args.push_back(argv[i]);
 	}
@@ -473,6 +487,12 @@ int main(int argc, char** argv)
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
 		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u);
+		if (photoAperture >= 0.0f)
+		{
+			frame.DisableBits |= 524288u;
+			frame.MaxSamples = 4095;
+			frame.PhotoLens = vec4(photoAperture, 0.0f, 0.0f, 0.0f);
+		}
 		frame.GlowLighting = 1.0f;
 		frame.Timing = 1;
 		frame.Exposure = 0.2f + 128 * (2.0f / 255.0f);

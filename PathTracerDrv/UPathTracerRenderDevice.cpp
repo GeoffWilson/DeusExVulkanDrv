@@ -1481,6 +1481,7 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 		debugf(TEXT("PathTracer: %d static triangles, %d lights, %d mirrored surfaces"),
 			(int)(Scene.Geometries[0].Positions.size() / 3), (int)Scene.Lights.size(),
 			Scene.MirroredCount());
+		RepairPhotoSave();
 	}
 
 	// Every frame: where the movers and the mesh actors are now. New shapes are
@@ -1495,7 +1496,20 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	// Gathering is CPU only, so it runs while the GPU is still presenting the
 	// last frame.
 	const double collectStart = NowMs();
+	// In photo mode the world is held by the engine, but not the player,
+	// whose flying plays a pose and turns the body with the view: gathered
+	// as it stood, with the flashlight where it shone from.
+	Scene.PhotoMode = Photo.Active;
+	Scene.PhotoEye = Photo.Eye;
+	if (Photo.Active)
+		SwapPhotoPose();
 	Scene.CollectDynamic(level);
+	if (Photo.Active)
+	{
+		SwapPhotoPose();
+		for (int i = 0; i < 3; i++)
+			Scene.Flashlight[i] = Photo.Flashlight[i];
+	}
 	if (!Scene.FogLights.empty())
 		LastFogFrame = FrameIndex;
 	Timings.Collect += NowMs() - collectStart;
@@ -1588,7 +1602,8 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// again - is its own business, as the player's view's children are.
 	if (Viewport && Frame->X > 0 && Frame->Y > 0 && Frame->X < Viewport->SizeX)
 	{
-		if (!Frame->Parent)
+		// Photo mode leaves the HUD, and the views in its windows, out.
+		if (!Frame->Parent && !Photo.Active)
 			AddInsetView(Frame);
 		return;
 	}
@@ -1610,6 +1625,12 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	Scene.ViewRight = Frame->Coords.XAxis;
 	Scene.ViewDown = Frame->Coords.YAxis;
 	Scene.ViewForward = Frame->Coords.ZAxis;
+	// In photo mode the view looks the player's way from the free camera.
+	if (Photo.Active && Scene.ViewActor == Photo.Pawn)
+	{
+		MovePhotoCamera();
+		Scene.ViewOrigin = Photo.Position;
+	}
 
 	EnsureSceneBuilt(Frame->Level);
 
@@ -1672,7 +1693,7 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// the down-pointing Y axis is used as it stands.
 	const FCoords& c = Frame->Coords;
 
-	Camera.Origin = vec4(c.Origin.X, c.Origin.Y, c.Origin.Z, 0.0f);
+	Camera.Origin = vec4(Scene.ViewOrigin.X, Scene.ViewOrigin.Y, Scene.ViewOrigin.Z, 0.0f);
 	Camera.Right = vec4(c.XAxis.X, c.XAxis.Y, c.XAxis.Z, 0.0f) * halfWidth;
 	Camera.Up = vec4(c.YAxis.X, c.YAxis.Y, c.YAxis.Z, 0.0f) * halfHeight;
 	Camera.Forward = vec4(c.ZAxis.X, c.ZAxis.Y, c.ZAxis.Z, 0.0f);
@@ -1706,6 +1727,7 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 		}
 
 		CreateSwapChainResources();
+		CheckPhoto();
 		HaveCamera = false;
 		FlashScale = InFlashScale;
 		FlashFog = InFlashFog;
@@ -1882,7 +1904,7 @@ bool UPathTracerRenderDevice::SendScene()
 	// times - a chain stepping at double speed, a paced one lurching - and on
 	// the level's clock alone the animations stopped behind the pause menu,
 	// where the other devices keep them going.
-	if (Viewport)
+	if (Viewport && !Photo.Active)
 	{
 		const double time = Viewport->CurrentTime;
 		for (size_t i = 0; i < SentTextures.size(); i++)
@@ -1990,7 +2012,22 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			flashlightChanged = flashlightChanged || a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w;
 			LastFlashlight[i] = a;
 		}
-		if (cameraMoved || sceneChanged || flashlightChanged)
+		// Photo mode shows the denoised picture while the camera moves, and
+		// once it has held still a few frames refines the picture sample by
+		// sample instead, the world being held: nothing else starts it over,
+		// and a light flickering is averaged as a long exposure would.
+		if (Photo.Active)
+		{
+			Photo.StillFrames = cameraMoved ? 0 : Photo.StillFrames + 1;
+			const bool accumulate = Photo.StillFrames >= PhotoState::SettleFrames;
+			if (accumulate != Photo.Accumulating)
+			{
+				Photo.Accumulating = accumulate;
+				AccumulatedFrames = 0;
+				DenoiseRestart = true;
+			}
+		}
+		if (cameraMoved || (!Photo.Accumulating && (sceneChanged || flashlightChanged)))
 			AccumulatedFrames = 0;
 		// Where the camera was, for the motion vectors: last frame's, or this
 		// one's on the first frame there is.
@@ -2025,12 +2062,27 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.MaxSamples = (uint32_t)Max(MaxAccumulatedFrames, 1);
 				frame.Bounces = (uint32_t)Clamp(Bounces, 1, 255);
 				frame.GlossBounces = (uint32_t)Clamp(GlossBounces, 0, 255);
+				// A photo being refined: the samples averaged as they come,
+				// no denoiser, and paths given more bounces than a frame can
+				// afford (Disable bit 524288 in the trace shader).
+				if (Photo.Accumulating)
+				{
+					frame.MaxSamples = PhotoState::MaxSamples;
+					frame.Bounces = (uint32_t)Clamp(Max(Bounces, PhotoState::PathBounces), 1, 255);
+					frame.GlossBounces = (uint32_t)Clamp(Max(GlossBounces, PhotoState::GlossyBounces), 0, 255);
+				}
 				// DetailTextures is the engine's own switch, the one the
 				// display settings set, and is honoured as it changes.
-				frame.DisableBits = DisableBits | (DetailTextures ? 0u : 2048u) | (NeutralToneMapNow ? 8192u : 0u);
+				frame.DisableBits = DisableBits | (DetailTextures ? 0u : 2048u) | (NeutralToneMapNow ? 8192u : 0u) | (Photo.Accumulating ? 524288u : 0u);
 				frame.ViewMode = (uint32_t)ViewMode;
 				frame.DebugMode = (uint32_t)DebugMode;
-				frame.Denoise = !DenoiseEnabled ? TraceProtocol::DenoiseOff : (DlssEnabled ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd);
+				frame.Denoise = (!DenoiseEnabled || Photo.Accumulating) ? TraceProtocol::DenoiseOff : (DlssEnabled ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd);
+				// Photo mode's preview is NRD's rather than Ray Reconstruction's:
+				// NRD traces at the full size, as the refined picture does, so
+				// the helper goes from one to the other and back without
+				// making its images again every time the camera stops.
+				if (Photo.Active && !Photo.Accumulating && DenoiseEnabled)
+					frame.Denoise = TraceProtocol::DenoiseNrd;
 				frame.DlssQuality = (uint32_t)DlssQualityNow;
 				frame.LightSize = (uint32_t)LightSizeNow;
 				frame.MaxAnisotropy = (uint32_t)Clamp(appRound(MaxAnisotropy), 0, 16);
@@ -2040,6 +2092,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.Timing = (LogTimings || Bench.Step >= 0) ? 1 : 0;
 				frame.Time = (Viewport && Viewport->Actor && Viewport->Actor->Level)
 					? (float)fmod((double)Viewport->Actor->Level->TimeSeconds, 1000.0) : 0.0f;
+				// Photo mode holds what pans and sways with the clock.
+				if (Photo.Active)
+					frame.Time = Photo.Time;
 				frame.Exposure = 0.2f + Exposure * (2.0f / 255.0f);
 				frame.SkyIntensity = SkyIntensity * (2.0f / 255.0f);
 				// The screen flash, as the other devices blend it - the picture
@@ -2054,6 +2109,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.Camera[1].w = FlashFog.X;
 				frame.Camera[2].w = FlashFog.Y;
 				frame.Camera[3].w = FlashFog.Z;
+				// No flash over a photo: the player is not where it is taken.
+				if (Photo.Active)
+				{
+					frame.Camera[0].w = 1.0f;
+					frame.Camera[1].w = frame.Camera[2].w = frame.Camera[3].w = 0.0f;
+				}
 				frame.PreviousCamera[0] = previousCamera.Origin;
 				frame.PreviousCamera[1] = previousCamera.Right;
 				frame.PreviousCamera[2] = previousCamera.Up;
@@ -2069,6 +2130,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				for (int i = 0; i < 3; i++)
 					frame.Flashlight[i] = Scene.Flashlight[i];
 				frame.GlowLighting = Max(GlowLighting, 0) / 100.0f;
+				frame.PhotoLens = vec4(Photo.Aperture, Photo.Focus, 0.0f, 0.0f);
 				// The windows' views, each averaging its samples while it and
 				// the scene hold still, as the player's does.
 				frame.InsetCount = (uint32_t)InsetViews.size();
@@ -2249,6 +2311,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			.AddImage(SwapChain->GetImage(imageIndex), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
 			.Execute(commands.get(), VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
+		// The photo asked for, copied out as it is about to be shown.
+		if (Photo.SavePending)
+			RecordPhotoSave(commands.get());
+
 		// Letterbox: keep the traced image's aspect inside the window rather
 		// than stretching it, the same as the other devices here.
 		float scale = std::min(windowWidth / (float)TraceWidth, windowHeight / (float)TraceHeight);
@@ -2322,11 +2388,19 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		SwapChain->QueuePresent(imageIndex, RenderFinishedSemaphore.get());
 		Timings.Present += NowMs() - presentStart;
 
+		// A photo copied out in this frame, written once it is done.
+		if (Photo.SaveRecorded)
+		{
+			WaitForPreviousFrame();
+			WritePhoto();
+		}
+
 		// Paced after the present rather than before the next frame's work,
 		// so the game's own tick is what waits.
 		// Not while benchmarking, whose frame times would be the limit's.
+		// Nor while a photo refines, whose samples come a frame at a time.
 		const double limitStart = NowMs();
-		if (Bench.Step < 0)
+		if (Bench.Step < 0 && !Photo.Accumulating)
 			LimitFrameRate();
 		Timings.Limit += NowMs() - limitStart;
 		if (HaveCamera)
@@ -2388,7 +2462,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			Timings.Logged = logged;
 		}
 
-		if (AccumulatedFrames < (uint32_t)Max(MaxAccumulatedFrames, 1))
+		if (AccumulatedFrames < (Photo.Accumulating ? PhotoState::MaxSamples : (uint32_t)Max(MaxAccumulatedFrames, 1)))
 			AccumulatedFrames++;
 	}
 	catch (const std::exception& e)
@@ -2844,6 +2918,12 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				: TEXT("held to its lights' shadows"));
 			handled = true;
 		}
+		// Photo mode: see PhotoMode.cpp.
+		if (ParseCommand(&Cmd, TEXT("PHOTO")))
+		{
+			PhotoCommand(Cmd, Ar);
+			return 1;
+		}
 		// The flashlight on or off, or with a number its brightness, in
 		// percent.
 		if (ParseCommand(&Cmd, TEXT("FLASHLIGHT")))
@@ -3062,6 +3142,8 @@ void UPathTracerRenderDevice::Exit()
 {
 	guard(UPathTracerRenderDevice::Exit);
 
+	// The key bindings above all: the game can write them out as it closes.
+	EndPhoto(TEXT("the device is closing"));
 	PathTracerLogStack("Exit");
 	if (PathTracerEngineWndProc && SubclassedWindow && IsWindow(SubclassedWindow))
 		SetWindowLongPtr(SubclassedWindow, GWLP_WNDPROC, (LONG_PTR)PathTracerEngineWndProc);
@@ -3337,7 +3419,7 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 			Info.Texture ? Info.Texture->GetFullName() : TEXT("none"), X, Y, XL, YL, (int)PolyFlags, Color.X, Color.Y, Color.Z,
 			Span ? TEXT(", in the level") : TEXT(""));
 
-	if (!Textures || TraceWidth <= 0 || TraceHeight <= 0)
+	if (!Textures || TraceWidth <= 0 || TraceHeight <= 0 || PhotoHidesTiles())
 		return;
 
 	// A sprite in the level - a sprite actor, or one of a particle system's
