@@ -1845,6 +1845,39 @@ void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCo
 	instance.Mask = mask;
 	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved || isSprite, actor->ScaleGlow));
 	Instances.push_back(instance);
+
+	if (!iterated && !isSprite && actor->DrawType == DT_Mesh && actor->Mesh && !actor->IsA(APawn::StaticClass()))
+		FittingCandidates.push_back({ Instances.size() - 1, actor->Mesh->GetRenderBoundingBox(actor, 0) });
+}
+
+// A mesh with a light inside it - a hanging lamp's trough, a desk lamp's
+// shade - throws no shadows. The engine lights the level with lightmaps
+// that no mesh ever shadows, so a lamp's author put the light where it
+// looked right and never saw the fitting stand in its way; traced, the
+// fitting shut the light in with it, and the MJ12 lab's hangar floor came
+// out at under half its brightness with the ceiling above it lit instead.
+// A pawn keeps its shadows even with a light of its own. The bounds are the
+// engine's, a few units larger for a light sitting just at the surface.
+void LevelScene::UnshadowFittings()
+{
+	for (const FittingCandidate& fitting : FittingCandidates)
+	{
+		const FBox bounds = fitting.Bounds.ExpandBy(4.0f);
+		for (const FVector& light : LightPositions)
+		{
+			if (light.X >= bounds.Min.X && light.X <= bounds.Max.X &&
+				light.Y >= bounds.Min.Y && light.Y <= bounds.Max.Y &&
+				light.Z >= bounds.Min.Z && light.Z <= bounds.Max.Z)
+			{
+				SceneInstance& instance = Instances[fitting.Instance];
+				if (instance.Mask == InstanceSeenByAll)
+					instance.Mask = InstanceCastsNoShadow;
+				break;
+			}
+		}
+	}
+	FittingCandidates.clear();
+	LightPositions.clear();
 }
 
 // A render iterator's items, each placed as the actor it hands out. The
@@ -1877,6 +1910,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 	GeometryAdded = false;
 	Instances.clear();
+	FittingCandidates.clear();
+	LightPositions.clear();
 	Lights.clear();
 	FogLights.clear();
 	CurrentPoses.clear();
@@ -1943,6 +1978,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 		// actor carrying it is not drawn, which is exactly what the player's
 		// light augmentation is.
 		AddLight(actor);
+		if (actor->LightType != LT_None && actor->LightBrightness)
+			LightPositions.push_back(actor->Location);
 
 		if (actor->bHidden)
 		{
@@ -1983,6 +2020,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 		PlaceActor(actor, mask, false, counts);
 	}
 
+	UnshadowFittings();
 	CollectDecals(level);
 	const size_t beforeViewModel = Instances.size();
 	AddViewModel();

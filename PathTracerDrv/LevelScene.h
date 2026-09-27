@@ -52,6 +52,13 @@ private:
 		int Brushes = 0, Meshes = 0, Animated = 0, Skipped = 0;
 	};
 	void PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCounts& counts);
+	// Meshes placed this frame that could be a light's fitting - any mesh
+	// but a pawn's - with their bounds, and where every light is, however
+	// bright it is at the moment: see UnshadowFittings.
+	struct FittingCandidate { size_t Instance; FBox Bounds; };
+	std::vector<FittingCandidate> FittingCandidates;
+	std::vector<FVector> LightPositions;
+	void UnshadowFittings();
 	void PlaceIterated(AActor* actor, uint32_t mask, PlaceCounts& counts);
 	// A particle generator holds 64; this is only a guard against an iterator
 	// that never says it is done.

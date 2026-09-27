@@ -114,10 +114,11 @@ std::string Shaders::Trace()
 		// Which instances each kind of ray sees, against SceneInstance::Mask.
 		// The view's own rays and shadows miss the viewer's body while the
 		// camera is inside it (0x02); whatever has bounced - a mirror's view
-		// among them - misses the first person weapon (0x04).
+		// among them - misses the first person weapon (0x04); shadows miss a
+		// light fitting with its lamp inside it (0x08).
 		const uint ViewRays = 0xFDu;
 		const uint BouncedRays = 0xFBu;
-		const uint ShadowRays = 0xFDu;
+		const uint ShadowRays = 0xF5u;
 
 		// Does this point on the triangle actually exist? UE1 masked art keys
 		// transparency to palette index zero, which the upload turns into an

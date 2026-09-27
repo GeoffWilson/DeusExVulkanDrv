@@ -122,6 +122,8 @@ crash, flushed as they happen.
   switches them.
 - **Zone ambient light as the engine gives it**, where walls lit by nothing
   else were over twice as bright; and `AmbientGlow` on lit meshes.
+- **Light fittings no longer block their own lamps**, which left the floor
+  under a hanging lamp dark and the ceiling above it lit.
 - **Materials off by default** until they have been checked by hand.
 - **Fixes:** a crash loading a save of the map already being played; a crash
   starting the game in a mode narrower than the screen under Proton's Wayland
@@ -203,7 +205,10 @@ one shadow ray at it - at a random point on a disc around the light rather than
 its centre (`LightSize`, a small lamp's size by default), so a shadow starts sharp
 where something meets it and softens with distance, as a real one does. The
 engine's lights are points, and cast from one a shadow is hard all the way
-out. Paths bounce off surfaces with cosine weighted directions, three bounces
+out. A mesh with a light inside it - a hanging lamp's trough, a desk lamp's
+shade - casts no shadows: the engine never lets a mesh shadow its lightmaps,
+so levels put lights inside their fittings, and traced, the fitting shut the
+light in. Paths bounce off surfaces with cosine weighted directions, three bounces
 by default with Russian roulette after the second. Glass and water
 are lit by every light at once and without shadows, so the layer they add never
 flickers.

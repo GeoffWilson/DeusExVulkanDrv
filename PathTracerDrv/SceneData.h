@@ -153,6 +153,10 @@ enum InstanceMask : uint32_t
 	// seen by the view and throwing its shadows, but not floating at the
 	// player's eyes in a mirror.
 	InstanceSeenByView = 0x04,
+	// Seen by everything but shadow rays: a light fitting with its lamp
+	// inside it. The engine never lets a mesh shadow a lightmap, and a
+	// fitting built round its light shut the room's light in with it.
+	InstanceCastsNoShadow = 0x08,
 };
 
 struct SceneInstance
