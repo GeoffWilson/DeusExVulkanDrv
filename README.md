@@ -117,6 +117,9 @@ crash, flushed as they happen.
   flatter than a wall under the same lamp, with a rim from a light behind.
 - **Animated textures on the engine's clock** - fire, water, screens - which
   could run at the wrong speed, and stopped behind the pause menu.
+- **Detail textures**, the fine grain over a wall or floor close up, as Deus
+  Ex's own Direct3D renderer lays them on. The game's Detail Textures setting
+  switches them.
 - **Materials off by default** until they have been checked by hand.
 - **Fixes:** a crash loading a save of the map already being played; a crash
   starting the game in a mode narrower than the screen under Proton's Wayland
@@ -175,6 +178,15 @@ source and was read by disassembly:
   lit past its texture, then made linear. Unlike the engine's, the meshes
   keep their shadows from the lights in front of them. `PT MESHLIGHT` lights
   them as flat surfaces instead, to compare.
+
+Detail textures are laid on as the `D3DDrv.dll` Deus Ex shipped with lays them,
+which differs from the published UT source: three passes over the surface,
+each multiplying it by twice the detail texture faded towards mid grey. The
+first is at the detail texture's own scale and fades in from 380 units away to
+full at 107; each after is 4.223 times finer and fades in a 4.223th as far out.
+They multiply the displayed colour, so the linear one takes them to the power
+2.2. The game's Detail Textures setting (`DetailTextures`) switches them, as it
+does in the other devices.
 
 Each shaded point samples one light, chosen in proportion to its contribution
 from the lights listed for its cell of a uniform grid over the level, and fires
@@ -410,6 +422,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in.
 - `PT MESHLIGHT`: meshes lit as the engine lights them, or as flat surfaces are.
+- `PT DETAIL`: detail textures on or off, as the game's setting.
 - `PT WIDESCREEN`: the widescreen field of view on or off.
 - `PT LIGHTSIZE n`: the size lights cast shadows from, as `LightSize`.
 - `PT PINNEDUI 16:9 | 4:3 | OFF`: the UI kept to a box of that shape in the

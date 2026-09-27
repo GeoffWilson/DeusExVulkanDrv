@@ -33,7 +33,7 @@ std::string Shaders::Trace()
 			vec4 UV01;      // u0 v0 u1 v1
 			vec4 UV2Tex;    // u2 v2 texture unused
 			uvec4 CornerNormals;   // a mesh's smoothed normal at each corner, packed; w 1 when there are any
-			uvec4 CornerOffsets;   // each corner's neighbours off its tangent plane, half pairs
+			uvec4 CornerOffsets;   // each corner's neighbours off its tangent plane, half pairs; on a flat surface, its detail texture
 		};
 
 		struct SceneLight
@@ -104,7 +104,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -164,6 +164,38 @@ std::string Shaders::Trace()
 			// The engine's art is authored in sRGB; the trace works in linear.
 			vec3 linearRgb = pow(max(texel.rgb, vec3(0.0)), vec3(2.2));
 			return linearRgb;
+		}
+
+		// What a surface's detail texture makes of its colour, depth units in
+		// front of the eye: the fine grain that stops a wall going to mush when
+		// you stand at it. As Deus Ex's Direct3D renderer lays it on: up to
+		// three passes over the finished surface, each modulating it by twice
+		// the detail texture blended towards mid grey, the first at the
+		// texture's own scale out to 380 units, each after at 4.223 times the
+		// scale and out to a 4.223th of the distance. A pass fades in from its
+		// edge, 100 * (edge / depth - 1) out of 255 at a vertex. A flat
+		// surface's CornerOffsets name the texture (LevelScene::SetDetail).
+		// The passes are over the displayed colour, so the linear one takes
+		// them to the power 2.2.
+		vec3 detailFactor(TriangleAttributes attr, vec2 uv, float depth)
+		{
+			if (attr.CornerNormals.w != 0u || attr.CornerOffsets.x == 0u || (Disable & 2048u) != 0u)
+				return vec3(1.0);
+			uint index = attr.CornerOffsets.x - 1u;
+			if (index >= TextureCount)
+				return vec3(1.0);
+			vec2 detailUV = uv * uintBitsToFloat(attr.CornerOffsets.yz);
+			vec3 factor = vec3(1.0);
+			float edge = 380.0;
+			for (int pass = 0; pass < 3 && depth < edge; pass++)
+			{
+				float a = clamp(100.0 / 255.0 * (edge / max(depth, 1.0) - 1.0), 0.0, 1.0);
+				vec3 detail = texture(sceneTextures[nonuniformEXT(index)], detailUV).rgb;
+				factor *= 2.0 * mix(vec3(128.0 / 255.0), detail, a);
+				detailUV *= 4.223;
+				edge *= 0.2368;
+			}
+			return pow(factor, vec3(2.2));
 		}
 
 		// A unit vector as LevelScene packs it: octahedral, 16 bits a component.
@@ -1173,6 +1205,20 @@ std::string Shaders::Trace()
 					vec3 lifted;
 					vec3 normal = smoothNormal(attr, bary, mat3(objectToWorld), faceNormal, side, position, lifted);
 					attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal), attr.Albedo.w);
+					// The engine lays a detail texture over what is in view, a
+					// mirror's reflection included, where the depth is the
+					// reflection's own, as far behind the glass as it looks.
+					if (bounce == firstBounce && attr.UV2Tex.w < 1.5 && attr.CornerOffsets.x != 0u && !inSky)
+					{
+						float depth = dot(position - CameraOrigin.xyz, CameraForward.xyz);
+						if (lobePass == 1)
+						{
+							vec3 toMirror = surfacePosition - CameraOrigin.xyz;
+							depth = dot(toMirror, CameraForward.xyz) * (1.0 + distance(position, specularOrigin) / max(length(toMirror), 1.0));
+						}
+						if (depth > 0.0)
+							attr.Albedo.rgb *= detailFactor(attr, surfaceUV(attr, bary, direction, normal), depth);
+					}
 
 					// Translucent: add what this surface contributes and carry on
 					// through it in the same direction. UE1 draws these additively,

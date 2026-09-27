@@ -423,6 +423,8 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 			}
 			if (surf.PolyFlags & PF_FakeBackdrop)
 				attr.UV2Tex.w = 5.0f;
+			if (textureIndex >= 0)
+				SetDetail(attr, surf.Texture);
 
 			out.Positions.push_back(v0);
 			out.Positions.push_back(v1);
@@ -432,6 +434,28 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 	}
 
 	unguard;
+}
+
+// The detail texture a surface's texture names: fine grain the engine lays
+// over the surface close up (detailFactor in Shaders.cpp says how). Carried in
+// CornerOffsets, which only a mesh's triangles use: x the detail texture's
+// index plus one, 0 for none; y and z how many of its widths and heights one
+// of the surface texture's spans, which turns the surface's coordinates into
+// its. Both are laid out along the same texture axes, in texels.
+void LevelScene::SetDetail(TriangleAttributes& attr, UTexture* texture)
+{
+	UTexture* detail = texture ? texture->DetailTexture : nullptr;
+	if (!detail || detail->USize <= 0 || detail->VSize <= 0 || texture->USize <= 0 || texture->VSize <= 0)
+		return;
+	const int index = TextureFor(detail);
+	if (index < 0)
+		return;
+	const float scale = detail->Scale > 0.0f ? detail->Scale : 1.0f;
+	const float u = (float)texture->USize / ((float)detail->USize * scale);
+	const float v = (float)texture->VSize / ((float)detail->VSize * scale);
+	attr.CornerOffsets[0] = (uint32_t)index + 1u;
+	memcpy(&attr.CornerOffsets[1], &u, sizeof(u));
+	memcpy(&attr.CornerOffsets[2], &v, sizeof(v));
 }
 
 // Rotor lights whose pattern should turn the other way from the engine's, to
@@ -688,6 +712,7 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 				const vec2 uv2 = polyUV(p2);
 				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
 				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, kind);
+				SetDetail(attr, poly.Texture);
 			}
 			else
 			{

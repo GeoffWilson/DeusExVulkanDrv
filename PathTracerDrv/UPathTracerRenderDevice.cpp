@@ -305,6 +305,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	LightSize = 4;
 	UseDLSS = 1;
 	DLSSQuality = 1;
+	DetailTextures = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -1551,7 +1552,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.MaxSamples = (uint32_t)Max(MaxAccumulatedFrames, 1);
 				frame.Bounces = (uint32_t)Clamp(Bounces, 1, 255);
 				frame.GlossBounces = (uint32_t)Clamp(GlossBounces, 0, 255);
-				frame.DisableBits = DisableBits;
+				// DetailTextures is the engine's own switch, the one the
+				// display settings set, and is honoured as it changes.
+				frame.DisableBits = DisableBits | (DetailTextures ? 0u : 2048u);
 				frame.ViewMode = (uint32_t)ViewMode;
 				frame.DebugMode = (uint32_t)DebugMode;
 				frame.Denoise = !DenoiseEnabled ? TraceProtocol::DenoiseOff : (DlssEnabled ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd);
@@ -2059,6 +2062,12 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				: TEXT("as the engine lights them, brighter and flatter, with its rim"));
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("DETAIL")))
+		{
+			DetailTextures = !DetailTextures;
+			Ar.Logf(TEXT("PT: detail textures %s"), DetailTextures ? TEXT("on") : TEXT("off"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("WIDESCREEN")))
 		{
 			WidescreenFovEnabled = !WidescreenFovEnabled;
@@ -2157,7 +2166,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | MESHLIGHT | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | MESHLIGHT | DETAIL | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

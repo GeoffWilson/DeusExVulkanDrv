@@ -127,7 +127,7 @@ int main(int argc, char** argv)
 {
 	std::vector<const char*> args;
 	int dlss = -1;
-	bool still = false, reference = false, backlight = false;
+	bool still = false, reference = false, backlight = false, detail = false;
 	uint32_t lightSize = 0;
 	for (int i = 1; i < argc; i++)
 	{
@@ -141,6 +141,8 @@ int main(int argc, char** argv)
 			reference = still = true;
 		else if (!strcmp(argv[i], "--backlight"))
 			backlight = true;
+		else if (!strcmp(argv[i], "--detail"))
+			detail = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -248,8 +250,29 @@ int main(int argc, char** argv)
 		light.Flags = vec4(0, 0, 0, -1);
 		std::vector<SceneLight> lights = { light };
 
+		// --detail: a detail texture on the floor, as LevelScene::SetDetail
+		// describes one - stripes, a light and a dark one to each checker
+		// square at the first pass's scale - which shows on the floor nearer
+		// than 380 units.
+		std::vector<uint32_t> stripes(64 * 64);
+		for (int y = 0; y < 64; y++)
+			for (int x = 0; x < 64; x++)
+				stripes[y * 64 + x] = ((x / 4) & 1) ? 0xffbfbfbfu : 0xff404040u;
+		if (detail)
+		{
+			const float scale = 1.0f;
+			for (int t = 0; t < 2; t++)
+			{
+				world.Attributes[t].CornerOffsets[0] = 2;
+				memcpy(&world.Attributes[t].CornerOffsets[1], &scale, sizeof(scale));
+				memcpy(&world.Attributes[t].CornerOffsets[2], &scale, sizeof(scale));
+			}
+		}
+
 		client.ResetScene();
 		client.Texture(0, 64, 64, checker.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false);
+		if (detail)
+			client.Texture(1, 64, 64, stripes.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false);
 		client.Geometry(0, world);
 
 		// The camera, as the render device builds it: right and "up" - which

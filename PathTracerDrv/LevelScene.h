@@ -37,6 +37,7 @@ private:
 	int AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind = 0.0f, const FCoords* toLocal = nullptr);
 	void AddBrushPolys(UModel* brush, SceneGeometry& out);
 	void AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPortals);
+	void SetDetail(TriangleAttributes& attr, UTexture* texture);
 	void AddLight(AActor* actor);
 	void AddFogLight(AActor* actor, const FPlane& colour, float brightness);
 
