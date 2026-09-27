@@ -1356,12 +1356,12 @@ void UPathTracerRenderDevice::AdvanceBench()
 {
 	if (Bench.Step < 0)
 		return;
-	if (++Bench.Frame == BenchState::Settle)
+	if (++Bench.Frame == Bench.SettleFrames())
 	{
 		Bench.Gpu = Bench.Trace = Bench.Collect = Bench.FrameSum = 0.0;
 		Bench.GpuFrames = Bench.Frames = 0;
 	}
-	if (Bench.Frame < BenchState::Settle + BenchState::Measure)
+	if (Bench.Frame < Bench.SettleFrames() + BenchState::Measure)
 		return;
 
 	const double g = Max(Bench.GpuFrames, 1), f = Max(Bench.Frames, 1);

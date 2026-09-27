@@ -29,7 +29,9 @@ Copy the device's `.dll` and `.int` into the game's `System` folder, then set
 `GameRenderDevice` in the `[Engine.Engine]` section of the ini to
 `PathTracerDrv.PathTracerRenderDevice` or `VulkanDrv.VulkanRenderDevice`.
 PathTracerDrv also needs `PathTracerHelper.exe` beside it: the tracing happens
-there (see below), and the device will not start without it.
+there (see below), and the device will not start without it. For DLSS Ray
+Reconstruction, its default denoiser, it needs NVIDIA's `nvngx_dlssd.dll`
+beside the helper as well; without it NRD denoises instead.
 
 UE1 names its ini after the executable: `DeusEx.exe` reads `DeusEx.ini` and the
 retail `DeusExRetail.exe` reads `DeusExRetail.ini`. Change the one the game you
@@ -654,13 +656,14 @@ Copy `build-win32/PathTracerDrv.dll`, `PathTracerDrv.int` and
 cross built from Linux, as in [cmake/README-crossbuild.md](cmake/README-crossbuild.md),
 rather than with MSVC.
 
-Build this way to test behaviour, not to measure it. The CMake configuration
-carries `/Zi` and links with `/DEBUG`, which defaults `/OPT:NOREF`, and it does
-not pass `/GL`; the released binaries come from the solution's `DeusExRelease`
-configuration, which does. The difference does not show in the trace, which is
-the helper's work, but it cost about a millisecond a frame of CPU time reading
-the scene out of the engine - 3.1 ms against the 2.1 the shipped build takes
-for the same frame. Benchmark the binaries that ship.
+Build this way to test behaviour, not to measure it. This configuration
+carries `/Zi`, links with `/DEBUG` and passes no `/GL`, and it read the scene
+out of the engine about a millisecond a frame slower than the shipped build -
+3.1 ms against 2.1 for the same frame - though the trace, the helper's work,
+was the same. The path tracer's releases are cross built from Linux, as
+[cmake/README-crossbuild.md](cmake/README-crossbuild.md) describes, and
+VulkanDrv's and the Direct3D devices' come from the solution's `DeusExRelease`
+configuration. Benchmark the binaries that ship.
 
 ### Building the denoisers
 

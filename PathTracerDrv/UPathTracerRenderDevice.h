@@ -401,7 +401,11 @@ private:
 		int GpuFrames = 0, Frames = 0;
 		struct Result { const TCHAR* Name; double Gpu, Trace, Collect, Frame; };
 		std::vector<Result> Results;
-		bool Measuring() const { return Step >= 0 && Frame >= Settle; }
+		// The first step settles four times as long: straight after a PT
+		// DLSS switch, or a level loading, the first row measured 1.4 ms
+		// slow against the same settings measured again at the end.
+		int SettleFrames() const { return Step == 0 ? 4 * Settle : Settle; }
+		bool Measuring() const { return Step >= 0 && Frame >= SettleFrames(); }
 		static const int Settle = 60, Measure = 240;
 	} Bench;
 	void StartBench();
