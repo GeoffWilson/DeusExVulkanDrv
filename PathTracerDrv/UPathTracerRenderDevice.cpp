@@ -1149,6 +1149,18 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 		.Create(Device.get());
 	OutputView = ImageViewBuilder().Image(OutputImage.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName("PathTracerOutputView").Create(Device.get());
 
+	InsetSource = std::make_unique<CachedTexture>();
+	InsetSource->Width = width;
+	InsetSource->Height = height;
+	InsetSource->Image = ImageBuilder()
+		.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
+		.Size(width, height)
+		.Usage(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+		.DebugName("PathTracerInsetSource")
+		.Create(Device.get());
+	InsetSource->View = ImageViewBuilder().Image(InsetSource->Image.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName("PathTracerInsetSourceView").Create(Device.get());
+	InsetSourceFresh = true;
+
 	// The tile pass draws into the traced image, so its framebuffer follows the
 	// image rather than the window.
 	if (TileRenderPass)
@@ -1314,6 +1326,7 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	const double collectStart = NowMs();
 	Scene.CollectDynamic(level);
 	Timings.Collect += NowMs() - collectStart;
+	CollectedThisFrame = true;
 
 	// Only when something new appeared, so this says what is being traced
 	// without filling the log every frame.
@@ -1324,6 +1337,65 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	}
 }
 
+// A view the HUD draws in a window: traced by the helper after the player's
+// from its own eye (TraceRenderer::RecordInsets) and written into the picture
+// at the window, then drawn back from a copy of the picture at this point
+// among the 2D, so what the HUD drew before it - a computer's screen behind
+// its camera views - lies under it, and what it draws after, over it.
+void UPathTracerRenderDevice::AddInsetView(FSceneNode* Frame)
+{
+	if (InsetViews.size() >= TraceProtocol::MaxInsets || !InsetSource || TraceWidth <= 0 || TraceHeight <= 0 || Frame->Proj.Z <= 0.0f)
+		return;
+
+	// A frame that draws only these - a security computer's screen hides the
+	// player's view - still wants the scene where things are now. Either
+	// way, the camera the window is seen from is hidden now, while it draws.
+	if (!CollectedThisFrame)
+		EnsureSceneBuilt(Frame->Level);
+	Scene.HideFromWindows();
+
+	InsetView view;
+	view.X = Frame->XB + UiOffsetX;
+	view.Y = Frame->YB;
+	view.Width = Min(Frame->X, TraceWidth - view.X);
+	view.Height = Min(Frame->Y, TraceHeight - view.Y);
+	if (view.X < 0 || view.Y < 0 || view.Width <= 0 || view.Height <= 0)
+		return;
+	// As the player's view is built (see below): the axes of the node's
+	// coordinates, scaled to the window's edges by its focal length.
+	const FCoords& c = Frame->Coords;
+	const float halfWidth = Frame->FX * 0.5f / Frame->Proj.Z;
+	const float halfHeight = Frame->FY * 0.5f / Frame->Proj.Z;
+	view.Camera.Origin = vec4(c.Origin.X, c.Origin.Y, c.Origin.Z, 0.0f);
+	view.Camera.Right = vec4(c.XAxis.X, c.XAxis.Y, c.XAxis.Z, 0.0f) * halfWidth;
+	view.Camera.Up = vec4(c.YAxis.X, c.YAxis.Y, c.YAxis.Z, 0.0f) * halfHeight;
+	view.Camera.Forward = vec4(c.ZAxis.X, c.ZAxis.Y, c.ZAxis.Z, 0.0f);
+	InsetViews.push_back(view);
+
+	// Drawn back here among the tiles, texel for texel.
+	const int samplerMode = 3;
+	if (!TileSet(InsetSource.get(), samplerMode))
+		return;
+	const float x0 = (float)view.X, y0 = (float)view.Y, x1 = x0 + view.Width, y1 = y0 + view.Height;
+	const float sx = 2.0f / (float)TraceWidth, sy = 2.0f / (float)TraceHeight;
+	const vec4 white(1.0f, 1.0f, 1.0f, 1.0f);
+	TileVertex corners[4];
+	corners[0] = { vec2(x0 * sx - 1.0f, y0 * sy - 1.0f), vec2(x0 / TraceWidth, y0 / TraceHeight), white };
+	corners[1] = { vec2(x1 * sx - 1.0f, y0 * sy - 1.0f), vec2(x1 / TraceWidth, y0 / TraceHeight), white };
+	corners[2] = { vec2(x1 * sx - 1.0f, y1 * sy - 1.0f), vec2(x1 / TraceWidth, y1 / TraceHeight), white };
+	corners[3] = { vec2(x0 * sx - 1.0f, y1 * sy - 1.0f), vec2(x0 / TraceWidth, y1 / TraceHeight), white };
+	TileBatch batch;
+	batch.Texture = InsetSource.get();
+	batch.BlendMode = 0;
+	batch.SamplerMode = samplerMode;
+	batch.FirstVertex = (int)TileVertices.size();
+	batch.VertexCount = 6;
+	TileBatches.push_back(batch);
+	const int order[6] = { 0, 1, 2, 0, 2, 3 };
+	for (int i = 0; i < 6; i++)
+		TileVertices.push_back(corners[order[i]]);
+}
+
 void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 {
 	guardSlow(UPathTracerRenderDevice::SetSceneNode);
@@ -1332,6 +1404,19 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 		debugf(TEXT("PT TILES: scene node %dx%d at %d %d, from %.0f %.0f %.0f, viewport actor %s"),
 			Frame->X, Frame->Y, Frame->XB, Frame->YB, Frame->Coords.Origin.X, Frame->Coords.Origin.Y, Frame->Coords.Origin.Z,
 			(Frame->Viewport && Frame->Viewport->Actor) ? Frame->Viewport->Actor->GetName() : TEXT("none"));
+
+	// A view the HUD draws in a window of its own: Extension's XViewportWindow
+	// has the engine render one through a scene node of its own, the size of
+	// its window - narrower than the screen, where the player's view, a
+	// mirror's and the sky's are its whole width.
+	// A child of one - the sky zone or a mirror seen in it, the same window
+	// again - is its own business, as the player's view's children are.
+	if (Viewport && Frame->X > 0 && Frame->Y > 0 && Frame->X < Viewport->SizeX)
+	{
+		if (!Frame->Parent)
+			AddInsetView(Frame);
+		return;
+	}
 
 	// The first scene node of a frame is the player's view. Later ones are
 	// mirrors, skyboxes and the weapon, which this device does not yet treat
@@ -1451,6 +1536,8 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 		FlashFog = InFlashFog;
 		TileVertices.clear();
 		TileBatches.clear();
+		InsetViews.clear();
+		CollectedThisFrame = false;
 		LogDraws = LogDrawsArmed;
 		LogDrawsArmed = false;
 		LoggedDraws = 0;
@@ -1713,7 +1800,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// rather than idling while the frame is described and recorded.
 		// Without a world to trace the output image keeps the last one, which
 		// is what the engine expects behind a menu or a conversation.
-		if (HaveCamera && Tracer && Tracer->Alive() && !Scene.IsEmpty())
+		if ((HaveCamera || !InsetViews.empty()) && Tracer && Tracer->Alive() && !Scene.IsEmpty())
 		{
 			const double sendStart = NowMs();
 			if (SendScene())
@@ -1760,6 +1847,32 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.PreviousCamera[2] = previousCamera.Up;
 				frame.PreviousCamera[3] = previousCamera.Forward;
 				frame.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
+				// The windows' views, each averaging its samples while it and
+				// the scene hold still, as the player's does.
+				frame.InsetCount = (uint32_t)InsetViews.size();
+				for (size_t i = 0; i < InsetViews.size(); i++)
+				{
+					const InsetView& view = InsetViews[i];
+					InsetView& last = LastInsetViews[i];
+					const bool moved = !sameXyz(view.Camera.Origin, last.Camera.Origin) || !sameXyz(view.Camera.Right, last.Camera.Right) ||
+						!sameXyz(view.Camera.Up, last.Camera.Up) || !sameXyz(view.Camera.Forward, last.Camera.Forward) ||
+						view.X != last.X || view.Y != last.Y || view.Width != last.Width || view.Height != last.Height;
+					if (moved || sceneChanged)
+						InsetAccumulated[i] = 0;
+					last = view;
+					TraceProtocol::TraceInset& inset = frame.Insets[i];
+					inset.Camera[0] = view.Camera.Origin;
+					inset.Camera[1] = view.Camera.Right;
+					inset.Camera[2] = view.Camera.Up;
+					inset.Camera[3] = view.Camera.Forward;
+					inset.X = (uint32_t)view.X;
+					inset.Y = (uint32_t)view.Y;
+					inset.Width = (uint32_t)view.Width;
+					inset.Height = (uint32_t)view.Height;
+					inset.AccumulatedFrames = InsetAccumulated[i];
+					if (InsetAccumulated[i] < (uint32_t)Max(MaxAccumulatedFrames, 1))
+						InsetAccumulated[i]++;
+				}
 				owed = Tracer->Trace(frame);
 				if (Tracer->Alive())
 				{
@@ -1862,6 +1975,34 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
 			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				0, 0, nullptr, 0, nullptr, 2, barriers);
+		}
+
+		// The windows' views, copied out of the picture for the tiles to draw
+		// back at their place among them.
+		if (!InsetViews.empty() && InsetSource)
+		{
+			VulkanImage* source = InsetSource->Image.get();
+			PipelineBarrier()
+				.AddImage(source, InsetSourceFresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+				.Execute(commands.get(), VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+			std::vector<VkImageCopy> regions;
+			for (const InsetView& view : InsetViews)
+			{
+				VkImageCopy region = {};
+				region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+				region.dstSubresource = region.srcSubresource;
+				region.srcOffset = { view.X, view.Y, 0 };
+				region.dstOffset = region.srcOffset;
+				region.extent = { (uint32_t)view.Width, (uint32_t)view.Height, 1 };
+				regions.push_back(region);
+			}
+			vkCmdCopyImage(commands->buffer, OutputImage->image, VK_IMAGE_LAYOUT_GENERAL, source->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				(uint32_t)regions.size(), regions.data());
+			PipelineBarrier()
+				.AddImage(source, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+				.Execute(commands.get(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			InsetSourceFresh = false;
 		}
 
 		// HUD, menus and console on top of the traced world, and the game's
@@ -2530,6 +2671,7 @@ void UPathTracerRenderDevice::Exit()
 
 	OutputView.reset();
 	OutputImage.reset();
+	InsetSource.reset();
 
 	TileFramebuffer.reset();
 	TileVertexBuffer.reset();

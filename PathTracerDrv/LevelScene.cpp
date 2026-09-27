@@ -2028,9 +2028,21 @@ void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCo
 	instance.Mask = mask;
 	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved || isSprite, actor->ScaleGlow));
 	Instances.push_back(instance);
+	if (!iterated)
+		ActorInstances.push_back({ Instances.size() - 1, actor });
 
 	if (!iterated && !isSprite && actor->DrawType == DT_Mesh && actor->Mesh && !actor->IsA(APawn::StaticClass()))
 		FittingCandidates.push_back({ Instances.size() - 1, actor->Mesh->GetRenderBoundingBox(actor, 0) });
+}
+
+// The actors a window of the HUD's has hidden while it draws its view: the
+// security camera, or the drone, it is seen from. Placed in the frame's scene
+// before the window drew, they are taken out of what its view sees.
+void LevelScene::HideFromWindows()
+{
+	for (const auto& placed : ActorInstances)
+		if (placed.second->bHidden && placed.first < Instances.size())
+			Instances[placed.first].Mask &= ~(uint32_t)InstanceSeenByWindows;
 }
 
 // A mesh with a light inside it - a hanging lamp's trough, a desk lamp's
@@ -2093,6 +2105,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 
 	GeometryAdded = false;
 	Instances.clear();
+	ActorInstances.clear();
 	FittingCandidates.clear();
 	LightPositions.clear();
 	Lights.clear();

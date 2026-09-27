@@ -330,6 +330,28 @@ private:
 	uint32_t AccumulatedFrames = 0;
 	size_t LastInstanceCount = 0;
 
+	// The views the HUD draws in windows of their own this frame - a security
+	// computer's cameras, the spy drone's, the targeting augmentation's zoom -
+	// in the order it draws them, with the rectangle each fills in the trace's
+	// pixels (see AddInsetView). Each window's last camera and how many frames
+	// it has held still, by its place in that order.
+	struct InsetView
+	{
+		TraceCamera Camera;
+		int X = 0, Y = 0, Width = 0, Height = 0;
+	};
+	std::vector<InsetView> InsetViews;
+	InsetView LastInsetViews[TraceProtocol::MaxInsets];
+	uint32_t InsetAccumulated[TraceProtocol::MaxInsets] = {};
+	// The traced picture again, for the tiles to draw the windows' views back
+	// from at their place among the HUD's drawing.
+	std::unique_ptr<CachedTexture> InsetSource;
+	bool InsetSourceFresh = true;
+	// Whether the scene was gathered this frame, for a frame that draws only
+	// the windows' views.
+	bool CollectedThisFrame = false;
+	void AddInsetView(FSceneNode* Frame);
+
 	// The engine's screen flash for this frame, from Lock.
 	uint32_t DisableBits = 0;
 	FPlane FlashScale = FPlane(0.5f, 0.5f, 0.5f, 0.0f);

@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 10;
+	static const uint32_t Version = 11;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -254,6 +254,20 @@ namespace TraceProtocol
 	};
 
 	// Trace a frame of the scene as it now stands, at Width x Height.
+	// A view the HUD draws inside a window of its own - a security camera,
+	// the spy drone, the targeting augmentation's zoom - traced from its own
+	// viewpoint after the player's and written into the output at its
+	// rectangle, in output pixels. Its camera as TraceCommand's; its samples
+	// averaged over AccumulatedFrames frames, 0 when it has moved.
+	static const uint32_t MaxInsets = 4;
+	struct TraceInset
+	{
+		vec4 Camera[4];
+		uint32_t X, Y, Width, Height;
+		uint32_t AccumulatedFrames;
+		uint32_t Pad[3];
+	};
+
 	struct TraceCommand
 	{
 		CommandHeader H;
@@ -280,12 +294,13 @@ namespace TraceProtocol
 		// 1 when the level's surfaces take their lights as the engine's
 		// lightmaps do, 0 each linearly. The device's Lighting.
 		uint32_t Lighting;
-		uint32_t Spare;
+		uint32_t InsetCount;        // how many of Insets are in use
 		// Origin, right, up and forward, as the trace shader's push constants
 		// carry them - w holding the screen flash - and the same for last frame.
 		vec4 Camera[4];
 		vec4 PreviousCamera[4];
 		vec4 SkyOrigin;
+		TraceInset Insets[MaxInsets];
 	};
 
 	inline uint32_t Rounded(size_t bytes) { return (uint32_t)((bytes + 7) & ~size_t(7)); }
@@ -295,5 +310,6 @@ namespace TraceProtocol
 	static_assert(offsetof(Header, ReadySemaphore) % 8 == 0 && offsetof(Header, OutputMemory) % 8 == 0, "64-bit fields must be aligned alike");
 	static_assert(sizeof(Header) % 8 == 0, "header must keep the command area aligned");
 	static_assert(sizeof(WireInstance) == 128, "instance record must match in both builds");
+	static_assert(sizeof(TraceInset) == 96, "inset record must match in both builds");
 	static_assert(sizeof(TraceCommand) % 8 == 0 && sizeof(GeometryCommand) % 8 == 0 && sizeof(TextureCommand) % 8 == 0, "commands keep 8 byte alignment");
 }

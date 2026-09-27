@@ -44,11 +44,13 @@ std::string Shaders::Trace()
 		layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 		layout(binding = 0) uniform accelerationStructureEXT topLevel;
-		layout(binding = 1, rgba32f) uniform image2D accumImage;
-		layout(binding = 2, rgba16f) uniform image2D outImage;
-		// xyz: the world position this pixel hit last frame. w: which instance
-		// owned it, or -1 for the sky.
-		layout(binding = 7, rgba32f) uniform image2D historyImage;
+		// The view's own images, a set of their own so that the views the HUD
+		// draws in windows are traced with the same scene: the average so far,
+		// the picture, and - xyz - the world position each pixel hit last
+		// frame, w which instance owned it, or -1 for the sky.
+		layout(set = 1, binding = 0, rgba32f) uniform image2D accumImage;
+		layout(set = 1, binding = 1, rgba16f) uniform image2D outImage;
+		layout(set = 1, binding = 2, rgba32f) uniform image2D historyImage;
 
 		struct TriangleAttributes
 		{
@@ -133,7 +135,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -151,12 +153,15 @@ std::string Shaders::Trace()
 
 		// Which instances each kind of ray sees, against SceneInstance::Mask.
 		// The view's own rays and shadows miss the viewer's body while the
-		// camera is inside it (0x02); whatever has bounced - a mirror's view
+		// camera is inside it (0x12); whatever has bounced - a mirror's view
 		// among them - misses the first person weapon (0x04); shadows miss a
-		// light fitting with its lamp inside it (0x08).
-		const uint ViewRays = 0xFDu;
+		// light fitting with its lamp inside it (0x18). A view in a window of
+		// the HUD's sees only what carries 0x10: not the weapon, and not the
+		// camera it is seen from (SceneData's InstanceMask).
+		const uint ViewRays = 0xEDu;
 		const uint BouncedRays = 0xFBu;
-		const uint ShadowRays = 0xF5u;
+		const uint ShadowRays = 0xE5u;
+		const uint WindowRays = 0x10u;
 
 		// Does this point on the triangle actually exist? UE1 masked art keys
 		// transparency to palette index zero, which the upload turns into an
@@ -1500,7 +1505,10 @@ std::string Shaders::Trace()
 					rayQueryEXT rq;
 					// The view's own ray until it first bounces: passing through
 					// glass or into the sky zone keeps it at bounce zero.
-					uint cullMask = (lobePass == 0 && bounce == 0u) ? ViewRays : BouncedRays;
+					// A view in a window of the HUD's is someone else's
+					// (Disable bit 32768): it sees the player, and neither
+					// the weapon at the player's eyes nor its own camera.
+					uint cullMask = (lobePass == 0 && bounce == 0u) ? ((Disable & 32768u) != 0u ? WindowRays : ViewRays) : BouncedRays;
 					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, cullMask, origin, rayMin, direction, 100000.0);
 					while (rayQueryProceedEXT(rq))
 					{

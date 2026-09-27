@@ -171,7 +171,13 @@ straight out of `UModel` and the actor list:
   full when a conversation's camera looks on from outside;
 - the skybox, seen through the sky zone's own viewpoint as the engine draws it;
 - the vision augmentation: its tints and labels, and the people and bodies it
-  shows through walls, which the HUD draws as meshes over the view.
+  shows through walls, which the HUD draws as meshes over the view;
+- the views the HUD draws in windows of their own - a security computer's
+  cameras, the spy drone's - each traced from its own camera after the
+  player's view, at its window's size, and averaged over the frames it holds
+  still rather than denoised, so a moving one stays grainy. The camera it is
+  seen from, which the engine hides while it draws the view, is left out of
+  it, and the player is in it.
 
 The static world is built into a bottom level acceleration structure once per
 level; everything that moves is rebuilt only when its shape changes, and placed
@@ -568,9 +574,6 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
   which.
 - Some lockers come out about three times as bright as in the rasterised
   game; not yet looked into.
-- The views drawn inside the HUD - a security computer's cameras, the spy
-  drone's, the targeting augmentation's zoom - are blank: only the player's
-  own view is traced.
 
 ### Building it on Windows
 

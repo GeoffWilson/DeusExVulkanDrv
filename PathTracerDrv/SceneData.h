@@ -200,16 +200,22 @@ enum InstanceMask : uint32_t
 	InstanceSeenByAll = 0xFF,
 	// The viewer's own body while the camera is inside it. The engine never
 	// draws it from there, but a mirror shows it, and so does anything else
-	// that bounces - everything except the view itself and shadows.
-	InstanceSeenReflected = 0x02,
+	// that bounces, and a view in a window of the HUD's - everything except
+	// the view itself and shadows.
+	InstanceSeenReflected = 0x12,
 	// The weapon in the player's hands, which the engine draws over the view:
 	// seen by the view and throwing its shadows, but not floating at the
-	// player's eyes in a mirror.
+	// player's eyes in a mirror or in a window's view.
 	InstanceSeenByView = 0x04,
 	// Seen by everything but shadow rays: a light fitting with its lamp
 	// inside it. The engine never lets a mesh shadow a lightmap, and a
 	// fitting built round its light shut the room's light in with it.
-	InstanceCastsNoShadow = 0x08,
+	InstanceCastsNoShadow = 0x18,
+	// Taken out of an instance's mask, it is not seen by the views in the
+	// HUD's windows: the security camera or drone a window is seen from,
+	// which the window hides while it draws, and whose inside the view
+	// would otherwise start in.
+	InstanceSeenByWindows = 0x10,
 };
 
 struct SceneInstance

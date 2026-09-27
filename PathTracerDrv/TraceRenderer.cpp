@@ -77,13 +77,10 @@ void TraceRenderer::CreateTracePipeline()
 {
 	DescriptorLayout = DescriptorSetLayoutBuilder()
 		.AddBinding(0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxTextures, VK_SHADER_STAGE_COMPUTE_BIT)
-		.AddBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
@@ -105,16 +102,27 @@ void TraceRenderer::CreateTracePipeline()
 		.DebugName("PathTracerSetLayout")
 		.Create(Device);
 
+	ViewLayout = DescriptorSetLayoutBuilder()
+		.AddBinding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.DebugName("PathTracerViewSetLayout")
+		.Create(Device);
+
+	const int viewSets = 1 + (int)TraceProtocol::MaxInsets;
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 + GuideImageCount)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 + GuideImageCount + 3 * viewSets)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxTextures)
-		.MaxSets(1)
+		.MaxSets(1 + viewSets)
 		.DebugName("PathTracerDescriptorPool")
 		.Create(Device);
 
 	DescriptorSet = DescriptorPool->allocate(DescriptorLayout.get());
+	ViewSet = DescriptorPool->allocate(ViewLayout.get());
+	for (Inset& inset : Insets)
+		inset.Set = DescriptorPool->allocate(ViewLayout.get());
 
 	MaterialBuffer = BufferBuilder()
 		.Size(MaxTextures * sizeof(vec4))
@@ -127,6 +135,7 @@ void TraceRenderer::CreateTracePipeline()
 
 	PipelineLayout = PipelineLayoutBuilder()
 		.AddSetLayout(DescriptorLayout.get())
+		.AddSetLayout(ViewLayout.get())
 		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants))
 		.DebugName("PathTracerPipelineLayout")
 		.Create(Device);
@@ -484,7 +493,7 @@ void TraceRenderer::Resize(int width, int height, int outputWidth, int outputHei
 	makeImage(HistoryImage, HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT, "PathTracerHistory");
 
 	makeImage(OutputImage, OutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight,
-		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, "PathTracerOutput");
+		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerOutput");
 
 	// In the trace shader's binding order. Depth and motion want the full
 	// precision; the rest are colours and normals.
@@ -646,13 +655,13 @@ void TraceRenderer::UpdateDescriptors()
 	writes.AddBuffer(DescriptorSet.get(), 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MotionBuffer.get());
 	writes
 		.AddAccelerationStructure(DescriptorSet.get(), 0, Accel->GetTopLevel())
-		.AddStorageImage(DescriptorSet.get(), 1, AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(ViewSet.get(), 0, AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		// With Ray Reconstruction the trace's picture is its input, at the
 		// render size; otherwise it is the picture.
-		.AddStorageImage(DescriptorSet.get(), 2, TracingForRr ? RrColorView.get() : OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(ViewSet.get(), 1, TracingForRr ? RrColorView.get() : OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(ViewSet.get(), 2, HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(DescriptorSet.get(), 23, RrDepthView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(DescriptorSet.get(), 24, RrMotionView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(DescriptorSet.get(), 7, HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddBuffer(DescriptorSet.get(), 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
 		.AddBuffer(DescriptorSet.get(), 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
 		.AddBuffer(DescriptorSet.get(), 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
@@ -846,6 +855,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 
 	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
 	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet.get());
+	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, ViewSet.get());
 	commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
 	commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
 	stamp(2);
@@ -940,9 +950,100 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		stamp(3);
 		LastDenoiser = DenoiseOff;
 	}
+	RecordInsets(commands, frame);
 	stamp(4);
 	TimestampsPending[slot] = timing;
 	return true;
+}
+
+// The views the HUD draws in windows of their own - a security computer's
+// cameras, the spy drone's, the targeting augmentation's zoom - each traced
+// from its own viewpoint once the player's is done, at its window's size in
+// output pixels, and copied into the output over it. Not denoised: each
+// averages its own samples over the frames it holds still, as a view with
+// denoising off does, in images of its own. The engine draws them over the
+// view the same way, and the device draws them back at their place among
+// the HUD's own drawing (see UPathTracerRenderDevice::SetSceneNode).
+void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame)
+{
+	static_assert(MaxInsets == (int)TraceProtocol::MaxInsets, "one set of images for each inset the protocol carries");
+	const uint32_t count = std::min(frame.InsetCount, TraceProtocol::MaxInsets);
+	for (uint32_t i = 0; i < count; i++)
+	{
+		const TraceProtocol::TraceInset& view = frame.Insets[i];
+		const int width = (int)std::min<uint32_t>(view.Width, (uint32_t)std::max(OutputWidth - (int)view.X, 0));
+		const int height = (int)std::min<uint32_t>(view.Height, (uint32_t)std::max(OutputHeight - (int)view.Y, 0));
+		if (width <= 0 || height <= 0)
+			continue;
+
+		Inset& inset = Insets[i];
+		bool fresh = false;
+		if (inset.Width != width || inset.Height != height)
+		{
+			// A window that appears or changes size: rare, so it waits.
+			Context->WaitForGpu();
+			auto makeImage = [&](std::unique_ptr<VulkanImage>& image, std::unique_ptr<VulkanImageView>& imageView, VkFormat format, VkImageUsageFlags usage, const char* name)
+			{
+				image = ImageBuilder().Format(format).Size(width, height).Usage(usage).DebugName(name).Create(Device);
+				imageView = ImageViewBuilder().Image(image.get(), format).DebugName(name).Create(Device);
+			};
+			makeImage(inset.Accum, inset.AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, "PathTracerInsetAccum");
+			makeImage(inset.Out, inset.OutView, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, "PathTracerInsetOut");
+			makeImage(inset.History, inset.HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, "PathTracerInsetHistory");
+			WriteDescriptors()
+				.AddStorageImage(inset.Set.get(), 0, inset.AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
+				.AddStorageImage(inset.Set.get(), 1, inset.OutView.get(), VK_IMAGE_LAYOUT_GENERAL)
+				.AddStorageImage(inset.Set.get(), 2, inset.HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
+				.Execute(Device);
+			inset.Width = width;
+			inset.Height = height;
+			fresh = true;
+		}
+		if (fresh)
+		{
+			PipelineBarrier()
+				.AddImage(inset.Accum.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
+				.AddImage(inset.Out.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
+				.AddImage(inset.History.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
+				.Execute(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		}
+
+		// The player's settings, from its own eye, at its own size, and with
+		// nothing for a denoiser: the view is neutral to the screen flash,
+		// which the engine puts over the whole screen.
+		TracePushConstants constants = PushConstants;
+		constants.CameraOrigin = vec4(view.Camera[0].x, view.Camera[0].y, view.Camera[0].z, 1.0f);
+		constants.CameraRight = vec4(view.Camera[1].x, view.Camera[1].y, view.Camera[1].z, 0.0f);
+		constants.CameraUp = vec4(view.Camera[2].x, view.Camera[2].y, view.Camera[2].z, 0.0f);
+		constants.CameraForward = vec4(view.Camera[3].x, view.Camera[3].y, view.Camera[3].z, 0.0f);
+		constants.Disable = (constants.Disable & ~(64u | 256u)) | 32768u;
+		constants.Counts[2] &= 0x00ffffffu;
+		constants.Counts[3] = fresh ? 0u : view.AccumulatedFrames;
+		constants.Params.w = 0.0f;
+
+		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet.get());
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, inset.Set.get());
+		commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &constants);
+		commands->dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+		// Over the output at the window: after the player's view is written
+		// there, whichever pass wrote it, and before it is handed over.
+		VkMemoryBarrier toCopy = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+		toCopy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		toCopy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toCopy, 0, nullptr, 0, nullptr);
+		VkImageCopy copy = {};
+		copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		copy.dstSubresource = copy.srcSubresource;
+		copy.dstOffset = { (int32_t)view.X, (int32_t)view.Y, 0 };
+		copy.extent = { (uint32_t)width, (uint32_t)height, 1 };
+		vkCmdCopyImage(commands->buffer, inset.Out->image, VK_IMAGE_LAYOUT_GENERAL, OutputImage->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+		VkMemoryBarrier afterCopy = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+		afterCopy.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		afterCopy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &afterCopy, 0, nullptr, 0, nullptr);
+	}
 }
 
 const char* TraceRenderer::DlssStatus() const

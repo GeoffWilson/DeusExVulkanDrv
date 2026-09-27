@@ -132,6 +132,7 @@ int main(int argc, char** argv)
 	uint32_t lightSize = 0;
 	uint32_t engineLighting = 0;
 	bool bakedMask = false;
+	bool inset = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -152,6 +153,8 @@ int main(int argc, char** argv)
 			engineLighting = 1;
 		else if (!strcmp(argv[i], "--baked-mask"))
 			bakedMask = true;
+		else if (!strcmp(argv[i], "--inset"))
+			inset = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -397,6 +400,27 @@ int main(int argc, char** argv)
 		frame.Camera[3] = vec4(forward.x, forward.y, forward.z, 0.0f);
 		for (int i = 0; i < 4; i++)
 			frame.PreviousCamera[i] = frame.Camera[i];
+		// --inset: a second view, as a security camera's in a window of the
+		// HUD's, from the right of the box and above, in the picture's top
+		// right third.
+		if (inset)
+		{
+			const vec3 insetEye(650, 150, 420);
+			const vec3 insetForward = Normalized(vec3(target.x - insetEye.x, target.y - insetEye.y, target.z - insetEye.z));
+			const vec3 insetRight = Normalized(Cross(insetForward, vec3(0, 0, 1)));
+			const vec3 insetDown = Cross(insetForward, insetRight);
+			TraceProtocol::TraceInset& view = frame.Insets[0];
+			view.Width = width / 3;
+			view.Height = height / 3;
+			view.X = width - view.Width - width / 32;
+			view.Y = height / 32;
+			const float insetAspect = (float)view.Height / (float)view.Width;
+			view.Camera[0] = vec4(insetEye.x, insetEye.y, insetEye.z, 1.0f);
+			view.Camera[1] = vec4(insetRight.x, insetRight.y, insetRight.z, 0.0f) * 0.8f;
+			view.Camera[2] = vec4(insetDown.x, insetDown.y, insetDown.z, 0.0f) * (0.8f * insetAspect);
+			view.Camera[3] = vec4(insetForward.x, insetForward.y, insetForward.z, 0.0f);
+			frame.InsetCount = 1;
+		}
 		// Frame to frame change over the last quarter, for --still.
 		std::vector<float> lastPicture;
 		double changeSum = 0.0;
@@ -439,6 +463,7 @@ int main(int argc, char** argv)
 				frame.Height = height * 3 / 2;
 			}
 			frame.AccumulatedFrames = (uint32_t)i;
+			frame.Insets[0].AccumulatedFrames = (uint32_t)i;
 			frame.RestartDenoiser = i == 0;
 			LARGE_INTEGER a, b, f;
 			QueryPerformanceCounter(&a);

@@ -68,7 +68,9 @@ its checker as S3TC blocks, as New Vision's textures go; `--engine-lighting`
 lights it as the device's default `Lighting=Engine` does, where the harness
 otherwise keeps to the linear lighting its scene was made for; with it,
 `--baked-mask` bakes the light into the floor's lightmap with a shadow mask
-covering only the floor's left half, which the right half should go without. The Windows SDK that `xwin` fetches carries the Direct3D
+covering only the floor's left half, which the right half should go without.
+`--inset` adds a second view, as a security camera's in a window of the HUD,
+traced from the right of the box into the picture's top right corner. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 

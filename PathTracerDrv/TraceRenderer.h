@@ -111,6 +111,7 @@ private:
 	void WriteMotion(const vec4 (&previousCamera)[4], vec2 jitter, FrameUploads& uploads);
 	void RecordTexturePixels(VulkanCommandBuffer* commands, FrameUploads& uploads);
 	void BindWhite(uint32_t index);
+	void RecordInsets(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame);
 
 	GpuContext* Context = nullptr;
 	VulkanDevice* Device = nullptr;
@@ -121,6 +122,20 @@ private:
 	std::unique_ptr<VulkanDescriptorSetLayout> DescriptorLayout;
 	std::unique_ptr<VulkanDescriptorPool> DescriptorPool;
 	std::unique_ptr<VulkanDescriptorSet> DescriptorSet;
+	// A view's own images, set 1 of the trace: the player's view's, and one
+	// set for each window of the HUD's that shows a view of its own.
+	std::unique_ptr<VulkanDescriptorSetLayout> ViewLayout;
+	std::unique_ptr<VulkanDescriptorSet> ViewSet;
+	struct Inset
+	{
+		int Width = 0;
+		int Height = 0;
+		std::unique_ptr<VulkanImage> Accum, Out, History;
+		std::unique_ptr<VulkanImageView> AccumView, OutView, HistoryView;
+		std::unique_ptr<VulkanDescriptorSet> Set;
+	};
+	static const int MaxInsets = 4;   // TraceProtocol::MaxInsets
+	Inset Insets[MaxInsets];
 	std::unique_ptr<VulkanPipelineLayout> PipelineLayout;
 	std::unique_ptr<VulkanShader> TraceShader;
 	std::unique_ptr<VulkanPipeline> TracePipeline;

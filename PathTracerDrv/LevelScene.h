@@ -38,6 +38,9 @@ public:
 	// have the light at all. -1 when the surface has no lightmap. For PT LOOK.
 	static float BakedMaskAt(UModel* model, INT iSurf, AActor* light, const FVector& point);
 
+	// Called as a window of the HUD's draws its view: see the definition.
+	void HideFromWindows();
+
 private:
 	static void AnimationPose(UMesh* mesh, FName sequence, FLOAT animFrame, int& frameA, int& frameB, float& alpha);
 	int AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind = 0.0f, const FCoords* toLocal = nullptr);
@@ -132,6 +135,8 @@ private:
 	// brightness of a light without one. Numbered from 1, as the shader
 	// finds them in a surface's list.
 	std::unordered_map<AActor*, uint32_t> BakedLightIds;
+	// Which actor each of this frame's instances places, where it is one.
+	std::vector<std::pair<size_t, AActor*>> ActorInstances;
 	// Each lightmapped surface of the level's, by its index, as its record's
 	// number plus one; and the records, light lists and masks as they are
 	// gathered, put together into Lightmaps once the level is built.
