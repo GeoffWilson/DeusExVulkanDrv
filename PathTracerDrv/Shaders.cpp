@@ -831,14 +831,13 @@ std::string Shaders::Trace()
 				}
 			}
 
+			// A mesh's is returned as the engine has it, in displayed terms
+			// and unclamped: its ambient goes on before the clamp (meshLight).
 			if (everyLight)
 			{
 				if (anyChanging)
 					litByChangingLight = true;
-				// The engine clamps a mesh's light at each vertex to one: a lit
-				// mesh is never drawn brighter than its texture. Then linear,
-				// like every other colour the engine gives.
-				return meshGlow >= 0.0 ? pow(min(total, vec3(1.0)), vec3(2.2)) : total;
+				return total;
 			}
 
 			if (chosen < 0 || chosenWeight <= 0.0)
@@ -882,11 +881,27 @@ std::string Shaders::Trace()
 			float scale = weightSum / chosenWeight;
 			lightDirection = chosenDir;
 			lightBase = chosenBase * scale;
-			// For a mesh, clamped as the engine clamps it and then made linear.
 			// The estimate is the total in proportion, sampled by its weight,
-			// so clamping it clamps the total near enough.
-			vec3 direct = chosenValue * scale;
-			return meshGlow >= 0.0 ? pow(min(direct, vec3(1.0)), vec3(2.2)) : direct;
+			// so for a mesh, clamping it clamps the total near enough.
+			return chosenValue * scale;
+		}
+
+		// A lit mesh's light as the engine finishes it: its ambient added to
+		// the lights' sum, in displayed terms, clamped at one - a lit mesh is
+		// never drawn brighter than its texture - then made linear, like every
+		// other colour the engine gives.
+		vec3 meshLight(vec3 lights, vec3 ambient)
+		{
+			return pow(min(lights + ambient, vec3(1.0)), vec3(2.2));
+		}
+
+		// The ambient on a hit, linear. A lit mesh's instance carries its
+		// ambient in displayed terms, for meshLight; the level's surfaces and
+		// the movers carry their lightmaps' ambient, linear already.
+		vec3 linearAmbient(TriangleAttributes attr, int instanceId)
+		{
+			vec3 a = instanceAmbient[instanceId].rgb;
+			return attr.Ambient.rgb + (attr.CornerNormals.w != 0u ? pow(max(a, vec3(0.0)), vec3(2.2)) : a);
 		}
 	)";
 
@@ -1307,7 +1322,7 @@ std::string Shaders::Trace()
 							}
 							else
 							{
-								vec3 surroundings = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
+								vec3 surroundings = linearAmbient(attr, rayQueryGetIntersectionInstanceIdEXT(rq, true));
 								vec3 unusedDirection, unusedBase;
 								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, -1.0, direction, unusedDirection, unusedBase)
 									+ attr.Albedo.rgb * surroundings;
@@ -1502,13 +1517,16 @@ std::string Shaders::Trace()
 					// ScaleGlow (the instance's w, 1 + ScaleGlow, signed by
 					// whether it moved), unless PT MESHLIGHT has it lit as a
 					// flat surface is (Disable bit 1024).
+					int hitInstance = rayQueryGetIntersectionInstanceIdEXT(rq, true);
 					float meshGlow = -1.0;
 					if (attr.CornerNormals.w != 0u && (Disable & 1024u) == 0u)
 					{
-						float flags = abs(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w);
+						float flags = abs(instanceAmbient[hitInstance].w);
 						meshGlow = 1.4 * (flags > 0.5 ? flags - 1.0 : 1.0);
 					}
 					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, meshGlow, direction, lightDirection, lightBase);
+					if (meshGlow >= 0.0)
+						lit = meshLight(lit, instanceAmbient[hitInstance].rgb);
 
 					// What it is made of, only now the light loop is done with.
 					// A surface seen in a mirror is captured as matte, since its
@@ -1540,8 +1558,10 @@ std::string Shaders::Trace()
 					// not what the engine shows. A glossy surface reflects it too,
 					// as light arriving evenly from everywhere, which is what keeps
 					// metal from going black where no light reaches it.
-					vec3 ambient = attr.Ambient.rgb + instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].rgb;
-					radiance += throughput * shade * ambient;
+					// A lit mesh's is in its light already, as the engine adds it.
+					vec3 ambient = linearAmbient(attr, hitInstance);
+					if (meshGlow < 0.0)
+						radiance += throughput * shade * ambient;
 					if (glossCapture)
 						reflectionEmission += ambient;
 					else if (!captured)

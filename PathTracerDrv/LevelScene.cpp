@@ -15,16 +15,32 @@ namespace
 	}
 
 	// A zone's ambient light, which is what stops an unlit corner of a Deus Ex
-	// room being pure black. The engine adds it to everything in the zone; the
-	// light actors alone are nowhere near the whole picture.
+	// room being pure black, as Render.dll works it out: FGetHSV of the zone's
+	// hue, saturation and brightness together. That puts the brightness
+	// through the engine's curve, which is close to a square root - 20 out of
+	// 255 comes out at 0.23, not 0.08. In displayed terms, as everything in
+	// the engine's lighting is. Few zones set one; most of the game has none.
 	vec3 ZoneAmbient(AZoneInfo* zone)
 	{
 		if (!zone || zone->AmbientBrightness == 0)
 			return vec3(0.0f, 0.0f, 0.0f);
 
-		FPlane c = FGetHSV(zone->AmbientHue, zone->AmbientSaturation, 255);
-		const float brightness = zone->AmbientBrightness / 255.0f;
-		return vec3(std::pow(c.X, 2.2f), std::pow(c.Y, 2.2f), std::pow(c.Z, 2.2f)) * brightness;
+		const FPlane c = FGetHSV(zone->AmbientHue, zone->AmbientSaturation, zone->AmbientBrightness);
+		return vec3(c.X, c.Y, c.Z);
+	}
+
+	// The ambient on a surface the engine lights with a lightmap - the level's
+	// own and its movers'. Every texel of a lightmap starts at 64 times it, on
+	// a scale where 127 is full brightness (the lights' sum saturates there,
+	// and the lightmap is drawn doubled), so on screen it is half the zone's
+	// ambient. Made linear, as the texture is: the engine's multiply happens
+	// on the displayed colours. Summing it as a linear light, at the zone's
+	// brightness over 255, drew ambient-lit walls over twice as bright as the
+	// engine does.
+	vec3 LightmapAmbient(AZoneInfo* zone)
+	{
+		const vec3 a = ZoneAmbient(zone) * (2.0f * 64.0f / 255.0f);
+		return SrgbToLinear(a.x, a.y, a.z);
 	}
 
 	// A texture's average colour, used as a stand-in for sampling it.
@@ -318,7 +334,7 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		AZoneInfo* zone = nullptr;
 		if (node.iZone[1] < FBspNode::MAX_ZONES)
 			zone = model->Zones[node.iZone[1]].ZoneActor;
-		const vec3 ambient = ZoneAmbient(zone);
+		const vec3 ambient = LightmapAmbient(zone);
 
 		TriangleAttributes attr;
 		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
@@ -831,6 +847,20 @@ static float KindFromStyle(BYTE style);
 static float UnlitMeshGlow(AActor* actor)
 {
 	return Clamp(0.5f * (float)actor->ScaleGlow + actor->AmbientGlow / 256.0f, 0.0f, 1.0f);
+}
+
+// A lit mesh's ambient, as FLightManager sets it up for the mesh in
+// Render.dll: its zone's plus its own AmbientGlow out of 255, or at 255 a
+// pulse of 0.25 + 0.2 sin(8t) on the viewport's clock - a dropped pickup
+// glowing. In displayed terms: the shader adds it to the mesh's light before
+// the clamp, as the engine does, and a mesh gets all of it where a lightmap
+// gets half.
+vec3 LevelScene::MeshAmbient(AActor* actor, AZoneInfo* zone) const
+{
+	const float glow = actor->AmbientGlow == 255
+		? 0.25f + 0.2f * (float)std::sin(8.0 * ViewportTime)
+		: actor->AmbientGlow / 255.0f;
+	return ZoneAmbient(zone) + vec3(glow, glow, glow);
 }
 
 int LevelScene::GeometryForSprite(UTexture* texture, float kind)
@@ -1782,7 +1812,10 @@ void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCo
 	// ScaleGlow brightness, which is how effects fade out. An unlit mesh
 	// carries its own brightness the same way: see UnlitMeshGlow.
 	const float glow = isSprite ? Clamp((float)actor->ScaleGlow, 0.0f, 4.0f) : UnlitMeshGlow(actor);
-	const vec3 ambient = (isSprite || actor->bUnlit) ? vec3(glow, glow, glow) : ZoneAmbient(actor->Region.Zone);
+	// A lit mesh's ambient is the engine's, in displayed terms, for the shader
+	// to add to its light; a mover's is its lightmap's, as on the level.
+	const vec3 ambient = (isSprite || actor->bUnlit) ? vec3(glow, glow, glow)
+		: isBrush ? LightmapAmbient(actor->Region.Zone) : MeshAmbient(actor, actor->Region.Zone);
 
 	// Did this actor actually move or change shape since the last frame?
 	// The trace uses it to throw away the accumulated history of the pixels
@@ -2060,7 +2093,7 @@ void LevelScene::AddViewModel()
 	instance.Transform[2 * 4 + 3] = position.Z;
 
 	const float glow = UnlitMeshGlow(item);
-	const vec3 ambient = item->bUnlit ? vec3(glow, glow, glow) : ZoneAmbient(ViewActor->Region.Zone);
+	const vec3 ambient = item->bUnlit ? vec3(glow, glow, glow) : MeshAmbient(item, ViewActor->Region.Zone);
 	// Always counted as having moved: it rides the camera, and it bobs even
 	// when the camera does not.
 	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(true, item->ScaleGlow));

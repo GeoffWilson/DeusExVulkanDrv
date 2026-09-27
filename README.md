@@ -120,6 +120,8 @@ crash, flushed as they happen.
 - **Detail textures**, the fine grain over a wall or floor close up, as Deus
   Ex's own Direct3D renderer lays them on. The game's Detail Textures setting
   switches them.
+- **Zone ambient light as the engine gives it**, where walls lit by nothing
+  else were over twice as bright; and `AmbientGlow` on lit meshes.
 - **Materials off by default** until they have been checked by hand.
 - **Fixes:** a crash loading a save of the map already being played; a crash
   starting the game in a mode narrower than the screen under Proton's Wayland
@@ -165,7 +167,14 @@ source and was read by disassembly:
   non incidence, cylinder, disco, searchlight and rotor, and the torch and
   fire wavers and watery shimmer, which flicker across the surfaces they
   light a lightmap texel at a time;
-- special lighting, zone ambient light, and volumetric fog lights in fog zones,
+- zone ambient light as the engine works it out: `FGetHSV` at the zone's
+  brightness, which puts it through the engine's brightness curve, close to a
+  square root. A lightmap starts every texel at half of that; a lit mesh gets
+  all of it, with its own `AmbientGlow` (a pickup's pulse at 255), added to
+  its lights before they are clamped. Few zones set one - most of the game has
+  none - but where they do, ambient-lit walls were twice as bright as the
+  engine draws them;
+- special lighting, and volumetric fog lights in fog zones,
   integrated per pixel along the view ray;
 - unlit meshes at the engine's own brightness, and the screen flash for damage
   and water;
@@ -410,7 +419,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   crosshair, is drawn - its style, glow, skins, and every material's flags and
   texture, including what is in the texture and what it counts as being made
   of. For the level itself, `PT LOOK` names the surface's texture, its group,
-  its material and its detail texture. For an actor it also lists the lights in its reach, with their
+  its material, its detail texture and its zone's ambient. For an actor it also lists the lights in its reach, with their
   own values and the trace's, and what a surface of it facing them would get.
 - `PT VIEW NORMALS | DEPTH | MOTION | DIFFUSE | SPECULAR | EMISSION | ALBEDO |
   HITDIST | HISTORY | MATERIAL`: shows one of the denoiser's inputs, how many

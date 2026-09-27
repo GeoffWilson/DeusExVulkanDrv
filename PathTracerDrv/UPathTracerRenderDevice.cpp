@@ -496,8 +496,8 @@ static void DescribeActor(AActor* actor, UMesh* mesh)
 // then the trace's own record of each light in reach and what the shader
 // makes of a surface of the actor facing it square on: the engine's mesh
 // response there is 2.5, scaled by 1.4 times the actor's ScaleGlow, summed
-// in the colours as displayed, clamped to one and then made linear.
-// Measured at the actor's origin, and without shadows.
+// in the colours as displayed with the mesh's ambient, clamped to one and
+// then made linear. Measured at the actor's origin, and without shadows.
 void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
 {
 	ULevel* level = target->XLevel;
@@ -520,7 +520,12 @@ void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
 			(int)light->bSpecialLit);
 	}
 	const float meshScale = 1.4f * (float)target->ScaleGlow;
-	float total[3] = {};
+	AZoneInfo* zone = target->Region.Zone;
+	const vec3 ambient = Scene.MeshAmbient(target, zone);
+	debugf(TEXT("  ambient %.3f %.3f %.3f as displayed: zone %s brightness %d hue %d saturation %d, and AmbientGlow"),
+		ambient.x, ambient.y, ambient.z, zone ? zone->GetName() : TEXT("none"),
+		zone ? (int)zone->AmbientBrightness : 0, zone ? (int)zone->AmbientHue : 0, zone ? (int)zone->AmbientSaturation : 0);
+	float total[3] = { ambient.x, ambient.y, ambient.z };
 	for (size_t i = 0; i < Scene.Lights.size(); i++)
 	{
 		const SceneLight& light = Scene.Lights[i];
@@ -539,7 +544,7 @@ void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
 			(int)i, light.ColorBrightness.x, light.ColorBrightness.y, light.ColorBrightness.z, light.ColorBrightness.w,
 			radius, distance, falloff, light.Flags.w, facing[0], facing[1], facing[2]);
 	}
-	debugf(TEXT("  facing every light: %.3f %.3f %.3f as displayed, clamped and made linear %.3f %.3f %.3f"), total[0], total[1], total[2],
+	debugf(TEXT("  facing every light, with the ambient: %.3f %.3f %.3f as displayed, clamped and made linear %.3f %.3f %.3f"), total[0], total[1], total[2],
 		powf(Min(total[0], 1.0f), 2.2f), powf(Min(total[1], 1.0f), 2.2f), powf(Min(total[2], 1.0f), 2.2f));
 }
 
@@ -1178,6 +1183,7 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	// sent to the helper when the frame is.
 	const size_t geometriesBefore = Scene.Geometries.size();
 	Scene.LightScale = Max(LightScale, 1) / 100.0f;
+	Scene.ViewportTime = Viewport->CurrentTime;
 	Scene.HighlightSpecialLights = (DisableBits & 16u) != 0;
 	// Gathering is CPU only, so it runs while the GPU is still presenting the
 	// last frame.
@@ -1983,6 +1989,17 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 					(texture && texture->GetOuter()) ? texture->GetOuter()->GetName() : TEXT("none"),
 					kind, m.x, m.y, m.z,
 					(texture && texture->DetailTexture) ? texture->DetailTexture->GetName() : TEXT("none"));
+				// Its zone's ambient: FGetHSV at the zone's brightness, of
+				// which a lightmap starts at half.
+				AZoneInfo* zone = node.iZone[1] < FBspNode::MAX_ZONES ? model->Zones[node.iZone[1]].ZoneActor : nullptr;
+				if (zone && zone->AmbientBrightness)
+				{
+					const FPlane a = FGetHSV(zone->AmbientHue, zone->AmbientSaturation, zone->AmbientBrightness);
+					Ar.Logf(TEXT("PT: zone %s ambient brightness %d hue %d saturation %d: %.3f %.3f %.3f on a mesh, half that on a lightmap"),
+						zone->GetName(), (int)zone->AmbientBrightness, (int)zone->AmbientHue, (int)zone->AmbientSaturation, a.X, a.Y, a.Z);
+				}
+				else
+					Ar.Logf(TEXT("PT: zone %s has no ambient"), zone ? zone->GetName() : TEXT("none"));
 			}
 			Ar.Logf(TEXT("PT: %s written to the log"), (hit.Actor && hit.Actor != player->Level) ? hit.Actor->GetName() : TEXT("nothing but the level"));
 			return 1;

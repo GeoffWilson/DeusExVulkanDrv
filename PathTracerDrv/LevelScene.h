@@ -127,6 +127,10 @@ public:
 	// One means a character is built once, exactly like a prop - which is the
 	// only structural difference between the two, and props render.
 	float LightScale = 1.0f;
+	// The viewport's clock, which the engine pulses a glowing mesh by.
+	double ViewportTime = 0.0;
+	// A lit mesh's ambient as the engine gives it, in displayed terms.
+	vec3 MeshAmbient(AActor* actor, AZoneInfo* zone) const;
 	// Diagnostic: paint animated and specially shaped lights in bright,
 	// obvious colours so they can be found.
 	bool HighlightSpecialLights = false;
