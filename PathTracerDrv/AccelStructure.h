@@ -56,6 +56,7 @@ public:
 	VulkanBuffer* GetLightBuffer() const { return LightBuffer.get(); }
 	VulkanBuffer* GetLightGridBuffer() const { return LightGridBuffer.get(); }
 	VulkanBuffer* GetLightmapBuffer() const { return LightmapBuffer.get(); }
+	VulkanBuffer* GetEmitterBuffer() const { return EmitterBuffer.get(); }
 	// One entry per instance, indexed in the shader by the intersection's
 	// instance id. Carries what varies by placement rather than by shape.
 	VulkanBuffer* GetInstanceDataBuffer() const { return InstanceDataBuffer.get(); }
@@ -136,6 +137,14 @@ private:
 	void WriteLightmaps(SceneData& scene, FrameUploads& uploads);
 	std::unique_ptr<VulkanBuffer> LightmapBuffer;
 	size_t LightmapCapacity = 0;
+
+	// The level's glowing surfaces (SceneData's Emitters), written when a
+	// level sends them, each record's geometry and triangle turned into the
+	// triangle's attribute index. Never empty: a level without any has a
+	// count of none.
+	void WriteEmitters(SceneData& scene, FrameUploads& uploads);
+	std::unique_ptr<VulkanBuffer> EmitterBuffer;
+	size_t EmitterCapacity = 0;
 	size_t AttributeCapacity = 0;
 	bool haveDynamic = false;
 	bool attributesChanged = false;

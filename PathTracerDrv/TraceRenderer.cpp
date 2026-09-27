@@ -100,6 +100,7 @@ void TraceRenderer::CreateTracePipeline()
 		.AddBinding(24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device);
 
@@ -114,7 +115,7 @@ void TraceRenderer::CreateTracePipeline()
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 + GuideImageCount + 3 * viewSets)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxTextures)
 		.MaxSets(1 + viewSets)
 		.DebugName("PathTracerDescriptorPool")
@@ -662,7 +663,7 @@ void TraceRenderer::WriteFinishDescriptors()
 
 void TraceRenderer::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !Accel->GetLightmapBuffer() || !MotionBuffer || !FogShadowBuffer)
+	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !Accel->GetLightmapBuffer() || !Accel->GetEmitterBuffer() || !MotionBuffer || !FogShadowBuffer)
 		return;
 	Context->WaitForGpu();
 
@@ -685,6 +686,7 @@ void TraceRenderer::UpdateDescriptors()
 		.AddBuffer(DescriptorSet.get(), 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
 		.AddBuffer(DescriptorSet.get(), 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightGridBuffer())
 		.AddBuffer(DescriptorSet.get(), 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightmapBuffer())
+		.AddBuffer(DescriptorSet.get(), 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetEmitterBuffer())
 		.Execute(Device);
 	WriteCompositeDescriptors();
 	WriteFinishDescriptors();
@@ -692,8 +694,9 @@ void TraceRenderer::UpdateDescriptors()
 	DescriptorsDirty = false;
 }
 
-// Last frame's camera, this frame's jitter for Ray Reconstruction, the
-// flashlight, then each instance's last placement as three rows, in the
+// Last frame's camera, this frame's jitter for Ray Reconstruction and how
+// much the glowing surfaces light, the flashlight, then each instance's last
+// placement as three rows, in the
 // order the top level structure numbers them. An instance with no last
 // placement - new this frame, or one that never moves - is given its current
 // one, which reads as not having moved.
@@ -718,7 +721,7 @@ void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 j
 	auto* mapped = (vec4*)uploads.Write(MotionBuffer.get(), 0, wanted * sizeof(vec4));
 	for (int i = 0; i < 4; i++)
 		mapped[i] = frame.PreviousCamera[i];
-	mapped[4] = vec4(jitter.x, jitter.y, 0.0f, 0.0f);
+	mapped[4] = vec4(jitter.x, jitter.y, frame.GlowLighting, 0.0f);
 	for (int i = 0; i < 3; i++)
 		mapped[5 + i] = frame.Flashlight[i];
 	for (size_t i = 0; i < count; i++)

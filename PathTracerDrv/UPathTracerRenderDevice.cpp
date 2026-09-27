@@ -324,6 +324,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	FlashlightBrightness = 100;
 	FlashlightHaze = 0;
 	UseFogShadows = 1;
+	GlowLighting = 1000;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -355,6 +356,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("FlashlightBrightness"), RF_Public) UIntProperty(CPP_PROPERTY(FlashlightBrightness), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FlashlightHaze"), RF_Public) UIntProperty(CPP_PROPERTY(FlashlightHaze), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FogShadows"), RF_Public) UBoolProperty(CPP_PROPERTY(UseFogShadows), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("GlowLighting"), RF_Public) UIntProperty(CPP_PROPERTY(GlowLighting), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -1298,6 +1300,7 @@ static const TCHAR* const BenchSteps[] = {
 	TEXT("meshes lit as flat surfaces"),
 	TEXT("hard shadows, from points"),
 	TEXT("glowing surfaces light nothing"),
+	TEXT("glowing surfaces not sampled"),
 	TEXT("fog unshadowed"),
 	TEXT("the game's light augmentation"),
 	TEXT("one bounce"),
@@ -1354,12 +1357,13 @@ bool UPathTracerRenderDevice::ApplyBenchStep(int step)
 	case 6:  return setBit(1024u);
 	case 7:  if (LightSizeNow <= 0) return false; LightSizeNow = 0; return true;
 	case 8:  return setBit(512u);
+	case 9:  return setBit(262144u);
 	// Any glow in the last couple of seconds: a strobe or a flickering fog
 	// light is out of the list on the frames it is dark.
-	case 9:  return FrameIndex - LastFogFrame < 120u && !(DisableBits & 32u) && setBit(65536u);
-	case 10: return Scene.Flashlight[0].w > 0.0f && setBit(131072u);
-	case 11: if (Bounces <= 1) return false; Bounces = 1; return true;
-	case 12: return setBit(2u);
+	case 10: return FrameIndex - LastFogFrame < 120u && !(DisableBits & 32u) && setBit(65536u);
+	case 11: return Scene.Flashlight[0].w > 0.0f && setBit(131072u);
+	case 12: if (Bounces <= 1) return false; Bounces = 1; return true;
+	case 13: return setBit(2u);
 	default: return true;
 	}
 }
@@ -1774,6 +1778,7 @@ bool UPathTracerRenderDevice::SendScene()
 		SentVersions.clear();
 		SentTextures.clear();
 		LightmapsSent = false;
+		EmittersSent = false;
 		SceneReset = false;
 	}
 
@@ -1790,6 +1795,20 @@ bool UPathTracerRenderDevice::SendScene()
 		{
 			debugf(TEXT("PathTracer lightmaps: %.1f MB is too much to send; the engine's shadows are left out"), bytes / (1024.0f * 1024.0f));
 			Tracer->Lightmaps(std::vector<uint32_t>());
+		}
+	}
+
+	// The glowing surfaces sampled as lights, once a level, likewise.
+	if (!EmittersSent)
+	{
+		EmittersSent = true;
+		const size_t bytes = Scene.Emitters.size() * sizeof(uint32_t);
+		if (bytes < (16u << 20))
+			Tracer->Emitters(Scene.Emitters);
+		else
+		{
+			debugf(TEXT("PathTracer glowing surfaces: %.1f MB is too much to send; they light only by the bounces that find them"), bytes / (1024.0f * 1024.0f));
+			Tracer->Emitters(std::vector<uint32_t>());
 		}
 	}
 
@@ -2042,6 +2061,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
 				for (int i = 0; i < 3; i++)
 					frame.Flashlight[i] = Scene.Flashlight[i];
+				frame.GlowLighting = Max(GlowLighting, 0) / 100.0f;
 				// The windows' views, each averaging its samples while it and
 				// the scene hold still, as the player's does.
 				frame.InsetCount = (uint32_t)InsetViews.size();
@@ -2835,6 +2855,23 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 					(int)FlashlightBrightness, (int)FlashlightHaze);
 			handled = true;
 		}
+		// How much glowing surfaces light, in percent; and whether they are
+		// sampled as lights or found only by the bounces that reach them,
+		// to compare (Disable bit 262144).
+		if (ParseCommand(&Cmd, TEXT("GLOW")))
+		{
+			GlowLighting = Max(appAtoi(Cmd), 0);
+			Ar.Logf(TEXT("PT: glowing surfaces light at %d%%"), (int)GlowLighting);
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("GLOWSAMPLING")))
+		{
+			DisableBits ^= 262144u;
+			Ar.Logf(TEXT("PT: glowing surfaces %s"), (DisableBits & 262144u)
+				? TEXT("found only by the bounces that reach them")
+				: TEXT("sampled as lights as well"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("BEAM")))
 		{
 			FlashlightHaze = Max(appAtoi(Cmd), 0);
@@ -2986,7 +3023,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

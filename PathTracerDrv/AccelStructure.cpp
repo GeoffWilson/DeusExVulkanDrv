@@ -1,5 +1,6 @@
 #include "TracePrecomp.h"
 #include "AccelStructure.h"
+#include "EmitterGrid.h"
 #include "GpuContext.h"
 #include "FrameUploads.h"
 #include <chrono>
@@ -30,6 +31,8 @@ void AccelStructure::Reset()
 	LightBuffer.reset();
 	LightmapBuffer.reset();
 	LightmapCapacity = 0;
+	EmitterBuffer.reset();
+	EmitterCapacity = 0;
 	AttributeBuffer.reset();
 	AttributeCapacity = 0;
 	haveDynamic = false;
@@ -126,6 +129,7 @@ void AccelStructure::Update(SceneData& scene, FrameUploads& uploads)
 {
 	SyncGeometry(scene, uploads);
 	WriteLightmaps(scene, uploads);
+	WriteEmitters(scene, uploads);
 	WriteInstances(scene, uploads);
 }
 
@@ -158,6 +162,45 @@ void AccelStructure::WriteLightmaps(SceneData& scene, FrameUploads& uploads)
 	{
 		uploads.Upload(LightmapBuffer.get(), 0, scene.Lightmaps.data(), scene.Lightmaps.size() * sizeof(uint32_t));
 	}
+
+	unguard;
+}
+
+void AccelStructure::WriteEmitters(SceneData& scene, FrameUploads& uploads)
+{
+	guard(AccelStructure::WriteEmitters);
+
+	if (EmitterBuffer && !scene.EmittersChanged)
+		return;
+	scene.EmittersChanged = false;
+	std::vector<uint32_t> words = scene.Emitters;
+	if (words.size() < EmitterGrid::Header)
+		words.assign(EmitterGrid::Header, 0u);
+	// The records name a geometry and a triangle in it; the shader wants the
+	// triangle's attributes, wherever that geometry's were put.
+	const uint32_t count = words[0], recordBase = words[1];
+	for (uint32_t i = 0; i < count; i++)
+	{
+		uint32_t* r = &words[recordBase + i * EmitterGrid::RecordWords];
+		const uint32_t geometry = r[15], primitive = r[19];
+		r[15] = geometry < Bottom.size() ? Bottom[geometry].AttributeBase + primitive : 0u;
+	}
+	const size_t wanted = words.size();
+	if (!EmitterBuffer || wanted > EmitterCapacity)
+	{
+		EmitterCapacity = wanted;
+		uploads.Retire(std::move(EmitterBuffer));
+		EmitterBuffer = BufferBuilder()
+			.Size(EmitterCapacity * sizeof(uint32_t))
+			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+			.MinAlignment(256)
+			.DebugName("PathTracerEmitters")
+			.Create(renderer->GetDevice());
+		attributesChanged = true;
+	}
+	uploads.Upload(EmitterBuffer.get(), 0, words.data(), words.size() * sizeof(uint32_t));
+	if (count)
+		debugf("PathTracer: %u glowing triangles sampled as lights", count);
 
 	unguard;
 }

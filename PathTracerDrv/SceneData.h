@@ -295,6 +295,12 @@ public:
 	// written once rather than every frame.
 	bool LightmapsChanged = false;
 
+	// The level's glowing surfaces as lights, and the grid saying which to
+	// sample where, as words: see EmitterGrid.h. Sent once a level, like the
+	// lightmaps.
+	std::vector<uint32_t> Emitters;
+	bool EmittersChanged = false;
+
 	// Set when geometry was added, so whoever keeps acceleration structures
 	// for it knows to extend them.
 	bool GeometryAdded = false;

@@ -198,6 +198,13 @@ public:
 	// everything (volumetricFog in Shaders.cpp). PT FOGSHADOWS switches it
 	// for the session.
 	BITFIELD UseFogShadows;
+	// How much the level's glowing surfaces - signs, light panels, screens -
+	// light what is around them, in percent: 100 as bright as they glow,
+	// which is what the trace had always given them and hardly shows, since
+	// a sign's texture is no brighter than a lit wall; 1000, the default, for
+	// neon that spills its colour onto the walls around it. What they look
+	// like is unchanged. PT GLOW n sets it for the session.
+	INT GlowLighting;
 
 private:
 	// The switches in DisableBits the ini sets rather than PT alone: the
@@ -269,6 +276,7 @@ private:
 	double AdvancesSince = 0.0;
 	// Whether the helper has the level's shadow masks (Scene.Lightmaps).
 	bool LightmapsSent = false;
+	bool EmittersSent = false;
 	std::vector<uint32_t> Pixels;
 	int TextureFailuresLogged = 0;
 	bool TracerLost = false;

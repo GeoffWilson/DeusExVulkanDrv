@@ -664,6 +664,16 @@ bool Helper::Batch()
 			break;
 		}
 
+		case CmdEmitters:
+		{
+			EmittersCommand c;
+			memcpy(&c, body, sizeof(c));
+			const uint32_t* words = (const uint32_t*)(body + sizeof(c));
+			Renderer->Scene.Emitters.assign(words, words + c.Words);
+			Renderer->Scene.EmittersChanged = true;
+			break;
+		}
+
 		case CmdTexture:
 		{
 			TextureCommand c;

@@ -2,6 +2,7 @@
 
 #include "vec.h"
 #include "SceneData.h"
+#include "EmitterGrid.h"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -186,6 +187,11 @@ private:
 	std::vector<uint8_t> LightmapMaskBytes;
 	uint32_t AddLightmap(UModel* model, INT iSurf);
 	void FinishLightmaps();
+	// The level's glowing triangles, as they are found, and each one's place
+	// among all the level's triangles before they are split into the two
+	// static geometries: see BuildStatic.
+	std::vector<EmitterSource> EmitterSources;
+	std::vector<uint32_t> EmitterTriangles;
 	std::unordered_map<AActor*, PlacedPose> PreviousPoses;
 	std::unordered_map<AActor*, PlacedPose> CurrentPoses;
 	// The first person weapon's last placement, which is not an actor's

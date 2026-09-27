@@ -36,6 +36,7 @@ public:
 	void Instances(const std::vector<SceneInstance>& instances, int staticGeometries);
 	void Lights(const std::vector<SceneLight>& lights, const std::vector<SceneLight>& fogLights);
 	void Lightmaps(const std::vector<uint32_t>& words);
+	void Emitters(const std::vector<uint32_t>& words);
 	void Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels = 1, uint32_t format = 0);
 	void TexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels);
 

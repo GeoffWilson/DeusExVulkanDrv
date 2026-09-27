@@ -134,6 +134,13 @@ crash, flushed as they happen.
   wall. Their glow is now held to their shadows: it falls through grates and
   fan blades in shafts, and a pillar casts a shadow through it
   (`FogShadows`, `PT FOGSHADOWS`).
+- **Glowing surfaces sampled as lights.** Signs, light panels and screens lit
+  what was around them only through the bounces that happened to reach them,
+  so a small one left a noisy, flickering spill. Each surface shaded now also
+  traces a shadow ray to a point on a glowing triangle nearby, weighed against
+  the bounces so nothing is counted twice: the same light, with far less
+  noise - and turned up tenfold by default, so that neon spills its colour
+  onto the walls around it (`GlowLighting`, `PT GLOW n`).
 
 ### New in 1.2
 
@@ -492,6 +499,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	FlashlightBrightness=100
 	FlashlightHaze=0
 	FogShadows=True
+	GlowLighting=1000
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Lighting`: `Engine`, the default, lights the level's surfaces as the engine
@@ -587,6 +595,17 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   it falls through grates in shafts and a pillar shadows it, rather than
   glowing through everything as the engine draws it. `PT FOGSHADOWS` switches
   it for the session.
+- `GlowLighting`: how much the level's glowing surfaces - signs, light
+  panels, screens, anything the map marks unlit - light what is around them,
+  in percent. 100 is as bright as they glow, which is what they had always
+  given and hardly shows: a sign's texture is no brighter than a lit wall.
+  1000, the default, spills a sign's colour onto the walls around it, as real
+  neon would. What they look like is unchanged. In the Hong Kong market, with
+  2,068 glowing triangles, sampling them costs 0.36 ms of GPU a frame at 1000
+  (DLSS Quality at 1920x1440 on an RTX 4090). The level's own glowing surfaces are sampled as lights
+  where they would add at least a fiftieth to what the lights give; glass and
+  meshes that glow are found only by the bounces that reach them.
+  `PT GLOW n` sets it for the session.
 - `FPSLimit`: frames per second to hold the game to, 120 by default and 0 for
   no limit. Deus Ex cuts conversation audio short when left to run at a few
   hundred frames a second, the intro included. Unlike VulkanDrv's it does not wait
@@ -650,9 +669,13 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT LIGHTSIZE n`: the size lights cast shadows from, as `LightSize`.
 - `PT PINNEDUI 16:9 | 4:3 | OFF`: the UI kept to a box of that shape in the
   middle of the screen, or across all of it. Any ratio or number works.
-- `PT FLASHLIGHT [n]`, `PT BEAM n`, `PT FOGSHADOWS`: the flashlight on or
-  off or at a brightness, its beam's haze, and the fog's shadows, as the
-  settings of the same names.
+- `PT FLASHLIGHT [n]`, `PT BEAM n`, `PT FOGSHADOWS`, `PT GLOW n`: the
+  flashlight on or off or at a brightness, its beam's haze, the fog's
+  shadows, and how much glowing surfaces light, as the settings of the same
+  names.
+- `PT GLOWSAMPLING`: glowing surfaces found only by the bounces that reach
+  them, as before, or sampled as lights as well, to compare. The two should
+  settle to the same picture.
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).
@@ -660,8 +683,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT BENCH`: hold still for about half a minute while it switches the
   costlier features off one at a time - the engine's lighting, the baked
   shadow masks, mipmaps, anisotropic filtering, detail textures, the engine's
-  mesh lighting, soft shadows, glowing surfaces lighting the room, the fog's
-  shadows, the flashlight (against the game's own light augmentation), the
+  mesh lighting, soft shadows, glowing surfaces lighting the room and being
+  sampled as lights, the fog's shadows, the flashlight (against the game's own light augmentation), the
   extra bounces, shadows - with the frame limit and VSync off, then logs a table to
   `PathTracerTimings.log`: the GPU's time, the scene gathering and the frame
   with each, and how each compares with the settings as they are. `PT BENCH`

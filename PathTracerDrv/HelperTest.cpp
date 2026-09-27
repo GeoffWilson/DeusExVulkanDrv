@@ -9,7 +9,7 @@
 //
 //   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still]
 //                            [--lightsize radius] [--reference] [--backlight]
-//                            [--fog] [--flashlight] [--dark]
+//                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -35,6 +35,11 @@
 // the camera being so far off - and --dark turns the scene's light down to a
 // fiftieth and the sky off to show it.
 //
+// --glow puts a glowing cyan strip low on the wall, sampled as a light as the
+// level's glowing surfaces are; --glow-unsampled the same strip found only by
+// the bounces that reach it. With --reference the two should come to the
+// same picture, the sampled one with less noise on the way.
+//
 // Frames are taken the way the render device takes them: the next is asked
 // for before the last is waited for, so the helper records one while the GPU
 // traces the other. Along the way the scene does what a level does to the
@@ -56,6 +61,7 @@
 #include <zvulkan/vulkanbuilders.h>
 #include <zvulkan/vulkancompatibledevice.h>
 #include "TraceClient.h"
+#include "EmitterGrid.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -142,7 +148,7 @@ int main(int argc, char** argv)
 	uint32_t engineLighting = 0;
 	bool bakedMask = false;
 	bool inset = false;
-	bool fog = false, flashlight = false, dark = false, fogUnshadowed = false;
+	bool fog = false, flashlight = false, dark = false, fogUnshadowed = false, glowStrip = false, glowUnsampled = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -173,6 +179,10 @@ int main(int argc, char** argv)
 			flashlight = true;
 		else if (!strcmp(argv[i], "--dark"))
 			dark = true;
+		else if (!strcmp(argv[i], "--glow"))
+			glowStrip = true;
+		else if (!strcmp(argv[i], "--glow-unsampled"))
+			glowStrip = glowUnsampled = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -221,6 +231,32 @@ int main(int argc, char** argv)
 			for (TriangleAttributes& attr : world.Attributes)
 				attr.Ambient.w += 2.0f;
 		}
+		// The glowing strip, as the device describes a level's glowing
+		// triangle: unlit (Emission.w), numbered in Emission.z, and listed
+		// with its edges crossing along the face it glows from.
+		std::vector<EmitterSource> glowSources;
+		if (glowStrip)
+		{
+			const size_t first = world.Attributes.size();
+			AddQuad(world, vec3(-420, 398, 20), vec3(-220, 398, 20), vec3(-220, 398, 70), vec3(-420, 398, 70), vec3(0.1f, 0.9f, 1.0f), -1, 1);
+			for (size_t t = first; t < world.Attributes.size(); t++)
+			{
+				TriangleAttributes& attr = world.Attributes[t];
+				attr.Emission.w = 1.0f;
+				EmitterSource e;
+				e.V0 = world.Positions[t * 3];
+				e.E1 = world.Positions[t * 3 + 1] - e.V0;
+				e.E2 = world.Positions[t * 3 + 2] - e.V0;
+				const vec3 c = cross(e.E1, e.E2);
+				e.Power = (0.2126f * 0.1f + 0.7152f * 0.9f + 0.0722f * 1.0f) * 0.5f * std::sqrt(dot(c, c));
+				e.Geometry = 0;
+				e.Primitive = (uint32_t)t;
+				glowSources.push_back(e);
+				attr.Emission.z = (float)glowSources.size();
+			}
+		}
+		std::vector<uint32_t> emitterWords;
+		EmitterGrid::Build(glowSources, emitterWords);
 		std::vector<uint32_t> checker(64 * 64);
 		for (int y = 0; y < 64; y++)
 			for (int x = 0; x < 64; x++)
@@ -414,6 +450,7 @@ int main(int argc, char** argv)
 			client.Texture(1, 64, 64, stripes.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false);
 		client.Geometry(0, world);
 		client.Lightmaps(lightmaps);
+		client.Emitters(emitterWords);
 
 		// The camera, as the render device builds it: right and "up" - which
 		// points down the screen - scaled to the view's half extents.
@@ -435,7 +472,8 @@ int main(int argc, char** argv)
 		frame.Lighting = engineLighting;
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
-		frame.DisableBits = fogUnshadowed ? 65536u : 0u;
+		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u);
+		frame.GlowLighting = 1.0f;
 		frame.Timing = 1;
 		frame.Exposure = 0.2f + 128 * (2.0f / 255.0f);
 		frame.SkyIntensity = dark ? 0.0f : 128 * (2.0f / 255.0f);

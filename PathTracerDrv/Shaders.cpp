@@ -119,6 +119,9 @@ static std::string TraceCommon()
 		// Each fog light's shadow cube, written by the pass before the trace
 		// (Shaders::FogShadows) and read by volumetricFog.
 		layout(binding = 26, std430) buffer FogShadows { float fogShadow[]; };
+		// The level's glowing surfaces as lights, and the grid of which to
+		// sample where: see EmitterGrid.h and glowLight.
+		layout(binding = 27, std430) readonly buffer Emitters { uint emitterData[]; };
 		// DLSS Ray Reconstruction's own inputs, written in place of NRD's when
 		// asked for (Disable bit 256): the depth and the motion, each on its
 		// own. The rest share NRD's images, written differently for it.
@@ -140,11 +143,13 @@ static std::string TraceCommon()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
 		#define GlossBounces ((Counts.z >> 8u) & 255u)
+		// How much a glowing surface gives what it lights: GlowLighting.
+		#define GlowScale frameJitter.z
 		#define LightRadius float((Counts.z >> 16u) & 255u)
 		#define MipBias (float(int(Counts.z) >> 24) / 16.0)
 		// Whether the level's surfaces take their lights as the engine's
@@ -1482,6 +1487,209 @@ static std::string TraceCommon()
 	)";
 
 	source += R"(
+		// The level's glowing surfaces - signs, light panels, screens - as
+		// lights. A glowing surface has always lit what is around it, but
+		// only through the bounces that happened to reach it, so a small one
+		// lit a wall in sparse speckles that the denoiser smeared, and its
+		// colour came and went. Now every surface shaded also picks one of
+		// the glowing triangles near it and traces a shadow ray to a point on
+		// it, as it does for a light.
+		//
+		// Both ways count, each weighed by how likely it was to find the
+		// light that way against the other (the balance heuristic): a big
+		// panel close by is found well by a bounce, a small sign far off by
+		// sampling it. So nothing is counted twice, and what a glowing
+		// surface gives is what it gave before, with less noise. What it
+		// gives is scaled by GlowLighting either way.
+		struct Emitter
+		{
+			vec3 v0, e1, e2, normal;
+			float area;
+			uint triangle;
+			bool twoSided;
+		};
+
+		Emitter emitterAt(uint i)
+		{
+			uint b = emitterData[1] + i * 20u;
+			Emitter e;
+			e.twoSided = uintBitsToFloat(emitterData[b + 3u]) < 0.0;
+			e.normal = uintBitsToFloat(uvec3(emitterData[b + 4u], emitterData[b + 5u], emitterData[b + 6u]));
+			e.area = uintBitsToFloat(emitterData[b + 7u]);
+			e.v0 = uintBitsToFloat(uvec3(emitterData[b + 8u], emitterData[b + 9u], emitterData[b + 10u]));
+			e.e1 = uintBitsToFloat(uvec3(emitterData[b + 12u], emitterData[b + 13u], emitterData[b + 14u]));
+			e.triangle = emitterData[b + 15u];
+			e.e2 = uintBitsToFloat(uvec3(emitterData[b + 16u], emitterData[b + 17u], emitterData[b + 18u]));
+			return e;
+		}
+
+		// The list for a point's cell of the grid: where it starts, how long.
+		uvec2 emitterList(vec3 p)
+		{
+			if (emitterData[0] == 0u)
+				return uvec2(0u);
+			vec3 origin = uintBitsToFloat(uvec3(emitterData[2], emitterData[3], emitterData[4]));
+			float cellSize = uintBitsToFloat(emitterData[5]);
+			ivec3 dims = ivec3(emitterData[6], emitterData[7], emitterData[8]);
+			ivec3 c = ivec3(floor((p - origin) / cellSize));
+			if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, dims)))
+				return uvec2(0u);
+			uint cell = uint((c.z * dims.y + c.y) * dims.x + c.x);
+			return uvec2(emitterData[12u + cell * 2u], emitterData[13u + cell * 2u]);
+		}
+
+		// How much emitter i is likely to give a point facing n, to choose
+		// between them by: its power, the angles at both ends and the square
+		// law, all from its middle, the square law held back within its own
+		// size and neither angle let fall to nothing, since a big panel close
+		// by can light a point its middle hardly faces. None from behind a
+		// face that glows one way, nor to a point it lies wholly behind.
+		// Reads only the record's first eight words and one more.
+		float emitterWeight(uint i, vec3 p, vec3 n)
+		{
+			uint b = emitterData[1] + i * 20u;
+			vec4 middle = uintBitsToFloat(uvec4(emitterData[b], emitterData[b + 1u], emitterData[b + 2u], emitterData[b + 3u]));
+			vec4 face = uintBitsToFloat(uvec4(emitterData[b + 4u], emitterData[b + 5u], emitterData[b + 6u], emitterData[b + 7u]));
+			vec3 d = middle.xyz - p;
+			float side = -dot(face.xyz, d);
+			if (middle.w > 0.0 && side <= 0.0)
+				return 0.0;
+			float along = dot(n, d);
+			if (along <= -uintBitsToFloat(emitterData[b + 11u]))
+				return 0.0;
+			float d2 = dot(d, d);
+			float inv = inversesqrt(max(d2, 1.0e-6));
+			return abs(middle.w) * max(along * inv, 0.1) * max(abs(side) * inv, 0.1) / max(d2, face.w);
+		}
+
+		// What an emitter glows with at a point on it, linear: its texture
+		// read coarsely - where the triangle is four texels or so across - as
+		// the point stands for the light from the part of it around it. A
+		// masked texture's holes glow with nothing.
+		vec3 emitterRadiance(Emitter e, vec2 bary)
+		{
+			TriangleAttributes attr = tris[e.triangle];
+			int index = int(attr.UV2Tex.z);
+			if (index < 0 || uint(index) >= TextureCount)
+				return attr.Albedo.rgb;
+			vec2 uv = surfaceUV(attr, bary, vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0));
+			ivec2 size = textureSize(sceneTextures[nonuniformEXT(index)], 0);
+			vec2 a = attr.UV01.zw - attr.UV01.xy, b = attr.UV2Tex.xy - attr.UV01.xy;
+			float texels = abs(a.x * b.y - a.y * b.x) * 0.5 * float(size.x) * float(size.y);
+			vec4 t = textureLod(sceneTextures[nonuniformEXT(index)], uv, max(0.5 * log2(max(texels, 1.0)) - 2.0, 0.0));
+			return pow(max(t.rgb, vec3(0.0)), vec3(2.2)) * (attr.UV2Tex.w > 0.5 ? t.a : 1.0);
+		}
+
+		// What the last surface the path shaded sampled, for weighing a
+		// glowing surface the bounce from it then finds: the sum of the
+		// weights it chose from (none when it sampled nothing, or the path
+		// went on by a mirror or a glossy reflection), where it was, which
+		// way it faced, and the share of its bounces that go the matte way.
+		float glowWeights = 0.0;
+		vec3 glowFrom = vec3(0.0);
+		vec3 glowNormal = vec3(0.0, 0.0, 1.0);
+		float glowPdfScale = 1.0;
+
+		// The light a point facing n takes from one glowing triangle near it,
+		// chosen by weight and sampled at a point uniformly over its area,
+		// per unit of the point's colour, linear. pdfScale is the share of
+		// the point's bounces that go the matte way. Not sampled where what
+		// the glow would give, by the weights, is under a fiftieth of what
+		// the lights already give (lit, linear) or too faint to see: the
+		// bounces find it there as they always did, and the shadow ray is
+		// saved.
+		vec3 glowLight(vec3 p, vec3 n, float pdfScale, float lit)
+		{
+			glowWeights = 0.0;
+			if ((Disable & (512u | 262144u)) != 0u)
+				return vec3(0.0);
+			uvec2 list = emitterList(p);
+			float total = 0.0;
+			int chosen = -1;
+			float chosenWeight = 0.0;
+			for (uint k = 0u; k < list.y; k++)
+			{
+				uint i = emitterData[list.x + k];
+				float w = emitterWeight(i, p, n);
+				if (w <= 0.0)
+					continue;
+				total += w;
+				if (randomFloat() < w / total)
+				{
+					chosen = int(i);
+					chosenWeight = w;
+				}
+			}
+			if (total * GlowScale / 3.14159265 < max(0.002, 0.02 * lit))
+				return vec3(0.0);
+			glowWeights = total;
+			glowFrom = p;
+			glowNormal = n;
+			glowPdfScale = pdfScale;
+			if (chosen < 0)
+				return vec3(0.0);
+
+			Emitter e = emitterAt(uint(chosen));
+			float su = sqrt(randomFloat());
+			float r = randomFloat();
+			vec2 bary = vec2(su * (1.0 - r), su * r);
+			vec3 toPoint = e.v0 + e.e1 * bary.x + e.e2 * bary.y - p;
+			float dist2 = dot(toPoint, toPoint);
+			float dist = sqrt(dist2);
+			vec3 dir = toPoint / max(dist, 1.0e-4);
+			float cosX = dot(n, dir);
+			float area = e.area;
+			float cosE = -dot(e.normal, dir);
+			if (e.twoSided)
+				cosE = abs(cosE);
+			if (cosX <= 0.0 || cosE <= 1.0e-4 || area <= 0.0 || dist < 1.0)
+				return vec3(0.0);
+			vec3 glow = emitterRadiance(e, bary);
+			if (luminance(glow) <= 0.0)
+				return vec3(0.0);
+			if (occludedBy(p, dir, dist - 1.0, ShadowRays))
+				return vec3(0.0);
+			float pdfLight = (chosenWeight / total) * dist2 / (area * cosE);
+			float pdfBounce = pdfScale * cosX / 3.14159265;
+			return glow * (GlowScale * cosX / 3.14159265 / (pdfLight + pdfBounce));
+		}
+
+		// What a glowing surface a bounce has found gives, as a share of its
+		// glow: GlowLighting's, weighed against the chance the surface the
+		// bounce left would have sampled it (glowLight). Nothing from behind
+		// a surface that glows from one face only, as sampling it never
+		// takes. emitterNumber is Emission.z: its number plus one, or 0 for
+		// a glowing surface that is not sampled - a mesh's, glass - which
+		// the bounces alone find.
+		float glowFound(float emitterNumber, vec3 position, vec3 direction)
+		{
+			if (emitterNumber < 0.5)
+				return GlowScale;
+			uint index = uint(emitterNumber - 0.5);
+			Emitter e = emitterAt(index);
+			float facing = -dot(e.normal, direction);
+			if (!e.twoSided && facing <= 0.0)
+				return 0.0;
+			if (glowWeights <= 0.0)
+				return GlowScale;
+			uvec2 list = emitterList(glowFrom);
+			float w = 0.0;
+			for (uint k = 0u; k < list.y; k++)
+				if (emitterData[list.x + k] == index)
+				{
+					w = emitterWeight(index, glowFrom, glowNormal);
+					break;
+				}
+			if (w <= 0.0 || abs(facing) <= 1.0e-4)
+				return GlowScale;
+			vec3 toPoint = position - glowFrom;
+			float pdfLight = (w / glowWeights) * dot(toPoint, toPoint) / (e.area * abs(facing));
+			float pdfBounce = glowPdfScale * max(dot(glowNormal, direction), 0.0) / 3.14159265;
+			return GlowScale * pdfBounce / (pdfBounce + pdfLight);
+		}
+	)";
+
+	source += R"(
 		vec3 skyLight(vec3 dir)
 		{
 			// Standing in for the level's own sky, which is drawn through a
@@ -1731,6 +1939,7 @@ std::string Shaders::Trace()
 			float diffuseHitDistance = 0.0;
 			for (int lobePass = 0; lobePass < 2; lobePass++)
 			{
+				glowWeights = 0.0;
 				if (lobePass == 1)
 				{
 					if (!pendingSpecular && !pendingGloss)
@@ -1760,7 +1969,9 @@ std::string Shaders::Trace()
 				ivec2 passedLayers[8];
 				uint passedCount = 0u;
 				bool passingThrough = false;
+	)";
 
+	source += R"(
 				// A glossy reflection goes as far as its own budget allows:
 				// with one, what it shows is lit by the lights and the ambient
 				// but not by light bounced on from there.
@@ -1912,6 +2123,7 @@ std::string Shaders::Trace()
 						{
 							inSky = true;
 							primaryFogged = false;
+							glowWeights = 0.0;
 							origin = SkyOrigin.xyz;
 							rayMin = RayEpsilon;
 							// The eye is at the sky zone's viewpoint now, so the
@@ -1973,7 +2185,7 @@ std::string Shaders::Trace()
 							vec3 contribution;
 							if (sprite || attr.Emission.w > 0.5)
 							{
-								contribution = bounce > firstBounce && (Disable & 512u) != 0u ? vec3(0.0) : attr.Albedo.rgb * glow;
+								contribution = bounce > firstBounce ? ((Disable & 512u) != 0u ? vec3(0.0) : attr.Albedo.rgb * (glow * GlowScale)) : attr.Albedo.rgb * glow;
 							}
 							else
 							{
@@ -2121,6 +2333,7 @@ std::string Shaders::Trace()
 						origin = lifted + faceNormal * RayEpsilon;
 						rayMin = RayEpsilon;
 						direction = aboveFace(reflect(direction, normal), faceNormal);
+						glowWeights = 0.0;
 						continue;
 					}
 
@@ -2170,8 +2383,10 @@ std::string Shaders::Trace()
 						// denoiser's surface. PT NOGLOW (Disable bit 512) has
 						// it light nothing, to see what glowing surfaces add
 						// to a room.
+						// Found by a bounce, it is weighed against its chance
+						// of having been sampled as a light (glowFound).
 						if (!firstSurface && !(bounce > firstBounce && (Disable & 512u) != 0u))
-							radiance += throughput * attr.Albedo.rgb * glow;
+							radiance += throughput * attr.Albedo.rgb * (glow * (bounce > firstBounce ? glowFound(attr.Emission.z, position, direction) : 1.0));
 						break;
 					}
 					// Shaded as white on the denoiser's surface: its colour goes back
@@ -2213,6 +2428,25 @@ std::string Shaders::Trace()
 					vec3 f0, shineAlbedo, diffuseColour;
 					splitColour(material, attr.Albedo.rgb, max(dot(normal, toEye), 1.0e-4), f0, shineAlbedo, diffuseColour);
 					bool glossCapture = firstSurface && material.glossy;
+					// Which way the path goes on from here is chosen below, a
+					// glossy surface's in proportion to what each half
+					// reflects; the share going the matte way weighs what the
+					// glowing surfaces give (glowLight). The denoiser's surface
+					// always takes the matte half.
+					float pShine = 0.0;
+					if (!captured && material.glossy)
+					{
+						float shineWeight = luminance(shineAlbedo);
+						float matteWeight = luminance(diffuseColour);
+						pShine = matteWeight <= 0.0 ? 1.0 : clamp(shineWeight / max(shineWeight + matteWeight, 1.0e-4), 0.05, 0.95);
+					}
+					// Only on the first two surfaces a path meets: past them
+					// what a glowing surface gives is faint, and the bounces
+					// alone find it well enough.
+					if (!inSky && bounce <= firstBounce + 1u)
+						lit += glowLight(lifted, normal, 1.0 - pShine, luminance(lit));
+					else
+						glowWeights = 0.0;
 					vec3 shade = captured ? vec3(1.0) : diffuseColour;
 					radiance += throughput * shade * lit;
 					// Only the denoiser's own surface can be both captured and
@@ -2265,9 +2499,6 @@ std::string Shaders::Trace()
 					bool glossyBounce = false;
 					if (!captured && material.glossy)
 					{
-						float shineWeight = luminance(shineAlbedo);
-						float matteWeight = luminance(diffuseColour);
-						float pShine = matteWeight <= 0.0 ? 1.0 : clamp(shineWeight / max(shineWeight + matteWeight, 1.0e-4), 0.05, 0.95);
 						if (randomFloat() < pShine)
 						{
 							vec3 weight;
@@ -2277,6 +2508,7 @@ std::string Shaders::Trace()
 							throughput *= weight / pShine;
 							direction = L;
 							glossyBounce = true;
+							glowWeights = 0.0;
 						}
 						else
 						{

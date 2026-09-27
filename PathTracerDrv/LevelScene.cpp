@@ -196,6 +196,9 @@ void LevelScene::Clear()
 	LightmapMaskBytes.clear();
 	LightmappedModel = nullptr;
 	Lightmaps.clear();
+	Emitters.clear();
+	EmitterSources.clear();
+	EmitterTriangles.clear();
 }
 
 bool LevelScene::BuildStatic(ULevel* level)
@@ -234,6 +237,8 @@ bool LevelScene::BuildStatic(ULevel* level)
 	SceneGeometry& judged = Geometries[1];
 	opaque.HasMasked = false;
 	judged.HasMasked = true;
+	// Where each triangle ends up, for the glowing ones' records.
+	std::vector<uint32_t> placedIn(all.Attributes.size()), placedAt(all.Attributes.size());
 	for (size_t t = 0; t < all.Attributes.size(); t++)
 	{
 		// Masked, translucent and modulated need the shader; plain, mirrored
@@ -241,9 +246,20 @@ bool LevelScene::BuildStatic(ULevel* level)
 		const float kind = all.Attributes[t].UV2Tex.w;
 		const bool needsShader = kind == 1.0f || kind == 2.0f || kind == 4.0f;
 		SceneGeometry& to = needsShader ? judged : opaque;
+		placedIn[t] = needsShader ? 1u : 0u;
+		placedAt[t] = (uint32_t)to.Attributes.size();
 		to.Positions.insert(to.Positions.end(), all.Positions.begin() + t * 3, all.Positions.begin() + t * 3 + 3);
 		to.Attributes.push_back(all.Attributes[t]);
 	}
+	for (size_t k = 0; k < EmitterSources.size(); k++)
+	{
+		EmitterSources[k].Geometry = placedIn[EmitterTriangles[k]];
+		EmitterSources[k].Primitive = placedAt[EmitterTriangles[k]];
+	}
+	EmitterGrid::Build(EmitterSources, Emitters);
+	EmittersChanged = true;
+	if (!EmitterSources.empty())
+		debugf(TEXT("PathTracer: %d glowing triangles sampled as lights"), (int)EmitterSources.size());
 	// A geometry with nothing in it cannot have an acceleration structure, so
 	// a level with no such surfaces carries one placeholder triangle of no
 	// size, which nothing can hit.
@@ -534,6 +550,24 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		// own shadow masks on it (see Lightmaps).
 		if (model == LightmappedModel)
 			attr.Emission.z = (float)AddLightmap(model, node.iSurf);
+		const float lightmapRecord = attr.Emission.z;
+
+		// A glowing surface of the level's own is also sampled as a light, so
+		// what is around it takes its glow from a shadow ray at it rather
+		// than only from the bounces that happen to find it (EmitterGrid.h).
+		// Not glass or a decal laid over what is behind it, nor a mirror or a
+		// window onto the sky, nor anything in the skybox, which is another
+		// place entirely. Its brightness for choosing between emitters is its
+		// texture's average; what it gives is read off the texture.
+		const bool glows = unlit && model == LightmappedModel && surf.Texture &&
+			!(surf.PolyFlags & (PF_Translucent | PF_Modulated | PF_Mirrored | PF_FakeBackdrop)) &&
+			!(zone && zone->IsA(ASkyZoneInfo::StaticClass()));
+		float glowBrightness = 0.0f;
+		if (glows)
+		{
+			const vec3 c = AverageColour(surf.Texture, vec3(0.0f, 0.0f, 0.0f));
+			glowBrightness = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+		}
 
 		// A BSP surface has no stored texture coordinates: the engine derives
 		// them from two axis vectors and an origin point, which is what lets one
@@ -636,6 +670,26 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 				attr.UV2Tex.w = 5.0f;
 			if (textureIndex >= 0)
 				SetDetail(attr, surf.Texture);
+
+			// Its emitter's number plus one, where the triangle is one: only
+			// an unlit surface's, which has no lightmap for it to displace.
+			// Too faint - a sliver, or a dark texture - it is left to the
+			// bounces. Its edges run so they cross along the surface's face.
+			attr.Emission.z = lightmapRecord;
+			const float power = glowBrightness * 0.5f * length(cr);
+			if (glows && textureIndex >= 0 && power >= 4.0f)
+			{
+				EmitterSource e;
+				e.V0 = v0;
+				const bool flipped = dot(cr, normal) < 0.0f;
+				e.E1 = flipped ? e2 : e1;
+				e.E2 = flipped ? e1 : e2;
+				e.Power = power;
+				e.TwoSided = (surf.PolyFlags & PF_TwoSided) != 0;
+				EmitterSources.push_back(e);
+				EmitterTriangles.push_back((uint32_t)out.Attributes.size());
+				attr.Emission.z = (float)EmitterSources.size();
+			}
 
 			out.Positions.push_back(v0);
 			out.Positions.push_back(v1);

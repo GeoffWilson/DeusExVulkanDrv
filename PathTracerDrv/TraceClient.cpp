@@ -280,6 +280,21 @@ void TraceClient::Lightmaps(const std::vector<uint32_t>& words)
 		memcpy(p + sizeof(c), words.data(), words.size() * sizeof(uint32_t));
 }
 
+void TraceClient::Emitters(const std::vector<uint32_t>& words)
+{
+	using namespace TraceProtocol;
+	const uint32_t bytes = Rounded(sizeof(EmittersCommand) + words.size() * sizeof(uint32_t));
+	uint8_t* p = Reserve(bytes);
+	if (!p)
+		return;
+	EmittersCommand c = {};
+	c.H = { CmdEmitters, bytes };
+	c.Words = (uint32_t)words.size();
+	memcpy(p, &c, sizeof(c));
+	if (!words.empty())
+		memcpy(p + sizeof(c), words.data(), words.size() * sizeof(uint32_t));
+}
+
 void TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels, uint32_t format)
 {
 	using namespace TraceProtocol;
