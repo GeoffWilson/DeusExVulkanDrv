@@ -3468,4 +3468,90 @@ void UPathTracerRenderDevice::ClearZ(FSceneNode* Frame)
 void UPathTracerRenderDevice::PushHit(const BYTE* Data, INT Count) {}
 void UPathTracerRenderDevice::PopHit(INT Count, UBOOL bForce) {}
 void UPathTracerRenderDevice::GetStats(TCHAR* Result) { Result[0] = 0; }
-void UPathTracerRenderDevice::ReadPixels(FColor* Pixels) {}
+
+// The last frame shown, for the game's own copies of the screen: the save
+// menu's snapshot, which Extension's XRootWindow::GenerateSnapshot takes by
+// calling this from script between frames, and the menus' Snapshot
+// background. The output image keeps that frame - traced picture, 2D and
+// Brightness - until the next one is drawn over it. Returned as the other
+// devices here return it: the viewport's size, the top row first, and each
+// pixel's bytes blue, green, red, alpha. Left empty, every save went without
+// its picture.
+void UPathTracerRenderDevice::ReadPixels(FColor* Pixels)
+{
+	guard(UPathTracerRenderDevice::ReadPixels);
+
+	const int width = Viewport ? (int)Viewport->SizeX : 0;
+	const int height = Viewport ? (int)Viewport->SizeY : 0;
+	if (!Pixels || width <= 0 || height <= 0)
+		return;
+	const size_t bytes = (size_t)width * height * 4;
+	if (!Device || !OutputImage)
+	{
+		memset(Pixels, 0, bytes);
+		return;
+	}
+
+	// The engine's view, which with the UI pinned sits in the middle of a
+	// wider trace.
+	const int sourceX = Clamp(UiOffsetX, 0, TraceWidth - 1);
+	const int sourceWidth = Max(Min(width, TraceWidth - sourceX), 1);
+	const int sourceHeight = Max(Min(height, TraceHeight), 1);
+
+	auto target = ImageBuilder()
+		.Format(VK_FORMAT_B8G8R8A8_UNORM)
+		.Size(width, height)
+		.Usage(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+		.DebugName("PathTracerReadPixels")
+		.Create(Device.get());
+	auto staging = BufferBuilder()
+		.Size(bytes)
+		.Usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU)
+		.DebugName("PathTracerReadPixelsStaging")
+		.Create(Device.get());
+
+	VulkanImage* source = OutputImage.get();
+	VulkanImage* dest = target.get();
+	VulkanBuffer* download = staging.get();
+	ExecuteImmediate([&](VulkanCommandBuffer* cmd)
+	{
+		// After the last frame's blit to the window, which is on the same
+		// queue ahead of this.
+		PipelineBarrier()
+			.AddImage(source, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+			.AddImage(dest, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
+			.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+		VkImageBlit blit = {};
+		blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		blit.srcOffsets[0] = { sourceX, 0, 0 };
+		blit.srcOffsets[1] = { sourceX + sourceWidth, sourceHeight, 1 };
+		blit.dstSubresource = blit.srcSubresource;
+		blit.dstOffsets[1] = { width, height, 1 };
+		const bool sameSize = sourceWidth == width && sourceHeight == height;
+		cmd->blitImage(source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &blit, sameSize ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+
+		PipelineBarrier()
+			.AddImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+			.AddImage(dest, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+			.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+		VkBufferImageCopy region = {};
+		region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		region.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
+		cmd->copyImageToBuffer(dest->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, download->buffer, 1, &region);
+	});
+
+	// Opaque whatever the tiles left in the alpha.
+	const uint8_t* mapped = (const uint8_t*)staging->Map(0, bytes);
+	uint8_t* out = (uint8_t*)Pixels;
+	memcpy(out, mapped, bytes);
+	staging->Unmap();
+	for (size_t i = 3; i < bytes; i += 4)
+		out[i] = 255;
+
+	unguard;
+}
