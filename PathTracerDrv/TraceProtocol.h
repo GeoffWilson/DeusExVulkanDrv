@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 11;
+	static const uint32_t Version = 12;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -300,6 +300,11 @@ namespace TraceProtocol
 		vec4 Camera[4];
 		vec4 PreviousCamera[4];
 		vec4 SkyOrigin;
+		// The light augmentation as a flashlight, as the trace shader's
+		// flashlight[] has it: xyz where it shines from, w 1 while it is on;
+		// xyz which way, w its intensity; its colour, linear, w how much of
+		// it the air scatters back. All zero while it is off.
+		vec4 Flashlight[3];
 		TraceInset Insets[MaxInsets];
 	};
 

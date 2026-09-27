@@ -440,12 +440,13 @@ float LevelScene::BakedMaskAt(UModel* model, INT iSurf, AActor* light, const FVe
 // a link in an animation chain. A surface wearing one cannot reuse what was
 // accumulated for it on earlier frames.
 // An instance's Ambient.w: its magnitude one more than the actor's
-// ScaleGlow, which the engine scales a lit mesh's lighting by, and negative
-// when it moved or changed since the last frame, which throws away the
-// history of the pixels it covers.
-static float InstanceFlags(bool moved, float scaleGlow)
+// ScaleGlow, which the engine scales a lit mesh's lighting by, plus 32 when
+// the actor stands in a fog zone, which is where the engine lays volumetric
+// fog over what it draws; and negative when it moved or changed since the
+// last frame, which throws away the history of the pixels it covers.
+static float InstanceFlags(bool moved, float scaleGlow, AZoneInfo* zone = nullptr)
 {
-	const float magnitude = 1.0f + Clamp(scaleGlow, 0.0f, 16.0f);
+	const float magnitude = 1.0f + Clamp(scaleGlow, 0.0f, 16.0f) + ((zone && zone->bFogZone) ? 32.0f : 0.0f);
 	return moved ? -magnitude : magnitude;
 }
 
@@ -526,7 +527,9 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		// is what made unlit masked surfaces glow the key colour.
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
 		// w: the surface is special lit, and only special lights reach it.
-		attr.Ambient = vec4(ambient.x, ambient.y, ambient.z, (surf.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f);
+		// w: special lit, plus 2 in a fog zone, as for an instance's.
+		attr.Ambient = vec4(ambient.x, ambient.y, ambient.z,
+			((surf.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f) + ((zone && zone->bFogZone) ? 2.0f : 0.0f));
 		// z: which of the level's lightmaps the surface has, for the engine's
 		// own shadow masks on it (see Lightmaps).
 		if (model == LightmappedModel)
@@ -841,6 +844,73 @@ void LevelScene::AddLight(AActor* actor)
 	Lights.push_back(light);
 
 	unguardSlow;
+}
+
+// One of the light augmentation's lights: a Beam, which nothing but
+// AugLight spawns, while it shines, carried by the pawn it lights for.
+bool LevelScene::IsFlashlightBeam(AActor* actor)
+{
+	return actor->LightType != LT_None && actor->LightBrightness && actor->Owner && actor->Owner->IsA(APawn::StaticClass()) &&
+		!appStricmp(actor->GetClass()->GetName(), TEXT("Beam"));
+}
+
+// The light augmentation as a flashlight. The game gives it two lights, one
+// moved every tick to just short of wherever the view meets something and
+// one at the head (AugLight's SetBeamLocation and SetGlowLocation, in
+// DeusEx.u): a round patch of light wherever you look, its shadows falling
+// away from the patch rather than from you. In their place, a torch at the
+// eyes - a little to the left and up, as a lamp worn at the temple would be,
+// so that what it lights shows the edges of its shadows - aimed to cross the
+// line of sight 320 units out, so that its hotspot sits on the crosshair
+// across a room. Seen from behind, or through someone else's camera, it
+// shines from the pawn's eyes the way it is looking, a little in front of
+// its face so its own head is not in the way. Its colour is the game's own
+// for it, taken half way to white; its beam shows in the air ten times as
+// much in a fog zone as out of one. None when beam is null.
+void LevelScene::PlaceFlashlight(AActor* beam)
+{
+	for (vec4& v : Flashlight)
+		v = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+	if (!beam)
+		return;
+	APawn* pawn = (APawn*)beam->Owner;
+
+	const FVector pawnEye = pawn->Location + FVector(0.0f, 0.0f, pawn->BaseEyeHeight);
+	FVector eye, forward, right, up, lamp;
+	if (pawn == ViewActor && !ViewFromBehind && (ViewOrigin - pawnEye).SizeSquared() < 64.0f * 64.0f)
+	{
+		eye = ViewOrigin;
+		forward = ViewForward;
+		right = ViewRight;
+		up = -ViewDown;
+		lamp = eye - right * 6.0f + up * 2.0f;
+	}
+	else
+	{
+		const FCoords coords = GMath.UnitCoords / pawn->ViewRotation;
+		eye = pawnEye;
+		forward = coords.XAxis;
+		right = coords.YAxis;
+		up = coords.ZAxis;
+		lamp = eye + forward * 12.0f - right * 6.0f + up * 2.0f;
+	}
+	const FVector aim = (eye + forward * 320.0f - lamp).SafeNormal();
+
+	const FPlane c = FGetHSV(beam->LightHue, beam->LightSaturation, 255);
+	vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
+	const float lum = 0.2126f * colour.x + 0.7152f * colour.y + 0.0722f * colour.z;
+	if (lum <= 0.0f)
+		return;
+	colour = vec3(0.5f + 0.5f * colour.x / lum, 0.5f + 0.5f * colour.y / lum, 0.5f + 0.5f * colour.z / lum);
+
+	// Lit to a matte surface's own colour 256 units off, on the axis.
+	const float intensity = 81920.0f * FlashlightBrightness;
+	const bool fogZone = pawn->Region.Zone && pawn->Region.Zone->bFogZone;
+	const float haze = 5.0e-6f * FlashlightHaze * (fogZone ? 10.0f : 1.0f);
+
+	Flashlight[0] = vec4(lamp.X, lamp.Y, lamp.Z, 1.0f);
+	Flashlight[1] = vec4(aim.X, aim.Y, aim.Z, intensity);
+	Flashlight[2] = vec4(colour.x, colour.y, colour.z, haze);
 }
 
 // A brush's own polygons, which is what the engine treats as its geometry.
@@ -2073,7 +2143,7 @@ void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCo
 	}
 
 	instance.Mask = mask;
-	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved || isSprite, actor->ScaleGlow));
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved || isSprite, actor->ScaleGlow, actor->Region.Zone));
 	Instances.push_back(instance);
 	if (!iterated)
 		ActorInstances.push_back({ Instances.size() - 1, actor });
@@ -2218,6 +2288,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 		lapStart = now;
 	};
 
+	AActor* flashlightBeam = nullptr;
 	const INT actorCount = level->Actors.Num();
 	for (INT i = 0; i < actorCount; i++)
 	{
@@ -2225,6 +2296,16 @@ void LevelScene::CollectDynamic(ULevel* level)
 		if (!actor)
 			continue;
 		lapStart = appCycles();
+
+		// The light augmentation's lights, which the flashlight stands in
+		// for: see PlaceFlashlight. They are never drawn.
+		if (UseFlashlight && IsFlashlightBeam(actor))
+		{
+			if (!flashlightBeam || actor->Owner == ViewActor)
+				flashlightBeam = actor;
+			lap(0);
+			continue;
+		}
 
 		// Before the visibility rules: a light still lights the room when the
 		// actor carrying it is not drawn, which is exactly what the player's
@@ -2279,6 +2360,13 @@ void LevelScene::CollectDynamic(ULevel* level)
 	}
 
 	lapStart = appCycles();
+	PlaceFlashlight(flashlightBeam);
+	// The engine gathers volumetric lights only while the player stands in
+	// a fog zone (Render.dll, as it walks the level's leaves): anywhere
+	// else, none glows at all.
+	if (!ViewActor || !ViewActor->Region.Zone || !ViewActor->Region.Zone->bFogZone)
+		FogLights.clear();
+	lap(0);
 	UnshadowFittings();
 	lap(5);
 	CollectDecals(level);
@@ -2299,8 +2387,8 @@ void LevelScene::CollectDynamic(ULevel* level)
 	if (!SummaryLogged)
 	{
 		SummaryLogged = true;
-		debugf(TEXT("PathTracer placed: %d movers, %d meshes (%d animated), %d meshes skipped, %d hidden, %d held weapons"),
-			counts.Brushes, counts.Meshes, counts.Animated, counts.Skipped, hiddenCount, counts.Held);
+		debugf(TEXT("PathTracer placed: %d movers, %d meshes (%d animated), %d meshes skipped, %d hidden, %d held weapons, %d lights glowing in fog"),
+			counts.Brushes, counts.Meshes, counts.Animated, counts.Skipped, hiddenCount, counts.Held, (int)FogLights.size());
 	}
 
 	unguard;
@@ -2417,7 +2505,7 @@ void LevelScene::AddViewModel()
 	const vec3 ambient = item->bUnlit ? vec3(glow, glow, glow) : MeshAmbient(item, ViewActor->Region.Zone);
 	// Always counted as having moved: it rides the camera, and it bobs even
 	// when the camera does not.
-	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(true, item->ScaleGlow));
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(true, item->ScaleGlow, ViewActor->Region.Zone));
 	if (HaveViewModelTransform)
 	{
 		instance.HasPrevious = true;
@@ -2528,7 +2616,7 @@ bool LevelScene::PlaceHeldItem(APawn* pawn, uint32_t mask)
 	// weapon's light sink.
 	const float glow = UnlitMeshGlow(item);
 	const vec3 ambient = item->bUnlit ? vec3(glow, glow, glow) : MeshAmbient(item, pawn->Region.Zone);
-	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved, item->ScaleGlow));
+	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(moved, item->ScaleGlow, pawn->Region.Zone));
 	Instances.push_back(instance);
 	return true;
 

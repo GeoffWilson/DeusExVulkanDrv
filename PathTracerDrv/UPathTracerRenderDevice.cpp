@@ -320,6 +320,10 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseS3TC = 1;
 	Lighting = 1;
 	NeutralToneMap = 1;
+	UseFlashlight = 1;
+	FlashlightBrightness = 100;
+	FlashlightHaze = 0;
+	UseFogShadows = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -347,6 +351,10 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSSQuality"), RF_Public) UIntProperty(CPP_PROPERTY(DLSSQuality), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("Flashlight"), RF_Public) UBoolProperty(CPP_PROPERTY(UseFlashlight), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("FlashlightBrightness"), RF_Public) UIntProperty(CPP_PROPERTY(FlashlightBrightness), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("FlashlightHaze"), RF_Public) UIntProperty(CPP_PROPERTY(FlashlightHaze), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("FogShadows"), RF_Public) UBoolProperty(CPP_PROPERTY(UseFogShadows), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -365,6 +373,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	LightSizeNow = Clamp(LightSize, 0, 255);
 	EngineLightingNow = Lighting != 0;
 	NeutralToneMapNow = NeutralToneMap != 0;
+	DisableBits = (DisableBits & ~(65536u | 131072u)) | ConfiguredBits();
 
 	// Started afresh once per run: the engine can make a new device mid
 	// session, and what led up to that is the part worth keeping.
@@ -1289,6 +1298,8 @@ static const TCHAR* const BenchSteps[] = {
 	TEXT("meshes lit as flat surfaces"),
 	TEXT("hard shadows, from points"),
 	TEXT("glowing surfaces light nothing"),
+	TEXT("fog unshadowed"),
+	TEXT("the game's light augmentation"),
 	TEXT("one bounce"),
 	TEXT("no shadows"),
 	TEXT("as set, again"),
@@ -1343,8 +1354,12 @@ bool UPathTracerRenderDevice::ApplyBenchStep(int step)
 	case 6:  return setBit(1024u);
 	case 7:  if (LightSizeNow <= 0) return false; LightSizeNow = 0; return true;
 	case 8:  return setBit(512u);
-	case 9:  if (Bounces <= 1) return false; Bounces = 1; return true;
-	case 10: return setBit(2u);
+	// Any glow in the last couple of seconds: a strobe or a flickering fog
+	// light is out of the list on the frames it is dark.
+	case 9:  return FrameIndex - LastFogFrame < 120u && !(DisableBits & 32u) && setBit(65536u);
+	case 10: return Scene.Flashlight[0].w > 0.0f && setBit(131072u);
+	case 11: if (Bounces <= 1) return false; Bounces = 1; return true;
+	case 12: return setBit(2u);
 	default: return true;
 	}
 }
@@ -1470,10 +1485,15 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	Scene.LightScale = Max(LightScale, 1) / 100.0f;
 	Scene.ViewportTime = Viewport->CurrentTime;
 	Scene.HighlightSpecialLights = (DisableBits & 16u) != 0;
+	Scene.UseFlashlight = (DisableBits & 131072u) == 0;
+	Scene.FlashlightBrightness = Max(FlashlightBrightness, 0) / 100.0f;
+	Scene.FlashlightHaze = Max(FlashlightHaze, 0) / 100.0f;
 	// Gathering is CPU only, so it runs while the GPU is still presenting the
 	// last frame.
 	const double collectStart = NowMs();
 	Scene.CollectDynamic(level);
+	if (!Scene.FogLights.empty())
+		LastFogFrame = FrameIndex;
 	Timings.Collect += NowMs() - collectStart;
 	if (Bench.Measuring())
 		Bench.Collect += NowMs() - collectStart;
@@ -1941,7 +1961,17 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// accumulation is capped rather than trusted indefinitely.
 		const bool sceneChanged = Scene.Instances.size() != LastInstanceCount;
 		LastInstanceCount = Scene.Instances.size();
-		if (cameraMoved || sceneChanged)
+		// The flashlight lights what it shines on differently once it has
+		// moved or gone on or off, though the view may not have moved.
+		bool flashlightChanged = false;
+		for (int i = 0; i < 3; i++)
+		{
+			const vec4& a = Scene.Flashlight[i];
+			const vec4& b = LastFlashlight[i];
+			flashlightChanged = flashlightChanged || a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w;
+			LastFlashlight[i] = a;
+		}
+		if (cameraMoved || sceneChanged || flashlightChanged)
 			AccumulatedFrames = 0;
 		// Where the camera was, for the motion vectors: last frame's, or this
 		// one's on the first frame there is.
@@ -2010,6 +2040,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.PreviousCamera[2] = previousCamera.Up;
 				frame.PreviousCamera[3] = previousCamera.Forward;
 				frame.SkyOrigin = vec4(Scene.SkyOrigin.X, Scene.SkyOrigin.Y, Scene.SkyOrigin.Z, Scene.HasSky ? 1.0f : 0.0f);
+				for (int i = 0; i < 3; i++)
+					frame.Flashlight[i] = Scene.Flashlight[i];
 				// The windows' views, each averaging its samples while it and
 				// the scene hold still, as the player's does.
 				frame.InsetCount = (uint32_t)InsetViews.size();
@@ -2580,6 +2612,87 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			return 1;
 		}
 
+		// The lights that glow in fog, nearest first: where each is, how big
+		// its glow is, whether the eye can see it, and how much of its glow
+		// it can see itself - the level's own line checks out from it in 26
+		// directions to the edge of the glow - which is what the fog's
+		// shadows hold it to. A light buried in a wall or a ceiling sees
+		// none, and with FogShadows its glow is gone.
+		if (ParseCommand(&Cmd, TEXT("FOG")))
+		{
+			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
+			ULevel* level = player ? player->XLevel : nullptr;
+			if (!level)
+				return 1;
+			auto say = [&](const FString& line)
+			{
+				Ar.Logf(TEXT("%s"), *line);
+				debugf(TEXT("%s"), *line);
+			};
+			const FCoords view = GMath.UnitCoords / player->ViewRotation;
+			const FVector eye = player->Location + FVector(0.0f, 0.0f, player->EyeHeight);
+			std::vector<std::pair<float, AActor*>> found;
+			for (INT i = 0; i < level->Actors.Num(); i++)
+			{
+				AActor* a = level->Actors(i);
+				if (a && a->LightType != LT_None && a->VolumeRadius && a->VolumeBrightness)
+					found.push_back({ (a->Location - eye).Size(), a });
+			}
+			std::sort(found.begin(), found.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+			say(FString::Printf(TEXT("PT FOG: %d lights with a glow, nearest first; fog shadows %s"), (int)found.size(),
+				(DisableBits & 65536u) ? TEXT("off") : TEXT("on")));
+			// The engine's own conditions: the player in a fog zone, or no
+			// fog anywhere, and fog only over what is in one.
+			AZoneInfo* here = player->Region.Zone;
+			say(FString::Printf(TEXT("  you are in %s%s"), here ? here->GetName() : TEXT("no zone"),
+				(here && here->bFogZone) ? TEXT(", a fog zone") : TEXT(", not a fog zone: the engine draws no volumetric fog anywhere from here")));
+			{
+				FCheckResult look;
+				const FVector ahead = player->ViewRotation.Vector();
+				level->SingleLineCheck(look, player, eye + ahead * 8000.0f, eye, TRACE_VisBlocking);
+				if (look.Actor && level->Model)
+				{
+					AZoneInfo* there = level->Model->PointRegion(level->GetLevelInfo(), look.Location - ahead * 4.0f).Zone;
+					say(FString::Printf(TEXT("  under the crosshair, %.0f units off: %s%s"), (look.Location - eye).Size(),
+						there ? there->GetName() : TEXT("no zone"), (there && there->bFogZone) ? TEXT(", a fog zone") : TEXT(", not a fog zone: no fog over it")));
+				}
+			}
+			for (size_t n = 0; n < found.size() && n < 8; n++)
+			{
+				AActor* a = found[n].second;
+				const float radius = (a->VolumeRadius + 1) * 25.0f;
+				const FVector d = a->Location - eye;
+				FCheckResult hit;
+				level->SingleLineCheck(hit, player, a->Location, eye, TRACE_VisBlocking);
+				const bool seen = hit.Actor == nullptr;
+				int open = 0;
+				float reached = 0.0f, nearest = 1.0f;
+				for (int x = -1; x <= 1; x++)
+					for (int y = -1; y <= 1; y++)
+						for (int z = -1; z <= 1; z++)
+						{
+							if (!x && !y && !z)
+								continue;
+							const FVector dir = FVector((FLOAT)x, (FLOAT)y, (FLOAT)z).SafeNormal();
+							FCheckResult out;
+							level->SingleLineCheck(out, nullptr, a->Location + dir * radius, a->Location, TRACE_VisBlocking);
+							const float t = out.Actor ? out.Time : 1.0f;
+							open += t > 0.9f ? 1 : 0;
+							reached += t;
+							nearest = Min(nearest, t);
+						}
+				AZoneInfo* zone = a->Region.Zone;
+				say(FString::Printf(TEXT("  %s: %.0f %s, %.0f %s, %.0f %s; glow %.0f across (VolumeRadius %d, brightness %d, fog %d), light %d, type %d, effect %d; zone %s%s; %s from here; sees out %d of 26 ways, on average %.0f%% of the way, the nearest wall %.0f units off"),
+					a->GetName(), Abs(d | view.XAxis), (d | view.XAxis) >= 0 ? TEXT("ahead") : TEXT("behind"),
+					Abs(d | view.YAxis), (d | view.YAxis) >= 0 ? TEXT("right") : TEXT("left"),
+					Abs(d.Z), d.Z >= 0 ? TEXT("up") : TEXT("down"),
+					radius * 2.0f, (int)a->VolumeRadius, (int)a->VolumeBrightness, (int)a->VolumeFog, (int)a->LightBrightness,
+					(int)a->LightType, (int)a->LightEffect,
+					zone ? zone->GetName() : TEXT("none"), (zone && zone->bFogZone) ? TEXT(" (fog)") : TEXT(" (not fog, so no glow)"),
+					seen ? TEXT("seen") : TEXT("hidden"), open, reached / 26.0f * 100.0f, nearest * radius));
+			}
+			return 1;
+		}
 		if (ParseCommand(&Cmd, TEXT("LIGHTS")))
 		{
 			APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
@@ -2696,6 +2809,38 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				: TEXT("on, each baked light held to the lightmap's shadow mask as well as traced"));
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("FOGSHADOWS")))
+		{
+			DisableBits ^= 65536u;
+			Ar.Logf(TEXT("PT: fog %s"), (DisableBits & 65536u)
+				? TEXT("glowing through everything, as the engine draws it")
+				: TEXT("held to its lights' shadows"));
+			handled = true;
+		}
+		// The flashlight on or off, or with a number its brightness, in
+		// percent.
+		if (ParseCommand(&Cmd, TEXT("FLASHLIGHT")))
+		{
+			if (appIsDigit(*Cmd))
+			{
+				FlashlightBrightness = Max(appAtoi(Cmd), 0);
+				DisableBits &= ~131072u;
+			}
+			else
+				DisableBits ^= 131072u;
+			if (DisableBits & 131072u)
+				Ar.Logf(TEXT("PT: the light augmentation as the game lights it"));
+			else
+				Ar.Logf(TEXT("PT: the light augmentation as a flashlight, brightness %d%%, beam %d%%  (PT FLASHLIGHT n, PT BEAM n)"),
+					(int)FlashlightBrightness, (int)FlashlightHaze);
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("BEAM")))
+		{
+			FlashlightHaze = Max(appAtoi(Cmd), 0);
+			Ar.Logf(TEXT("PT: the flashlight's beam in the air at %d%%"), (int)FlashlightHaze);
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("MIPS")))
 		{
 			DisableBits ^= 4096u;
@@ -2783,7 +2928,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		}
 		if (ParseCommand(&Cmd, TEXT("RESET")))
 		{
-			DisableBits = 0;
+			DisableBits = ConfiguredBits();
 			ViewMode = 0;
 			handled = true;
 		}
@@ -2841,7 +2986,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

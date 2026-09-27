@@ -49,6 +49,8 @@ private:
 	void SetDetail(TriangleAttributes& attr, UTexture* texture);
 	void AddLight(AActor* actor);
 	void AddFogLight(AActor* actor, const FPlane& colour, float brightness);
+	static bool IsFlashlightBeam(AActor* actor);
+	void PlaceFlashlight(AActor* beam);
 
 	// A unit quad carrying one texture in one style, shared by every sprite
 	// showing it. Its size and facing come from the instance.
@@ -204,6 +206,14 @@ public:
 	// Diagnostic: paint animated and specially shaped lights in bright,
 	// obvious colours so they can be found.
 	bool HighlightSpecialLights = false;
+	// The light augmentation as a flashlight rather than its own two lights
+	// (PlaceFlashlight), its brightness and how much of its beam the air
+	// shows, 1 as designed. This frame's, as TraceCommand carries it, all
+	// zero while it is off.
+	bool UseFlashlight = true;
+	float FlashlightBrightness = 1.0f;
+	float FlashlightHaze = 1.0f;
+	vec4 Flashlight[3] = {};
 	bool StrobeOff = false;
 	FLOAT LastStrobeTime = -1.0f;
 

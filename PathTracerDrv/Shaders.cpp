@@ -27,7 +27,9 @@ static std::string ToneMapGlsl()
 	)";
 }
 
-std::string Shaders::Trace()
+// Everything the trace and the fog's shadow pass share: the bindings, the
+// push constants and the functions. Each adds its own main.
+static std::string TraceCommon()
 {
 	// MSVC caps a single string literal at 16384 bytes - clang-cl does not -
 	// and this shader is four times that, so the GLSL is carried in pieces and
@@ -111,9 +113,12 @@ std::string Shaders::Trace()
 		layout(binding = 21, rgba16f) uniform writeonly image2D glossImage;
 		layout(binding = 22, rgba16f) uniform writeonly image2D glossAlbedoImage;
 		// Last frame's camera, as the push constants carry it, this frame's
-		// fixed jitter in xy (see Disable bit 256), then each instance's last
-		// placement as three rows.
-		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 previousRows[]; };
+		// fixed jitter in xy (see Disable bit 256), the flashlight (see
+		// flashlightAt), then each instance's last placement as three rows.
+		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 previousRows[]; };
+		// Each fog light's shadow cube, written by the pass before the trace
+		// (Shaders::FogShadows) and read by volumetricFog.
+		layout(binding = 26, std430) buffer FogShadows { float fogShadow[]; };
 		// DLSS Ray Reconstruction's own inputs, written in place of NRD's when
 		// asked for (Disable bit 256): the depth and the motion, each on its
 		// own. The rest share NRD's images, written differently for it.
@@ -135,7 +140,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -162,6 +167,10 @@ std::string Shaders::Trace()
 		const uint BouncedRays = 0xFBu;
 		const uint ShadowRays = 0xE5u;
 		const uint WindowRays = 0x10u;
+		// The flashlight's shadows miss the player's body and the weapon in
+		// the player's hands, which it shines from among, but not a light
+		// fitting: there is no lamp of the flashlight's inside one (0xE9).
+		const uint FlashlightRays = 0xE9u;
 
 		// Does this point on the triangle actually exist? UE1 masked art keys
 		// transparency to palette index zero, which the upload turns into an
@@ -685,14 +694,16 @@ std::string Shaders::Trace()
 		// lights.
 		vec3 lightmapAmbient = vec3(0.0);
 
-		bool occluded(vec3 origin, vec3 dir, float dist)
+		// cullMask is which instances can be in the way: ShadowRays for the
+		// level's lights (occluded), FlashlightRays for the flashlight.
+		bool occludedBy(vec3 origin, vec3 dir, float dist, uint cullMask)
 		{
 			if ((Disable & 2u) != 0u)
 				return false;
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, topLevel,
 				gl_RayFlagsTerminateOnFirstHitEXT | ((Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : 0u),
-				ShadowRays, origin, RayEpsilon, dir, dist);
+				cullMask, origin, RayEpsilon, dir, dist);
 			// A hole in a grate lets light through, so a candidate only counts
 			// as occluding once its texel is known to be there.
 			// Light passes through glass and through the holes in a grate, so a
@@ -715,6 +726,11 @@ std::string Shaders::Trace()
 			if (blocker > 0 && instanceAmbient[blocker].w < 0.0)
 				shadowedByMover = true;
 			return true;
+		}
+
+		bool occluded(vec3 origin, vec3 dir, float dist)
+		{
+			return occludedBy(origin, dir, dist, ShadowRays);
 		}
 
 		// A value from 0 to 1 for each 32 unit cell of the level - about a
@@ -1293,6 +1309,179 @@ std::string Shaders::Trace()
 	)";
 
 	source += R"(
+		// The light augmentation as a torch rather than the two lights the
+		// game gives it - one where the view meets a wall, one at the head -
+		// which lit a round patch with shadows falling away from it rather
+		// than from the player (LevelScene's flashlight). flashlight[0] xyz
+		// is where it shines from, w 1 while it is on; [1] xyz which way, w
+		// its intensity; [2] rgb its colour, linear, w how much of its light
+		// the air scatters back, per unit of distance.
+		//
+		// A bright hotspot about 12 degrees across in a dimmer spill out to
+		// about 32, falling off with the square of the distance, softened
+		// within 128 units where a square law blinds, and shadowed from a
+		// lamp two units across. Linear light, added to what the level's
+		// lights give as the engine sums them: it is not one of the engine's.
+		const float FlashlightRange = 4096.0;
+		const float FlashlightNear2 = 128.0 * 128.0;
+		const float FlashlightSize = 2.0;
+
+		// How bright the beam is at an angle off its axis, by the cosine.
+		float flashlightCone(float c)
+		{
+			float spill = smoothstep(0.8480, 0.8829, c);   // 32 to 28 degrees
+			float hot = smoothstep(0.9613, 0.9945, c);     // 16 to 6 degrees
+			return spill * (0.15 + 0.85 * hot);
+		}
+
+		// The flashlight's light at a point on a surface facing normal,
+		// before anything gets in its way: per unit of the surface's colour,
+		// before the angle to the surface, and dir the way to the lamp.
+		// False where it gives nothing.
+		bool flashlightAt(vec3 position, vec3 normal, out vec3 base, out vec3 dir, out float dist)
+		{
+			base = vec3(0.0);
+			dir = normal;
+			dist = 0.0;
+			if (flashlight[0].w < 0.5)
+				return false;
+			vec3 toLight = flashlight[0].xyz - position;
+			dist = length(toLight);
+			if (dist < 0.5 || dist >= FlashlightRange)
+				return false;
+			dir = toLight / dist;
+			if (dot(normal, dir) <= 0.0)
+				return false;
+			float cone = flashlightCone(-dot(dir, flashlight[1].xyz));
+			if (cone <= 0.0)
+				return false;
+			float fade = 1.0 - smoothstep(0.75 * FlashlightRange, FlashlightRange, dist);
+			base = flashlight[2].rgb * (flashlight[1].w * cone * fade / (dist * dist + FlashlightNear2));
+			return true;
+		}
+
+		// Does the flashlight reach the point? One shadow ray to a random
+		// point on the lamp, as lightReaches does for the level's lights.
+		bool flashlightReaches(vec3 position, vec3 dir, float dist)
+		{
+			vec3 across = normalize(cross(dir, abs(dir.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
+			vec3 along = cross(dir, across);
+			float r = FlashlightSize * sqrt(randomFloat());
+			float a = 6.2831853 * randomFloat();
+			vec3 toTarget = dir * dist + (across * cos(a) + along * sin(a)) * r;
+			float d = length(toTarget);
+			return !occludedBy(position, toTarget / d, d - RayEpsilon * 2.0, FlashlightRays);
+		}
+
+		// The beam in the air between the eye and what it meets: the light
+		// the air scatters back along the way, the same in every direction,
+		// and unshadowed - from beside the lamp, whatever is in the beam's
+		// way hides its own shadow. Linear, added to the picture.
+		//
+		// Along the view, the square law is 1 / ((t - t0)^2 + a^2), where t0
+		// is how far along the view passes nearest the lamp and a is how
+		// near, softened as the light is: which integrates to an angle,
+		// atan((t - t0) / a) / a. So the steps are taken evenly in that angle
+		// rather than in distance (Kulla and Fajardo's equiangular sampling),
+		// which packs them in where the light is densest, and all that is
+		// left to average is the cone. It fades in from 16 to 48 units out
+		// from the lamp: every view passes within a few units of a lamp
+		// beside the eye, and the beam's first inches, crossing in front of
+		// the face, put a faint veil over everything. jitter is the pixel's
+		// offset into the steps, the same every frame, so the beam never
+		// shimmers.
+		vec3 flashlightBeam(vec3 origin, vec3 dir, float len, float jitter)
+		{
+			if (flashlight[0].w < 0.5 || flashlight[2].w <= 0.0)
+				return vec3(0.0);
+			float reach = min(len, FlashlightRange);
+			vec3 toLamp = flashlight[0].xyz - origin;
+			float t0 = dot(toLamp, dir);
+			float a = sqrt(max(dot(toLamp, toLamp) - t0 * t0, 0.0) + FlashlightNear2);
+			float first = atan(-t0 / a), last = atan((reach - t0) / a);
+			const int steps = 12;
+			float sum = 0.0;
+			for (int s = 0; s < steps; s++)
+			{
+				float t = t0 + a * tan(mix(first, last, (float(s) + jitter) / float(steps)));
+				vec3 fromLight = origin + dir * t - flashlight[0].xyz;
+				float ahead = dot(fromLight, flashlight[1].xyz);
+				sum += smoothstep(16.0, 48.0, ahead) * flashlightCone(ahead * inversesqrt(max(dot(fromLight, fromLight), 1.0e-4)));
+			}
+			return flashlight[2].rgb * (flashlight[1].w * flashlight[2].w * (last - first) / a * sum / float(steps));
+		}
+
+		// Fog lights' shadows. The engine's volumetric lighting integrates
+		// each fog light's sphere along the view whatever is in the way, so a
+		// lamp's halo glows on both sides of a pillar and through a wall. Here
+		// the air a fog light cannot see is not lit by it: shafts of its glow
+		// through a grate, the pillar's shadow in its halo.
+		//
+		// Each has a cube around it, FogShadowSize texels a face, of how far
+		// a ray from the light goes in each texel's direction before
+		// something stops it, traced afresh every frame by the pass before
+		// the trace (Shaders::FogShadows). The first MaxFogShadows fog lights
+		// have one; any more glow as the engine has them.
+		const uint FogShadowSize = 64u;
+		const uint MaxFogShadows = 128u;
+		const int FogSteps = 16;
+
+		// The face a direction from the light falls on, and where on it, -1
+		// to 1 each way; and the direction through a point on a face.
+		vec2 cubeCoords(vec3 d, out uint face)
+		{
+			vec3 a = abs(d);
+			if (a.x >= a.y && a.x >= a.z)
+			{
+				face = d.x > 0.0 ? 0u : 1u;
+				return d.yz / a.x;
+			}
+			if (a.y >= a.z)
+			{
+				face = d.y > 0.0 ? 2u : 3u;
+				return d.xz / a.y;
+			}
+			face = d.z > 0.0 ? 4u : 5u;
+			return d.xy / a.z;
+		}
+
+		vec3 cubeDirection(uint face, vec2 st)
+		{
+			float side = (face & 1u) == 0u ? 1.0 : -1.0;
+			if (face < 2u)
+				return vec3(side, st.x, st.y);
+			if (face < 4u)
+				return vec3(st.x, side, st.y);
+			return vec3(st.x, st.y, side);
+		}
+
+		// Whether a fog light sees a point in the air fromLight away from it:
+		// 1 in the clear, 0 in shadow. The four texels around the direction
+		// are each compared and the answers blended, and each comparison
+		// ramps over a few texels' width at that distance, so the edge of a
+		// shaft is soft rather than stepped.
+		float fogLightSees(uint fogIndex, vec3 fromLight)
+		{
+			float dist = length(fromLight);
+			uint face;
+			vec2 texel = (cubeCoords(fromLight, face) * 0.5 + 0.5) * float(FogShadowSize) - 0.5;
+			ivec2 t0 = ivec2(floor(texel));
+			vec2 f = texel - vec2(t0);
+			ivec2 t1 = clamp(t0 + 1, ivec2(0), ivec2(int(FogShadowSize) - 1));
+			t0 = clamp(t0, ivec2(0), ivec2(int(FogShadowSize) - 1));
+			uint base = (fogIndex * 6u + face) * FogShadowSize * FogShadowSize;
+			vec4 reach = vec4(
+				fogShadow[base + uint(t0.y) * FogShadowSize + uint(t0.x)],
+				fogShadow[base + uint(t0.y) * FogShadowSize + uint(t1.x)],
+				fogShadow[base + uint(t1.y) * FogShadowSize + uint(t0.x)],
+				fogShadow[base + uint(t1.y) * FogShadowSize + uint(t1.x)]);
+			float soft = dist * (3.0 / float(FogShadowSize)) + 2.0;
+			vec4 seen = clamp((reach - dist) / soft + 1.0, 0.0, 1.0);
+			return mix(mix(seen.x, seen.y, f.x), mix(seen.z, seen.w, f.x), f.y);
+		}
+	)";
+
+	source += R"(
 		vec3 skyLight(vec3 dir)
 		{
 			// Standing in for the level's own sky, which is drawn through a
@@ -1303,18 +1492,6 @@ std::string Shaders::Trace()
 			return mix(vec3(0.02, 0.02, 0.03), vec3(0.10, 0.12, 0.16), t) * Params.y;
 		}
 
-		// The engine's volumetric lighting: how much a fog light glows in the
-		// air between the eye and what the eye sees, and how much of that
-		// thing the glow hides. Render.dll's own Fog routine, per pixel rather
-		// than per fog map texel. Along the view ray, measured from the point
-		// nearest the light, the glow integrates 3(1 - r^2/R^2) over the part
-		// of the ray inside the light's sphere, scaled by the light's
-		// strength, clamped to one, then doubled. Each light blends over the
-		// ones before it, as the engine accumulates them.
-		// NRD's normal and roughness packing, its R10G10B10A2 variant: an
-		// octahedral normal in xy, and roughness in z with the sign of the
-		// normal's z folded into it. Written to a float image, which reads back
-		// the same.
 		// Where a point that was at "then" last frame and is at "now" this frame
 		// moved on screen, from here to there in screen widths and heights.
 		vec2 screenMotion(vec3 nowPosition, vec3 thenPosition)
@@ -1332,6 +1509,10 @@ std::string Shaders::Trace()
 			return (thenUv - nowUv) * 0.5;
 		}
 
+		// NRD's normal and roughness packing, its R10G10B10A2 variant: an
+		// octahedral normal in xy, and roughness in z with the sign of the
+		// normal's z folded into it. Written to a float image, which reads back
+		// the same.
 		vec4 packNormalRoughness(vec3 n, float roughness)
 		{
 			n /= abs(n.x) + abs(n.y) + abs(n.z);
@@ -1344,11 +1525,28 @@ std::string Shaders::Trace()
 			return vec4(r, 0.0);
 		}
 
-		vec4 volumetricFog(vec3 origin, vec3 dir, float len)
+		// The engine's volumetric lighting: how much a fog light glows in the
+		// air between the eye and what the eye sees, and how much of that
+		// thing the glow hides. Render.dll's own Fog routine, per pixel rather
+		// than per fog map texel. Along the view ray, measured from the point
+		// nearest the light, the glow integrates 3(1 - r^2/R^2) over the part
+		// of the ray inside the light's sphere, scaled by the light's
+		// strength, clamped to one, then doubled. Each light blends over the
+		// ones before it, as the engine accumulates them.
+		//
+		// Then held to the fog light's shadows (fogLightSees): the glow is
+		// taken at FogSteps points along the stretch inside the sphere, each
+		// weighed by how much the engine's curve puts there, and scaled by
+		// the share the light sees - after the clamp, so a shaft shows even
+		// where the engine's glow is saturated. jitter is the pixel's offset
+		// into the steps, as for flashlightBeam. Disable bit 65536 leaves the
+		// shadows out.
+		vec4 volumetricFog(vec3 origin, vec3 dir, float len, float jitter)
 		{
 			vec4 fog = vec4(0.0);
 			uint first = Counts.y;
 			uint count = lightGrid[7];
+			bool shadowed = (Disable & 65536u) == 0u;
 			for (uint i = 0u; i < count; i++)
 			{
 				SceneLight light = lights[first + i];
@@ -1376,6 +1574,19 @@ std::string Shaders::Trace()
 				glow = 2.0 * clamp(glow, 0.0, 1.0);
 				if (glow <= 0.0)
 					continue;
+				if (shadowed && i < MaxFogShadows)
+				{
+					float seen = 0.0, weight = 0.0;
+					for (int s = 0; s < FogSteps; s++)
+					{
+						float x = mix(l, u, (float(s) + jitter) / float(FogSteps));
+						float w = max(k - 3.0 * x * x, 0.0);
+						seen += w * fogLightSees(i, origin + dir * (along - x * radius) - light.PositionRadius.xyz);
+						weight += w;
+					}
+					if (weight > 0.0)
+						glow *= seen / weight;
+				}
 				float hides = min(glow * light.DirectionCone.x, 1.0);
 				fog.rgb = min(fog.rgb * (1.0 - hides) + glow * light.ColorBrightness.rgb, vec3(1.0));
 				fog.a = min(fog.a + hides, 1.0);
@@ -1384,6 +1595,12 @@ std::string Shaders::Trace()
 		}
 	)";
 
+	return source;
+}
+
+std::string Shaders::Trace()
+{
+	std::string source = TraceCommon();
 	source += R"(
 		void main()
 		{
@@ -1393,6 +1610,11 @@ std::string Shaders::Trace()
 				return;
 
 			rngState = pcgHash(uint(pixel.x) + uint(pixel.y) * 9781u + Counts.x * 26699u);
+			// The pixel's offset into the steps the fog and the flashlight's
+			// beam are marched in: interleaved gradient noise, fixed per
+			// pixel, so neighbours step differently but no pixel changes from
+			// one frame to the next. Neither passes through the history.
+			float dither = fract(52.9829189 * fract(dot(vec2(pixel), vec2(0.06711056, 0.00583715))));
 
 			// Jitter inside the pixel: this is the whole of the antialiasing,
 			// and it costs nothing because the samples are being averaged anyway.
@@ -1442,6 +1664,17 @@ std::string Shaders::Trace()
 			bool primaryMoverShadow = false;
 			bool inSky = false;
 			float primaryDistance = 100000.0;
+			// How far the view goes through the level's air before it meets
+			// something solid or goes out through a window onto the sky:
+			// what the fog and the flashlight's beam fill. Measured from the
+			// eye, where primaryDistance is from whatever glass the ray last
+			// passed and, beyond a sky window, a distance in the skybox.
+			float airDistance = 100000.0;
+			// Whether what the eye meets is in a fog zone: the engine lays
+			// volumetric fog only over a surface or an actor in one - a
+			// level surface's Ambient.w carries 2 more there, an instance's
+			// 32 - and never over the skybox.
+			bool primaryFogged = false;
 
 			// The first solid surface the eye meets, through any glass, decals
 			// and the like in front of it: what a denoiser works on. Its
@@ -1599,6 +1832,11 @@ std::string Shaders::Trace()
 
 					if (bounce == 0u)
 					{
+						if (!inSky)
+						{
+							airDistance = distance(CameraOrigin.xyz, origin + direction * t);
+							primaryFogged = attr.Ambient.w > 1.5 || abs(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w) > 32.0;
+						}
 						primaryDistance = t;
 						primaryPosition = origin + direction * t;
 						primaryInstance = float(rayQueryGetIntersectionInstanceIdEXT(rq, true));
@@ -1673,6 +1911,7 @@ std::string Shaders::Trace()
 						if (SkyOrigin.w > 0.5 && !inSky && (Disable & 4u) == 0u)
 						{
 							inSky = true;
+							primaryFogged = false;
 							origin = SkyOrigin.xyz;
 							rayMin = RayEpsilon;
 							// The eye is at the sky zone's viewpoint now, so the
@@ -1740,9 +1979,15 @@ std::string Shaders::Trace()
 							{
 								vec3 surroundings = linearAmbient(attr, rayQueryGetIntersectionInstanceIdEXT(rq, true));
 								vec3 unusedDirection, unusedBase;
-								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, -1.0, direction,
+								contribution = attr.Albedo.rgb * directLight(position, normal, mod(attr.Ambient.w, 2.0) > 0.5, true, -1.0, direction,
 									pow(surroundings, vec3(1.0 / 2.2)), 0u, uint(attr.Emission.z + 0.5), unusedDirection, unusedBase);
 								contribution += attr.Albedo.rgb * (EngineLighting ? lightmapAmbient : surroundings);
+								// The flashlight on it too, with no shadow ray,
+								// as for the lights.
+								vec3 flashBase, flashDir;
+								float flashDistance;
+								if (!inSky && flashlightAt(position, normal, flashBase, flashDir, flashDistance))
+									contribution += attr.Albedo.rgb * flashBase * dot(normal, flashDir);
 							}
 							radiance += throughput * contribution;
 						}
@@ -1934,21 +2179,31 @@ std::string Shaders::Trace()
 					// and divided by the colour it goes back on with.
 					vec3 lightDirection, lightBase;
 					// A mesh is lit as the engine lights one, at 1.4 times its
-					// ScaleGlow (the instance's w, 1 + ScaleGlow, signed by
-					// whether it moved), unless PT MESHLIGHT has it lit as a
-					// flat surface is (Disable bit 1024).
+					// ScaleGlow (the instance's w, 1 + ScaleGlow, 32 more in a
+					// fog zone, signed by whether it moved), unless PT
+					// MESHLIGHT has it lit as a flat surface is (Disable bit
+					// 1024).
 					int hitInstance = rayQueryGetIntersectionInstanceIdEXT(rq, true);
 					float meshGlow = -1.0;
 					if (attr.CornerNormals.w != 0u && (Disable & 1024u) == 0u)
 					{
-						float flags = abs(instanceAmbient[hitInstance].w);
+						float flags = mod(abs(instanceAmbient[hitInstance].w), 32.0);
 						meshGlow = 1.4 * (flags > 0.5 ? flags - 1.0 : 1.0);
 					}
 					vec3 ambient = linearAmbient(attr, hitInstance);
-					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, meshGlow, direction,
+					vec3 lit = directLight(lifted, normal, mod(attr.Ambient.w, 2.0) > 0.5, false, meshGlow, direction,
 						pow(ambient, vec3(1.0 / 2.2)), firstSurface ? 4u : 1u, uint(attr.Emission.z + 0.5), lightDirection, lightBase);
 					if (meshGlow >= 0.0)
 						lit = meshLight(lit, instanceAmbient[hitInstance].rgb);
+					// The flashlight, on meshes and flat surfaces alike by the
+					// cosine, and on top of what the engine's lights sum to.
+					// Not in the skybox, which is somewhere else entirely.
+					vec3 flashBase, flashDir;
+					float flashDistance;
+					bool flashLit = !inSky && flashlightAt(lifted, normal, flashBase, flashDir, flashDistance) &&
+						flashlightReaches(lifted, flashDir, flashDistance);
+					if (flashLit)
+						lit += flashBase * dot(normal, flashDir);
 
 					// What it is made of, only now the light loop is done with.
 					// A surface seen in a mirror is captured as matte, since its
@@ -1965,6 +2220,8 @@ std::string Shaders::Trace()
 					if (material.glossy)
 					{
 						vec3 shine = lightBase * glossyLight(material, f0, normal, toEye, lightDirection);
+						if (flashLit)
+							shine += flashBase * glossyLight(material, f0, normal, toEye, flashDir);
 						if (glossCapture)
 							reflectionEmission += shine / max(shineAlbedo, vec3(1.0e-4));
 						else
@@ -2107,6 +2364,18 @@ std::string Shaders::Trace()
 				surfacePosition = primaryPosition;
 				surfaceObject = primaryPosition;
 			}
+			// The flashlight's beam in the air in front of it all: on the
+			// picture, and with what NRD passes straight through. Ray
+			// Reconstruction is given the picture without it, and it is added
+			// to what comes back, as the fog is laid over it: it stays where
+			// the lamp is as the view turns, which the picture's history,
+			// following the surfaces, would drag after them.
+			vec3 beam = flashlightBeam(CameraOrigin.xyz, viewDirection, airDistance, dither);
+			if ((Disable & 256u) == 0u)
+			{
+				radiance += beam;
+				emissionPart += beam;
+			}
 
 			// Depth along the view, and where this point was on screen last
 			// frame: carried back by its instance's last placement, then seen
@@ -2184,7 +2453,10 @@ std::string Shaders::Trace()
 				imageStore(specularAlbedoImage, pixel, vec4(specularGuide, 1.0));
 				imageStore(rrDepthImage, pixel, vec4(viewZ));
 				imageStore(rrMotionImage, pixel, vec4(motion, 0.0, 0.0));
-				imageStore(fogImage, pixel, (Disable & 32u) == 0u ? volumetricFog(CameraOrigin.xyz, viewDirection, primaryDistance) : vec4(0.0));
+				imageStore(fogImage, pixel, (Disable & 32u) == 0u && primaryFogged ? volumetricFog(CameraOrigin.xyz, viewDirection, airDistance, dither) : vec4(0.0));
+				// In NRD's emission image, which nothing else writes with
+				// Ray Reconstruction.
+				imageStore(emissionImage, pixel, vec4(beam * Params.x, 1.0));
 				return;
 			}
 
@@ -2319,7 +2591,7 @@ std::string Shaders::Trace()
 			// light or eye at once.
 			if ((Disable & 32u) == 0u)
 			{
-				vec4 fog = volumetricFog(CameraOrigin.xyz, viewDirection, primaryDistance);
+				vec4 fog = primaryFogged ? volumetricFog(CameraOrigin.xyz, viewDirection, airDistance, dither) : vec4(0.0);
 				mapped = fog.rgb + mapped * (1.0 - fog.a);
 				if ((Disable & 64u) != 0u)
 					imageStore(fogImage, pixel, fog);
@@ -2336,6 +2608,57 @@ std::string Shaders::Trace()
 		}
 	)";
 
+	return source;
+}
+
+// The pass before the trace that gives each fog light its shadow cube (see
+// fogLightSees): for every texel of every face, how far a ray from the light
+// goes that way before something stops it, out to the glow's radius. What
+// stops a shadow ray stops it: glass and the holes in a grate let the glow
+// through. What lies within 8 units of the light does not: a light sunk a
+// little way into a wall or a ceiling would see nothing at all, and its glow
+// would go, where the engine's glows out regardless. Any further, and a
+// light just the other side of a wall would glow through it. It shares the trace's
+// bindings, push constants and pipeline layout. One invocation a texel: x and y across the face, z the face and
+// the light, six faces to a light.
+std::string Shaders::FogShadows()
+{
+	std::string source = TraceCommon();
+	source += R"(
+		void main()
+		{
+			uvec3 id = gl_GlobalInvocationID;
+			uint fogIndex = id.z / 6u;
+			uint face = id.z - fogIndex * 6u;
+			if (id.x >= FogShadowSize || id.y >= FogShadowSize || fogIndex >= min(lightGrid[7], MaxFogShadows))
+				return;
+			SceneLight light = lights[Counts.y + fogIndex];
+			vec2 st = (vec2(id.xy) + 0.5) / float(FogShadowSize) * 2.0 - 1.0;
+			vec3 dir = normalize(cubeDirection(face, st));
+			float radius = light.PositionRadius.w;
+			float start = min(8.0, 0.25 * radius);
+
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT,
+				ShadowRays, light.PositionRadius.xyz, start, dir, radius);
+			while (rayQueryProceedEXT(rq))
+			{
+				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+				{
+					if (confirmCandidate(
+							rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+							rayQueryGetIntersectionPrimitiveIndexEXT(rq, false),
+							rayQueryGetIntersectionBarycentricsEXT(rq, false),
+							true, dir, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
+						rayQueryConfirmIntersectionEXT(rq);
+				}
+			}
+			float reach = radius;
+			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+				reach = rayQueryGetIntersectionTEXT(rq, true);
+			fogShadow[(fogIndex * 6u + face) * FogShadowSize * FogShadowSize + id.y * FogShadowSize + id.x] = reach;
+		}
+	)";
 	return source;
 }
 
@@ -2382,7 +2705,14 @@ std::string Shaders::Composite()
 			vec3 mapped = toneMap(result * Finish.x, Finish.z > 0.5);
 			mapped = pow(mapped, vec3(1.0 / 2.2));
 
-			vec4 fog = imageLoad(fogImage, pixel);
+			// A tent over the pixel and its neighbours: the fog's shadows
+			// are marched in steps each pixel offsets differently (the
+			// trace's dither), which this smooths.
+			vec4 fog = vec4(0.0);
+			for (int y = -1; y <= 1; y++)
+				for (int x = -1; x <= 1; x++)
+					fog += imageLoad(fogImage, clamp(pixel + ivec2(x, y), ivec2(0), size - 1)) * float((2 - abs(x)) * (2 - abs(y)));
+			fog /= 16.0;
 			mapped = fog.rgb + mapped * (1.0 - fog.a);
 
 			mapped = Flash.yzw + mapped * Flash.x;
@@ -2394,8 +2724,8 @@ std::string Shaders::Composite()
 // After Ray Reconstruction, at the output's size: what it returns is the
 // picture, denoised and upscaled but still linear, so it is tonemapped the
 // way the trace tonemaps its own, and the fog and the screen flash go over
-// it. The fog was traced at the render size, and is smooth enough to be
-// filtered up to this one.
+// it, with the flashlight's beam added first. Both were traced at the render
+// size, and are smooth enough to be filtered up to this one.
 std::string Shaders::Finish()
 {
 	return R"(
@@ -2406,6 +2736,9 @@ std::string Shaders::Finish()
 		layout(binding = 0, rgba16f) uniform writeonly image2D outImage;
 		layout(binding = 1, rgba16f) uniform readonly image2D reconstructedImage;
 		layout(binding = 2) uniform sampler2D fogTexture;
+		// The flashlight's beam, at the exposure, traced at the render size
+		// as the fog is.
+		layout(binding = 3) uniform sampler2D beamTexture;
 
 		layout(push_constant) uniform PushConstants
 		{
@@ -2421,10 +2754,17 @@ std::string Shaders::Finish()
 			if (pixel.x >= size.x || pixel.y >= size.y)
 				return;
 
-			vec3 mapped = toneMap(imageLoad(reconstructedImage, pixel).rgb, Mode.x > 0.5);
+			vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
+			vec3 mapped = toneMap(imageLoad(reconstructedImage, pixel).rgb + texture(beamTexture, uv).rgb, Mode.x > 0.5);
 			mapped = pow(mapped, vec3(1.0 / 2.2));
 
-			vec4 fog = texture(fogTexture, (vec2(pixel) + vec2(0.5)) / vec2(size));
+			// Four filtered reads half a traced pixel apart, which make a
+			// tent over the traced pixels around this one: the fog's
+			// shadows are marched in steps each pixel offsets differently
+			// (the trace's dither), which this smooths.
+			vec2 d = 0.5 / vec2(textureSize(fogTexture, 0));
+			vec4 fog = 0.25 * (texture(fogTexture, uv + vec2(-d.x, -d.y)) + texture(fogTexture, uv + vec2(d.x, -d.y)) +
+				texture(fogTexture, uv + vec2(-d.x, d.y)) + texture(fogTexture, uv + vec2(d.x, d.y)));
 			mapped = fog.rgb + mapped * (1.0 - fog.a);
 
 			mapped = Flash.yzw + mapped * Flash.x;

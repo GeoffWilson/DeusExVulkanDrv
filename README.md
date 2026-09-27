@@ -121,6 +121,20 @@ brought back at all. `PathTracerEvents.log`, beside the game's log, records the
 window's focus and size changes, mode switches, swap chain rebuilds and any
 crash, flushed as they happen.
 
+### New since 1.2
+
+- **A real flashlight.** The light augmentation shone a round patch of light
+  wherever the view landed, its shadows falling away from the patch rather
+  than from you. It is now a torch worn at the temple: a bright hotspot in a
+  wider, dimmer spill, falling off with distance, with traced shadows and
+  bounced light (`Flashlight`, `PT FLASHLIGHT`), and optionally its beam in
+  the air (`FlashlightHaze`, `PT BEAM`).
+- **Shafts of light in fog.** The engine's volumetric fog lights glow through
+  everything, so a lamp's halo shows through a pillar and on both sides of a
+  wall. Their glow is now held to their shadows: it falls through grates and
+  fan blades in shafts, and a pillar casts a shadow through it
+  (`FogShadows`, `PT FOGSHADOWS`).
+
 ### New in 1.2
 
 - **The level lit as the engine lights it**: each light's falloff, its
@@ -275,7 +289,13 @@ source and was read by disassembly:
   none - but where they do, ambient-lit walls were twice as bright as the
   engine draws them;
 - special lighting, and volumetric fog lights in fog zones,
-  integrated per pixel along the view ray;
+  integrated per pixel along the view ray, and drawn where the engine draws
+  them: only while the player stands in a fog zone, and only over surfaces
+  and actors in one, never over the sky - and held to their shadows: each
+  fog light's glow is taken at points along the ray and scaled by the share
+  of them it can see, from a cube around the light of how far it sees each
+  way, traced every frame, so that walls, grates and fans cut shafts and
+  shadows through it where the engine's glows through them;
 - unlit meshes at the engine's own brightness, and the screen flash for damage
   and water;
 - lit meshes as the engine lights them, not as a flat surface is: by
@@ -468,6 +488,10 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	LightSize=4
 	MaxAnisotropy=16
 	UseS3TC=True
+	Flashlight=True
+	FlashlightBrightness=100
+	FlashlightHaze=0
+	FogShadows=True
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Lighting`: `Engine`, the default, lights the level's surfaces as the engine
@@ -548,6 +572,21 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   it shows by the lights and the zone's ambient; more carries the reflection on
   bouncing, at a cost; 0 traces none and keeps only the highlights.
   `PT GLOSSBOUNCES n` changes it for the session.
+- `Flashlight`: the light augmentation as a real torch rather than the patch
+  of light the game moves to wherever you look: shining from beside your eyes
+  with a hotspot about 12 degrees across in a spill out to about 32, falling
+  off with the square of the distance, with traced shadows and bounced light,
+  and its beam in the air. `FlashlightBrightness` is its brightness and
+  `FlashlightHaze` how much of its beam the air shows, both percentages. The
+  beam is off by default: seen from beside the lamp it lights the air in the
+  whole of the cone as a veil rather than showing as a beam. At 100 it is
+  faint in clear air and ten times as strong in a fog zone. Off, the augmentation lights as
+  the game has it. `PT FLASHLIGHT` switches it for the session,
+  `PT FLASHLIGHT n` sets the brightness and `PT BEAM n` the haze.
+- `FogShadows`: the glow of the engine's fog lights held to their shadows, so
+  it falls through grates in shafts and a pillar shadows it, rather than
+  glowing through everything as the engine draws it. `PT FOGSHADOWS` switches
+  it for the session.
 - `FPSLimit`: frames per second to hold the game to, 120 by default and 0 for
   no limit. Deus Ex cuts conversation audio short when left to run at a few
   hundred frames a second, the intro included. Unlike VulkanDrv's it does not wait
@@ -560,6 +599,11 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 
 - `PT LIGHTS`: the nearest lights that change or have an effect, with their type,
   effect and where they are relative to the view.
+- `PT FOG`: whether the player's zone and the surface under the crosshair
+  are fog zones, which the engine needs to draw any fog, then the nearest
+  lights that glow in fog: where each is, how big its glow is, its zone,
+  whether it can be seen from the eye, and how far it sees out itself along
+  26 directions - which is what `FogShadows` holds its glow to.
 - `PT HIGHLIGHT`: paints changing lights green, spotlights magenta and shaped
   lights cyan, at eight times their brightness.
 - `PT WEAPON`, `PT LOOK`: log how the held weapon, or the actor under the
@@ -606,6 +650,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT LIGHTSIZE n`: the size lights cast shadows from, as `LightSize`.
 - `PT PINNEDUI 16:9 | 4:3 | OFF`: the UI kept to a box of that shape in the
   middle of the screen, or across all of it. Any ratio or number works.
+- `PT FLASHLIGHT [n]`, `PT BEAM n`, `PT FOGSHADOWS`: the flashlight on or
+  off or at a brightness, its beam's haze, and the fog's shadows, as the
+  settings of the same names.
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).
@@ -613,8 +660,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT BENCH`: hold still for about half a minute while it switches the
   costlier features off one at a time - the engine's lighting, the baked
   shadow masks, mipmaps, anisotropic filtering, detail textures, the engine's
-  mesh lighting, soft shadows, glowing surfaces lighting the room, the extra
-  bounces, shadows - with the frame limit and VSync off, then logs a table to
+  mesh lighting, soft shadows, glowing surfaces lighting the room, the fog's
+  shadows, the flashlight (against the game's own light augmentation), the
+  extra bounces, shadows - with the frame limit and VSync off, then logs a table to
   `PathTracerTimings.log`: the GPU's time, the scene gathering and the frame
   with each, and how each compares with the settings as they are. `PT BENCH`
   again stops it.

@@ -181,8 +181,30 @@ public:
 	// bends only that towards white; off, Reinhard's, which compresses
 	// everything. PT TONEMAP switches it for the session.
 	BITFIELD NeutralToneMap;
+	// The light augmentation as a real flashlight: a torch at the eyes with
+	// a hotspot, a spill, the square law and traced shadows, and its beam in
+	// the air, in place of the patch of light the game moves to wherever the
+	// view lands (LevelScene::PlaceFlashlight). FlashlightBrightness and
+	// FlashlightHaze, how bright it is and how much of its beam the air
+	// shows, are percentages; the beam is off by default, since from beside
+	// the lamp it lights the air in the whole of the cone as a veil rather
+	// than showing as a beam. PT FLASHLIGHT switches it for the session, PT
+	// FLASHLIGHT n sets the brightness, PT BEAM n the haze.
+	BITFIELD UseFlashlight;
+	INT FlashlightBrightness;
+	INT FlashlightHaze;
+	// Fog lights' glow held to their shadows: shafts through a grate, a
+	// pillar's shadow in a lamp's halo, where the engine's glows through
+	// everything (volumetricFog in Shaders.cpp). PT FOGSHADOWS switches it
+	// for the session.
+	BITFIELD UseFogShadows;
 
 private:
+	// The switches in DisableBits the ini sets rather than PT alone: the
+	// fog's shadows (65536) and the flashlight (131072).
+	uint32_t ConfiguredBits() const { return (UseFogShadows ? 0u : 65536u) | (UseFlashlight ? 0u : 131072u); }
+	// The flashlight as last traced, to notice it moving or going out.
+	vec4 LastFlashlight[3] = {};
 	FString DescribeDenoiser() const;
 	void CreateSwapChainResources();
 	void ReleaseSwapChainResources();
@@ -418,6 +440,8 @@ private:
 	std::vector<float> FrameIntervals;
 	double LastUnlockMs = 0.0;
 	uint32_t FrameIndex = 0;
+	// The last frame a light glowed in fog, for PT BENCH's fog row.
+	uint32_t LastFogFrame = 0x80000000u;
 
 	bool HaveCamera = false;
 	UBOOL UsingVsync = 0;

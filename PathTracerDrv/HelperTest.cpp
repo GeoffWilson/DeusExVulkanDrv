@@ -9,6 +9,7 @@
 //
 //   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still]
 //                            [--lightsize radius] [--reference] [--backlight]
+//                            [--fog] [--flashlight] [--dark]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -25,6 +26,14 @@
 // trace converges on - the picture a denoiser is trying to reach.
 // --backlight puts the light behind the red box, so its shadow falls towards
 // the camera, from where the box stands to well beyond it.
+//
+// --fog adds a fog light to the left of the box, whose glow the box should
+// cut a shadow through towards the right; --fog-unshadowed the same glow as
+// the engine draws it, through the box (PT FOGSHADOWS). --flashlight
+// shines the light augmentation's torch from beside the eye at the box, its
+// beam in the air as in a fog zone - eight times as bright as the player's,
+// the camera being so far off - and --dark turns the scene's light down to a
+// fiftieth and the sky off to show it.
 //
 // Frames are taken the way the render device takes them: the next is asked
 // for before the last is waited for, so the helper records one while the GPU
@@ -133,6 +142,7 @@ int main(int argc, char** argv)
 	uint32_t engineLighting = 0;
 	bool bakedMask = false;
 	bool inset = false;
+	bool fog = false, flashlight = false, dark = false, fogUnshadowed = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -155,6 +165,14 @@ int main(int argc, char** argv)
 			bakedMask = true;
 		else if (!strcmp(argv[i], "--inset"))
 			inset = true;
+		else if (!strcmp(argv[i], "--fog"))
+			fog = true;
+		else if (!strcmp(argv[i], "--fog-unshadowed"))
+			fog = fogUnshadowed = true;
+		else if (!strcmp(argv[i], "--flashlight"))
+			flashlight = true;
+		else if (!strcmp(argv[i], "--dark"))
+			dark = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -192,6 +210,17 @@ int main(int argc, char** argv)
 		AddQuad(world, vec3(-600, -600, 0), vec3(600, -600, 0), vec3(600, 600, 0), vec3(-600, 600, 0), vec3(0.8f, 0.8f, 0.8f), 0, 8);
 		AddBox(world, vec3(-80, -80, 0), vec3(80, 80, 160), vec3(0.8f, 0.15f, 0.1f), true);
 		AddQuad(world, vec3(-600, 400, 0), vec3(600, 400, 0), vec3(600, 400, 600), vec3(-600, 400, 600), vec3(0.6f, 0.6f, 0.6f), -1, 1);
+		// With --fog, a row of posts between the fog light and the box, for
+		// the glow to fall through in shafts.
+		// The floor, the wall and the posts are then in a fog zone, where the
+		// engine lays fog over what it draws (Ambient.w's 2).
+		if (fog)
+		{
+			for (int k = 0; k < 7; k++)
+				AddBox(world, vec3(-170, -260.0f + k * 80.0f, 0), vec3(-155, -245.0f + k * 80.0f, 320), vec3(0.5f, 0.5f, 0.5f));
+			for (TriangleAttributes& attr : world.Attributes)
+				attr.Ambient.w += 2.0f;
+		}
 		std::vector<uint32_t> checker(64 * 64);
 		for (int y = 0; y < 64; y++)
 			for (int x = 0; x < 64; x++)
@@ -286,7 +315,22 @@ int main(int argc, char** argv)
 		light.ColorBrightness = vec4(1.0f, 0.9f, 0.8f, 2.5f);
 		light.DirectionCone = vec4(0, 0, 0, -1);
 		light.Flags = vec4(0, 0, 0, -1);
+		if (dark)
+			light.ColorBrightness.w *= 0.02f;
 		std::vector<SceneLight> lights = { light };
+
+		// A fog light's glow, as AddFogLight describes one: its colour in
+		// display terms, its strength in w, hiding nothing behind it.
+		std::vector<SceneLight> fogLights;
+		if (fog)
+		{
+			SceneLight glow = {};
+			glow.PositionRadius = vec4(-260, 0, 120, 560);
+			glow.ColorBrightness = vec4(0.7f, 0.75f, 0.9f, 0.06f);
+			glow.DirectionCone = vec4(0, 0, 0, 0);
+			glow.Flags = vec4(0, 0, 0, -1);
+			fogLights.push_back(glow);
+		}
 
 		// --baked-mask: the light baked into the floor's lightmap, as the
 		// engine's lights are into a level's, with a shadow mask that has it
@@ -391,15 +435,26 @@ int main(int argc, char** argv)
 		frame.Lighting = engineLighting;
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
+		frame.DisableBits = fogUnshadowed ? 65536u : 0u;
 		frame.Timing = 1;
 		frame.Exposure = 0.2f + 128 * (2.0f / 255.0f);
-		frame.SkyIntensity = 128 * (2.0f / 255.0f);
+		frame.SkyIntensity = dark ? 0.0f : 128 * (2.0f / 255.0f);
 		frame.Camera[0] = vec4(eye.x, eye.y, eye.z, 1.0f);     // w: the flash's scale, neutral
 		frame.Camera[1] = vec4(right.x * halfWidth, right.y * halfWidth, right.z * halfWidth, 0.0f);
 		frame.Camera[2] = vec4(down.x * halfWidth * aspect, down.y * halfWidth * aspect, down.z * halfWidth * aspect, 0.0f);
 		frame.Camera[3] = vec4(forward.x, forward.y, forward.z, 0.0f);
 		for (int i = 0; i < 4; i++)
 			frame.PreviousCamera[i] = frame.Camera[i];
+		// The torch as LevelScene places the player's: beside the eye, to
+		// the left and up, aimed at the box.
+		if (flashlight)
+		{
+			const vec3 lamp(eye.x - right.x * 6.0f, eye.y - right.y * 6.0f, eye.z - right.z * 6.0f + 2.0f);
+			const vec3 aim = Normalized(vec3(target.x - lamp.x, target.y - lamp.y, target.z - lamp.z));
+			frame.Flashlight[0] = vec4(lamp.x, lamp.y, lamp.z, 1.0f);
+			frame.Flashlight[1] = vec4(aim.x, aim.y, aim.z, 8.0f * 81920.0f);
+			frame.Flashlight[2] = vec4(1.0f, 0.93f, 0.8f, 5.0e-5f);
+		}
 		// --inset: a second view, as a security camera's in a window of the
 		// HUD's, from the right of the box and above, in the picture's top
 		// right third.
@@ -455,7 +510,7 @@ int main(int argc, char** argv)
 				instances.back().GeometryIndex = 3;
 			}
 			client.Instances(instances, 1);
-			client.Lights(lights, {});
+			client.Lights(lights, fogLights);
 			frame.Frame = (uint32_t)i;
 			if (!still && i == frames / 2)
 			{

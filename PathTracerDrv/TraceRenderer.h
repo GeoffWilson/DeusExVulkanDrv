@@ -113,7 +113,8 @@ private:
 	void UpdateDescriptors();
 	void WriteCompositeDescriptors();
 	void WriteFinishDescriptors();
-	void WriteMotion(const vec4 (&previousCamera)[4], vec2 jitter, FrameUploads& uploads);
+	void WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 jitter, FrameUploads& uploads);
+	void EnsureFogShadows(uint32_t count, FrameUploads& uploads);
 	void RecordTexturePixels(VulkanCommandBuffer* commands, FrameUploads& uploads);
 	void BindWhite(uint32_t index);
 	void RecordInsets(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame);
@@ -144,6 +145,8 @@ private:
 	std::unique_ptr<VulkanPipelineLayout> PipelineLayout;
 	std::unique_ptr<VulkanShader> TraceShader;
 	std::unique_ptr<VulkanPipeline> TracePipeline;
+	std::unique_ptr<VulkanShader> FogShadowShader;
+	std::unique_ptr<VulkanPipeline> FogShadowPipeline;
 	bool DescriptorsDirty = true;
 
 	std::unique_ptr<VulkanImage> AccumImage;
@@ -218,6 +221,13 @@ private:
 	// vectors. Rewritten every frame.
 	std::unique_ptr<VulkanBuffer> MotionBuffer;
 	size_t MotionCapacity = 0;
+
+	// Each fog light's shadow cube, in floats: see Shaders::FogShadows. The
+	// size and the most lights given one are the shader's own.
+	static const uint32_t FogShadowSize = 64;
+	static const size_t MaxFogShadows = 128;
+	std::unique_ptr<VulkanBuffer> FogShadowBuffer;
+	size_t FogShadowCapacity = 0;
 
 	// The texture array: an image per slot the device has sent, the rest a 1x1
 	// white image so every descriptor is valid whether or not it is read.

@@ -99,6 +99,7 @@ void TraceRenderer::CreateTracePipeline()
 		.AddBinding(23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device);
 
@@ -113,7 +114,7 @@ void TraceRenderer::CreateTracePipeline()
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 + GuideImageCount + 3 * viewSets)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxTextures)
 		.MaxSets(1 + viewSets)
 		.DebugName("PathTracerDescriptorPool")
@@ -151,6 +152,19 @@ void TraceRenderer::CreateTracePipeline()
 		.ComputeShader(TraceShader.get())
 		.DebugName("PathTracerTracePipeline")
 		.Create(Device);
+
+	// The fog lights' shadow cubes, with the trace's own bindings.
+	FogShadowShader = ShaderBuilder()
+		.Type(ShaderType::Compute)
+		.AddSource("shaders/FogShadows.comp", Shaders::FogShadows())
+		.DebugName("PathTracerFogShadows")
+		.Create("PathTracerFogShadows", Device);
+
+	FogShadowPipeline = ComputePipelineBuilder()
+		.Layout(PipelineLayout.get())
+		.ComputeShader(FogShadowShader.get())
+		.DebugName("PathTracerFogShadowPipeline")
+		.Create(Device);
 }
 
 // The pass after Ray Reconstruction: its output tonemapped, with the fog and
@@ -161,12 +175,13 @@ void TraceRenderer::CreateFinishPipeline()
 		.AddBinding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerFinishSetLayout")
 		.Create(Device);
 
 	FinishPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2)
 		.MaxSets(1)
 		.DebugName("PathTracerFinishPool")
 		.Create(Device);
@@ -640,12 +655,14 @@ void TraceRenderer::WriteFinishDescriptors()
 		.AddStorageImage(FinishSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(FinishSet.get(), 1, RrOutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddCombinedImageSampler(FinishSet.get(), 2, GuideViews[7].get(), FogSampler.get(), VK_IMAGE_LAYOUT_GENERAL)
+		// The flashlight's beam, in the emission image NRD would use.
+		.AddCombinedImageSampler(FinishSet.get(), 3, GuideViews[4].get(), FogSampler.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.Execute(Device);
 }
 
 void TraceRenderer::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !Accel->GetLightmapBuffer() || !MotionBuffer)
+	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !Accel->GetLightmapBuffer() || !MotionBuffer || !FogShadowBuffer)
 		return;
 	Context->WaitForGpu();
 
@@ -653,6 +670,7 @@ void TraceRenderer::UpdateDescriptors()
 	for (int i = 0; i < GuideImageCount; i++)
 		writes.AddStorageImage(DescriptorSet.get(), GuideBinding(i), GuideViews[i].get(), VK_IMAGE_LAYOUT_GENERAL);
 	writes.AddBuffer(DescriptorSet.get(), 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MotionBuffer.get());
+	writes.AddBuffer(DescriptorSet.get(), 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, FogShadowBuffer.get());
 	writes
 		.AddAccelerationStructure(DescriptorSet.get(), 0, Accel->GetTopLevel())
 		.AddStorageImage(ViewSet.get(), 0, AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
@@ -674,14 +692,14 @@ void TraceRenderer::UpdateDescriptors()
 	DescriptorsDirty = false;
 }
 
-// Last frame's camera, this frame's jitter for Ray Reconstruction, then each
-// instance's last placement as three rows, in the order the top level
-// structure numbers them. An instance with no last placement - new this
-// frame, or one that never moves - is given its current one, which reads as
-// not having moved.
-void TraceRenderer::WriteMotion(const vec4 (&previousCamera)[4], vec2 jitter, FrameUploads& uploads)
+// Last frame's camera, this frame's jitter for Ray Reconstruction, the
+// flashlight, then each instance's last placement as three rows, in the
+// order the top level structure numbers them. An instance with no last
+// placement - new this frame, or one that never moves - is given its current
+// one, which reads as not having moved.
+void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 jitter, FrameUploads& uploads)
 {
-	const size_t header = 5;
+	const size_t header = 8;
 	const size_t count = Scene.Instances.size();
 	const size_t wanted = header + std::max<size_t>(count, 1) * 3;
 	if (!MotionBuffer || wanted > MotionCapacity)
@@ -699,8 +717,10 @@ void TraceRenderer::WriteMotion(const vec4 (&previousCamera)[4], vec2 jitter, Fr
 
 	auto* mapped = (vec4*)uploads.Write(MotionBuffer.get(), 0, wanted * sizeof(vec4));
 	for (int i = 0; i < 4; i++)
-		mapped[i] = previousCamera[i];
+		mapped[i] = frame.PreviousCamera[i];
 	mapped[4] = vec4(jitter.x, jitter.y, 0.0f, 0.0f);
+	for (int i = 0; i < 3; i++)
+		mapped[5 + i] = frame.Flashlight[i];
 	for (size_t i = 0; i < count; i++)
 	{
 		const SceneInstance& instance = Scene.Instances[i];
@@ -712,6 +732,24 @@ void TraceRenderer::WriteMotion(const vec4 (&previousCamera)[4], vec2 jitter, Fr
 	if (count == 0)
 		for (int r = 0; r < 3; r++)
 			mapped[header + r] = vec4(0.0f);
+}
+
+// The fog lights' shadow cubes, FogShadowSize squared floats a face, six
+// faces a light: grown as a level asks for more, never shrunk. The shader
+// binding needs a buffer even with no fog, so there is always room for one.
+void TraceRenderer::EnsureFogShadows(uint32_t count, FrameUploads& uploads)
+{
+	const size_t wanted = (size_t)std::max<uint32_t>(count, 1u) * 6 * FogShadowSize * FogShadowSize;
+	if (FogShadowBuffer && wanted <= FogShadowCapacity)
+		return;
+	FogShadowCapacity = wanted;
+	uploads.Retire(std::move(FogShadowBuffer));
+	FogShadowBuffer = BufferBuilder()
+		.Size(FogShadowCapacity * sizeof(float))
+		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY)
+		.DebugName("PathTracerFogShadows")
+		.Create(Device);
+	DescriptorsDirty = true;
 }
 
 bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, int slot)
@@ -784,7 +822,12 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	lap(1);
 	RecordStageMs[1] -= Accel->LightsMs - lightsBefore;
 	RecordStageMs[2] += Accel->LightsMs - lightsBefore;
-	WriteMotion(frame.PreviousCamera, jitter, uploads);
+	WriteMotion(frame, jitter, uploads);
+	// Room for a shadow cube for each fog light, when the fog is drawn
+	// with its shadows.
+	const uint32_t fogShadows = ((frame.DisableBits & (32u | 65536u)) == 0u)
+		? (uint32_t)std::min<size_t>(Scene.FogLights.size(), MaxFogShadows) : 0u;
+	EnsureFogShadows(fogShadows, uploads);
 	lap(3);
 	if (Accel->AttributesChanged())
 	{
@@ -869,10 +912,24 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		frame.Lighting ? 1.0f : 0.0f,
 		(float)(frame.ViewMode ? frame.ViewMode : frame.DebugMode));
 
-	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
 	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet.get());
 	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, ViewSet.get());
 	commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
+
+	// The fog lights' shadow cubes, every frame, since anything that moves
+	// can cast a shadow through the glow: a texel a thread, six faces a
+	// light. The trace, the views in the HUD's windows among it, reads them.
+	if (fogShadows > 0)
+	{
+		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, FogShadowPipeline.get());
+		commands->dispatch(FogShadowSize / 8, FogShadowSize / 8, fogShadows * 6);
+		VkMemoryBarrier written = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+		written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		written.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &written, 0, nullptr, 0, nullptr);
+	}
+
+	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
 	commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
 	stamp(2);
 	lap(7);

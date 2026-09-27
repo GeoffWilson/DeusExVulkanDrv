@@ -8,6 +8,9 @@ namespace Shaders
 	// driver is a single DLL, the same way VulkanDrv carries its shaders.
 	std::string Trace();
 
+	// Each fog light's shadow cube, traced before the trace reads it.
+	std::string FogShadows();
+
 	// The picture put back together from the denoised lighting: see Denoiser.
 	std::string Composite();
 
