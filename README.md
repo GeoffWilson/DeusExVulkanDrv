@@ -84,6 +84,30 @@ still, with the default settings, under Proton. The frame limiter holds it to
 takes out of it, and `LogTimings` says where a frame's time goes, the GPU's
 side included, and what frame rate that came to.
 
+**Native Windows costs nothing**, which was not a foregone conclusion given the
+tracing happens in another process there as it does under Proton. The same
+machine and the same settings, standing where the Proton runs stood, from the
+save they were taken on:
+
+| `PT BENCH`, Hong Kong market, 1920x1440 | Proton | Windows |
+| --------------------------------------- | ------ | ------- |
+| DLSS Ray Reconstruction at Quality       | about 160 fps | 171.7 fps |
+| GPU a frame, DLSS                        | 5.8 ms | 5.79 ms |
+| NRD                                      | about 95 fps | 96.5 fps |
+| GPU a frame, NRD                         | 10.5 ms | 10.33 ms |
+| Reading the scene out of the engine (CPU)| 2.2 ms | 2.12 ms |
+| One bounce rather than three             | 3.3 ms less GPU | 3.24 ms less |
+
+Every line agrees within the drift between two runs of the same bench, so the
+handoff to the helper costs nothing measurable on either platform and the trace
+is the trace wherever it runs. The 1% lows were if anything steadier on Windows:
+about 155 against a 170 average with DLSS, where Proton's sits nearer 120.
+
+The Windows column is the shipped build except for the two NRD rows, which were
+measured on a locally built one before the difference below was understood.
+Both are GPU bound - the frame and the GPU time agree to a hundredth of a
+millisecond there - so what that build cost on the CPU does not reach them.
+
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
 a second, rather than letting the engine drop to a window and minimise it: on
@@ -628,6 +652,14 @@ Copy `build-win32/PathTracerDrv.dll`, `PathTracerDrv.int` and
 `build-win64/PathTracerHelper.exe` into `System`. So far both halves have been
 cross built from Linux, as in [cmake/README-crossbuild.md](cmake/README-crossbuild.md),
 rather than with MSVC.
+
+Build this way to test behaviour, not to measure it. The CMake configuration
+carries `/Zi` and links with `/DEBUG`, which defaults `/OPT:NOREF`, and it does
+not pass `/GL`; the released binaries come from the solution's `DeusExRelease`
+configuration, which does. The difference does not show in the trace, which is
+the helper's work, but it cost about a millisecond a frame of CPU time reading
+the scene out of the engine - 3.1 ms against the 2.1 the shipped build takes
+for the same frame. Benchmark the binaries that ship.
 
 ### Building the denoisers
 
