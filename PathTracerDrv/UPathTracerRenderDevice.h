@@ -167,6 +167,7 @@ private:
 	void RenderTiles(VulkanCommandBuffer* commands);
 	void CreateBrightnessPipeline();
 	void DescribeLightingOf(AActor* target);
+	void DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, FOutputDevice& Ar);
 	void ApplyBrightness(VulkanCommandBuffer* commands);
 	void EnsureSceneBuilt(ULevel* level);
 	// Whether the engine has collected garbage since last asked, told by a

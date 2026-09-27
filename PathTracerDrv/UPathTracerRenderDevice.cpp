@@ -548,6 +548,98 @@ void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
 		powf(Min(total[0], 1.0f), 2.2f), powf(Min(total[1], 1.0f), 2.2f), powf(Min(total[2], 1.0f), 2.2f));
 }
 
+// What lights a point on the level, for comparing the trace with the
+// engine's lightmaps. For each light in reach: what the engine's lightmap
+// gets from it on the scale where 1 is full brightness - its colour at
+// FGetHSV's full brightness, times its brightness and the level's, times
+// 1 - 3x^2 + 2x^3 of the way x out to its radius, times the cosine at the
+// surface, as Render.dll builds a lightmap - whether the level's own geometry
+// is in the way, which is all that shadows a lightmap, and the linear light
+// the trace takes from it. Written to the log, strongest first.
+void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, FOutputDevice& Ar)
+{
+	struct Entry { AActor* Light; float Engine[3]; float Traced[3]; float Distance, Radius, Cosine; bool Clear; };
+	std::vector<Entry> entries;
+	const FVector from = point + normal * 2.0f;
+	const float levelBrightness = level->GetLevelInfo() ? (float)level->GetLevelInfo()->Brightness : 1.0f;
+	for (INT i = 0; i < level->Actors.Num(); i++)
+	{
+		AActor* light = level->Actors(i);
+		if (!light || light->bDeleteMe || light->LightType == LT_None || !light->LightBrightness)
+			continue;
+		if ((light->bSpecialLit != 0) != specialLit)
+			continue;
+		const float radius = light->LightRadius * 25.0f;
+		const FVector toLight = light->Location - point;
+		const float distance = toLight.Size();
+		if (distance >= radius || distance <= 0.0f)
+			continue;
+		const float cosine = (toLight | normal) / distance;
+		if (cosine <= 0.0f && light->LightEffect != LE_NonIncidence)
+			continue;
+		float incidence = light->LightEffect == LE_NonIncidence ? 1.0f : cosine;
+		// A spotlight's cone, as the trace and Render.dll take it.
+		if (light->LightEffect == LE_Spotlight || light->LightEffect == LE_StaticSpot)
+		{
+			APawn* pawn = Cast<APawn>(light);
+			const float along = -((toLight / distance) | (pawn ? pawn->ViewRotation : light->Rotation).Vector());
+			const float edge = 1.0f - light->LightCone / 256.0f;
+			if (along <= edge)
+				continue;
+			const float f = (along - edge) / Max(1.0f - edge, 0.0001f);
+			incidence *= f * f;
+		}
+		const float x = distance / radius;
+		const float smooth = 1.0f - 3.0f * x * x + 2.0f * x * x * x;
+		const float brightness = light->LightBrightness / 255.0f;
+		const FPlane c = FGetHSV(light->LightHue, light->LightSaturation, 255);
+		Entry e;
+		e.Light = light;
+		const float colour[3] = { c.X, c.Y, c.Z };
+		for (int k = 0; k < 3; k++)
+		{
+			e.Engine[k] = colour[k] * brightness * levelBrightness * smooth * incidence;
+			e.Traced[k] = powf(colour[k], 2.2f) * brightness * (1.0f - x) * incidence;
+		}
+		e.Distance = distance;
+		e.Radius = radius;
+		e.Cosine = cosine;
+		e.Clear = level->Model->FastLineCheck(light->Location, from) != 0;
+		entries.push_back(e);
+	}
+	std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.Engine[1] > b.Engine[1]; });
+	float engineAll[3] = {}, engineClear[3] = {}, tracedClear[3] = {};
+	int clearCount = 0;
+	for (const Entry& e : entries)
+	{
+		for (int k = 0; k < 3; k++)
+		{
+			engineAll[k] += e.Engine[k];
+			if (e.Clear)
+			{
+				engineClear[k] += e.Engine[k];
+				tracedClear[k] += e.Traced[k];
+			}
+		}
+		clearCount += e.Clear ? 1 : 0;
+	}
+	debugf(TEXT("PT: lighting at %.0f %.0f %.0f facing %.2f %.2f %.2f, texture %s, level brightness %.2f: %d lights in reach, %d not blocked by the level"),
+		point.X, point.Y, point.Z, normal.X, normal.Y, normal.Z, texture ? texture->GetName() : TEXT("none"), levelBrightness,
+		(int)entries.size(), clearCount);
+	for (size_t i = 0; i < entries.size() && i < 24; i++)
+	{
+		const Entry& e = entries[i];
+		debugf(TEXT("  %s %s: brightness %d hue %d saturation %d, %.0f of %.0f away, cosine %.2f, %s; engine %.3f %.3f %.3f, trace %.4f %.4f %.4f"),
+			e.Light->GetName(), e.Light->GetClass()->GetName(), (int)e.Light->LightBrightness, (int)e.Light->LightHue,
+			(int)e.Light->LightSaturation, e.Distance, e.Radius, e.Cosine, e.Clear ? TEXT("clear") : TEXT("BLOCKED"),
+			e.Engine[0], e.Engine[1], e.Engine[2], e.Traced[0], e.Traced[1], e.Traced[2]);
+	}
+	debugf(TEXT("  engine's lightmap, unclear lights too: %.3f %.3f %.3f; the clear ones: %.3f %.3f %.3f (1 is full brightness, before the ambient); trace, the clear ones: %.4f %.4f %.4f linear"),
+		engineAll[0], engineAll[1], engineAll[2], engineClear[0], engineClear[1], engineClear[2], tracedClear[0], tracedClear[1], tracedClear[2]);
+	Ar.Logf(TEXT("PT: %d lights reach this point, %d unblocked; engine lightmap %.2f, trace %.3f (green); details in the log"),
+		(int)entries.size(), clearCount, engineClear[1], tracedClear[1]);
+}
+
 VulkanDescriptorSet* UPathTracerRenderDevice::TileSet(CachedTexture* texture, int mode)
 {
 	std::unique_ptr<VulkanDescriptorSet>& set = texture->Sets[mode];
@@ -2000,6 +2092,39 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				}
 				else
 					Ar.Logf(TEXT("PT: zone %s has no ambient"), zone ? zone->GetName() : TEXT("none"));
+				DescribeLightingAt(player->XLevel, hit.Location, hit.Normal, texture,
+					node.iSurf < model->Surfs.Num() && (model->Surfs(node.iSurf).PolyFlags & PF_SpecialLit) != 0, Ar);
+				// The lights the level's build baked into this surface's
+				// lightmap, and how much of each one's shadow mask it left lit:
+				// what the engine's own shadows are made of.
+				FLightMapIndex* index = node.iSurf < model->Surfs.Num() ? model->GetLightMapIndex(node.iSurf) : nullptr;
+				if (index)
+				{
+					const INT rowBytes = (index->UClamp + 7) >> 3;
+					const INT perLight = rowBytes * index->VClamp;
+					debugf(TEXT("PT: lightmap %dx%d texels of %.0f units, lights baked in:"), index->UClamp, index->VClamp, index->UScale);
+					for (INT k = 0; index->iLightActors >= 0 && index->iLightActors + k < model->Lights.Num(); k++)
+					{
+						AActor* light = model->Lights(index->iLightActors + k);
+						if (!light)
+							break;
+						INT lit = 0, total = 0;
+						const INT start = index->DataOffset + k * perLight;
+						for (INT b = 0; b < perLight && start + b < model->LightBits.Num(); b++)
+						{
+							const BYTE bits = model->LightBits(start + b);
+							for (INT bit = 0; bit < 8; bit++)
+								if ((b % rowBytes) * 8 + bit < index->UClamp)
+								{
+									total++;
+									lit += (bits >> bit) & 1;
+								}
+						}
+						debugf(TEXT("  %s: %d of %d texels lit"), light->GetName(), lit, total);
+					}
+				}
+				else
+					debugf(TEXT("PT: this surface has no lightmap"));
 			}
 			Ar.Logf(TEXT("PT: %s written to the log"), (hit.Actor && hit.Actor != player->Level) ? hit.Actor->GetName() : TEXT("nothing but the level"));
 			return 1;
