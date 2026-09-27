@@ -104,6 +104,7 @@ static void AddQuad(SceneGeometry& g, vec3 a, vec3 b, vec3 c, vec3 d, vec3 albed
 				normals[v] = Normalized(vec3(corners[t][v].x - centre->x, corners[t][v].y - centre->y, corners[t][v].z - centre->z));
 			SetCornerNormals(attr, corners[t], normals);
 		}
+		SetUvDensity(attr, corners[t]);
 		g.Attributes.push_back(attr);
 	}
 }
@@ -184,6 +185,32 @@ int main(int argc, char** argv)
 		for (int y = 0; y < 64; y++)
 			for (int x = 0; x < 64; x++)
 				checker[y * 64 + x] = (((x / 8) ^ (y / 8)) & 1) ? 0xffe0e0e0u : 0xff303030u;
+		// Its mips, each the average of four texels of the one above, sent
+		// after it as the device sends a texture's: the far floor should
+		// settle to grey rather than sparkle.
+		uint32_t checkerLevels = 1;
+		for (int size = 64, above = 0; size > 1; size /= 2, checkerLevels++)
+		{
+			const int half = size / 2;
+			const size_t start = checker.size();
+			checker.resize(start + (size_t)half * half);
+			for (int y = 0; y < half; y++)
+				for (int x = 0; x < half; x++)
+				{
+					uint32_t sum[4] = {};
+					for (int k = 0; k < 4; k++)
+					{
+						const uint32_t c = checker[above + (y * 2 + k / 2) * size + x * 2 + k % 2];
+						for (int b = 0; b < 4; b++)
+							sum[b] += (c >> (b * 8)) & 255u;
+					}
+					uint32_t c = 0;
+					for (int b = 0; b < 4; b++)
+						c |= ((sum[b] + 2) / 4) << (b * 8);
+					checker[start + (size_t)y * half + x] = c;
+				}
+			above = (int)start;
+		}
 
 		SceneInstance placed = {};
 		placed.GeometryIndex = 0;
@@ -270,7 +297,7 @@ int main(int argc, char** argv)
 		}
 
 		client.ResetScene();
-		client.Texture(0, 64, 64, checker.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false);
+		client.Texture(0, 64, 64, checker.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false, checkerLevels);
 		if (detail)
 			client.Texture(1, 64, 64, stripes.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false);
 		client.Geometry(0, world);
@@ -291,6 +318,7 @@ int main(int argc, char** argv)
 		frame.GlossBounces = 1;
 		frame.Denoise = reference ? TraceProtocol::DenoiseOff : dlss >= 0 ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd;
 		frame.LightSize = lightSize;
+		frame.MaxAnisotropy = 16;
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
 		frame.Timing = 1;

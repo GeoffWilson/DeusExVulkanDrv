@@ -407,6 +407,7 @@ void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 	WaitForSlot(slotIndex);
 	FrameSlot& slot = Slots[slotIndex];
 
+	Renderer->SetAnisotropy(frame.MaxAnisotropy);
 	slot.Trace = CommandPool->createBuffer();
 	slot.Trace->begin();
 	const bool traced = Renderer->Record(slot.Trace.get(), frame, slotIndex);
@@ -613,8 +614,9 @@ bool Helper::Batch()
 		{
 			TextureCommand c;
 			memcpy(&c, body, sizeof(c));
-			const bool hasPixels = c.Width && c.Height && header.Bytes >= sizeof(c) + (size_t)c.Width * c.Height * 4;
-			Renderer->SetTexture(c.Index, c.Width, c.Height, hasPixels ? (const uint32_t*)(body + sizeof(c)) : nullptr, c.Material);
+			const uint32_t levels = std::max(std::min(c.MipLevels, 16u), 1u);
+			const bool hasPixels = c.Width && c.Height && header.Bytes >= sizeof(c) + MipChainPixels(c.Width, c.Height, levels) * 4;
+			Renderer->SetTexture(c.Index, c.Width, c.Height, levels, hasPixels ? (const uint32_t*)(body + sizeof(c)) : nullptr, c.Material);
 			break;
 		}
 

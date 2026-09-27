@@ -99,17 +99,18 @@ std::string Shaders::Trace()
 			vec4 CameraRight;     // xyz, already scaled by the horizontal half extent
 			vec4 CameraUp;        // xyz, already scaled by the vertical half extent
 			vec4 CameraForward;   // xyz unit vector down the middle of the view
-			uvec4 Counts;         // x frame, y light count, z bounces (glossy bounces << 8, light radius << 16), w accumulated frames
+			uvec4 Counts;         // x frame, y light count, z bounces (glossy bounces << 8, light radius << 16, mip bias in signed sixteenths << 24), w accumulated frames
 			vec4 Params;          // x exposure, y sky intensity, z ray epsilon, w debug mode
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
 		#define GlossBounces ((Counts.z >> 8u) & 255u)
 		#define LightRadius float((Counts.z >> 16u) & 255u)
+		#define MipBias (float(int(Counts.z) >> 24) / 16.0)
 
 		// Which instances each kind of ray sees, against SceneInstance::Mask.
 		// The view's own rays and shadows miss the viewer's body while the
@@ -152,7 +153,93 @@ std::string Shaders::Trace()
 			     + attr.Emission.xy * Time;
 		}
 
-		vec3 surfaceAlbedo(TriangleAttributes attr, vec2 bary, vec3 dir, vec3 worldNormal)
+		// Which mip level a hit samples its texture at, from how wide the ray's
+		// footprint is where it lands (Akenine-Moller et al., "Texture Level
+		// of Detail Strategies for Real-Time Ray Tracing", Ray Tracing Gems
+		// chapter 20). footprint is log2 of that width (footprintOf); the
+		// triangle says how much of its texture lies across a unit of it
+		// (SetUvDensity), and the texture's size turns that into texels. An
+		// environment map is looked up by direction rather than laid on, and
+		// keeps its top level.
+		float surfaceLod(TriangleAttributes attr, int index, float footprint)
+		{
+			if (attr.CornerOffsets.w == 0u || attr.Normal.w > 0.5)
+				return 0.0;
+			ivec2 size = textureSize(sceneTextures[nonuniformEXT(index)], 0);
+			return max(uintBitsToFloat(attr.CornerOffsets.w) + 0.5 * log2(float(size.x) * float(size.y)) + footprint, 0.0);
+		}
+
+		// log2 of the width of a ray's footprint where it meets a surface, as
+		// surfaceLod wants it: the cone's width there, widened for the slant by
+		// the square root of the stretch - between the two axes of the ellipse
+		// it really covers, which keeps a floor seen at a glance from blurring
+		// without leaving it to shimmer - and measured in the geometry's own
+		// space, where the triangle's density was: an instance scaled up
+		// spreads its texture over more of the world.
+		float footprintOf(float width, vec3 faceNormal, vec3 direction, mat4x3 objectToWorld, vec3 objectNormal)
+		{
+			mat3 m = mat3(objectToWorld);
+			float areaScale = length(cross(m[1], m[2]) * objectNormal.x + cross(m[2], m[0]) * objectNormal.y + cross(m[0], m[1]) * objectNormal.z);
+			float slant = max(abs(dot(faceNormal, direction)), 0.05);
+			return log2(max(width, 1.0e-4)) - 0.5 * log2(slant) - 0.5 * log2(max(areaScale, 1.0e-8));
+		}
+
+		vec3 unpackUnitVector(uint packed);
+
+		// A ray's footprint where it lands, for reading textures. logWidth is
+		// footprintOf's, for surfaceLod; on a flat surface, dx and dy are the
+		// footprint's two axes in texture coordinates, for textureGrad.
+		struct Footprint
+		{
+			float logWidth;
+			bool graded;
+			vec2 dx;
+			vec2 dy;
+		};
+
+		// The footprint's axes in texture coordinates, on a flat surface -
+		// one that carries its texture's gradients (SetUvDensity): across the
+		// ray it is the cone's width, along it the width stretched by the
+		// slant, and the sampler filters anisotropically along the longer, at
+		// the level the shorter calls for. A floor seen down a corridor is a
+		// pixel wide one way and twenty texels the other; one level for both
+		// either blurred it or left it sparkling.
+		bool footprintAxes(TriangleAttributes attr, float width, vec3 faceNormal, vec3 direction, mat3 worldToObject, out vec2 dx, out vec2 dy)
+		{
+			dx = vec2(0.0);
+			dy = vec2(0.0);
+			if (attr.CornerNormals.w != 0u || attr.CornerNormals.z == 0u)
+				return false;
+			vec2 lengths = unpackHalf2x16(attr.CornerNormals.z);
+			vec3 tu = unpackUnitVector(attr.CornerNormals.x) * lengths.x;
+			vec3 tv = unpackUnitVector(attr.CornerNormals.y) * lengths.y;
+			vec3 along = direction - dot(direction, faceNormal) * faceNormal;
+			float l = length(along);
+			along = l > 1.0e-4 ? along / l : normalize(cross(faceNormal, abs(faceNormal.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
+			vec3 across = cross(faceNormal, along);
+			float slant = max(abs(dot(faceNormal, direction)), 0.01);
+			vec3 a0 = worldToObject * (along * (width / slant));
+			vec3 a1 = worldToObject * (across * width);
+			dx = vec2(dot(tu, a0), dot(tv, a0));
+			dy = vec2(dot(tu, a1), dot(tv, a1));
+			return true;
+		}
+
+		// A texel of a hit's texture at the footprint's size: filtered along
+		// it where the surface is flat, at one level where it is not, at the
+		// top level with mipmaps switched off (Disable bit 4096). scale
+		// stretches the texture's coordinates, for a detail texture laid on
+		// finer than the surface's own.
+		vec4 sampleFootprint(TriangleAttributes attr, int index, vec2 uv, Footprint footprint, vec2 scale)
+		{
+			if ((Disable & 4096u) != 0u || attr.Normal.w > 0.5)
+				return textureLod(sceneTextures[nonuniformEXT(index)], uv, 0.0);
+			if (footprint.graded)
+				return textureGrad(sceneTextures[nonuniformEXT(index)], uv, footprint.dx * scale, footprint.dy * scale);
+			return textureLod(sceneTextures[nonuniformEXT(index)], uv, surfaceLod(attr, index, footprint.logWidth + 0.5 * log2(max(scale.x * scale.y, 1.0e-8))));
+		}
+
+		vec3 surfaceAlbedo(TriangleAttributes attr, vec2 bary, vec3 dir, vec3 worldNormal, Footprint footprint)
 		{
 			int index = int(attr.UV2Tex.z);
 			if (index < 0 || uint(index) >= TextureCount)
@@ -160,7 +247,7 @@ std::string Shaders::Trace()
 
 			vec2 uv = surfaceUV(attr, bary, dir, worldNormal);
 
-			vec4 texel = texture(sceneTextures[nonuniformEXT(index)], uv);
+			vec4 texel = sampleFootprint(attr, index, uv, footprint, vec2(1.0));
 
 			// The engine's art is authored in sRGB; the trace works in linear.
 			vec3 linearRgb = pow(max(texel.rgb, vec3(0.0)), vec3(2.2));
@@ -178,22 +265,25 @@ std::string Shaders::Trace()
 		// surface's CornerOffsets name the texture (LevelScene::SetDetail).
 		// The passes are over the displayed colour, so the linear one takes
 		// them to the power 2.2.
-		vec3 detailFactor(TriangleAttributes attr, vec2 uv, float depth)
+		vec3 detailFactor(TriangleAttributes attr, vec2 uv, float depth, Footprint footprint)
 		{
 			if (attr.CornerNormals.w != 0u || attr.CornerOffsets.x == 0u || (Disable & 2048u) != 0u)
 				return vec3(1.0);
 			uint index = attr.CornerOffsets.x - 1u;
 			if (index >= TextureCount)
 				return vec3(1.0);
-			vec2 detailUV = uv * uintBitsToFloat(attr.CornerOffsets.yz);
+			// Read over the surface's own footprint, stretched as the detail
+			// texture is laid on finer than the surface's, and each pass
+			// finer again.
+			vec2 scale = uintBitsToFloat(attr.CornerOffsets.yz);
 			vec3 factor = vec3(1.0);
 			float edge = 380.0;
 			for (int pass = 0; pass < 3 && depth < edge; pass++)
 			{
 				float a = clamp(100.0 / 255.0 * (edge / max(depth, 1.0) - 1.0), 0.0, 1.0);
-				vec3 detail = texture(sceneTextures[nonuniformEXT(index)], detailUV).rgb;
+				vec3 detail = sampleFootprint(attr, int(index), uv * scale, footprint, scale).rgb;
 				factor *= 2.0 * mix(vec3(128.0 / 255.0), detail, a);
-				detailUV *= 4.223;
+				scale *= 4.223;
 				edge *= 0.2368;
 			}
 			return pow(factor, vec3(2.2));
@@ -498,8 +588,12 @@ std::string Shaders::Trace()
 
 			vec2 uv = surfaceUV(attr, bary, dir, normalize(toWorld * attr.Normal.xyz));
 
+			// Tested at the top mip level, however far off: each ray finds
+			// a hole or a bar exactly, and the rays of a pixel between them
+			// cover it by as much as the grille really does. A smaller mip's
+			// blurred alpha thickened bars or closed holes.
 			if (kind < 1.5)
-				return textured ? texture(sceneTextures[nonuniformEXT(index)], uv).a > 0.5 : true;
+				return textured ? textureLod(sceneTextures[nonuniformEXT(index)], uv, 0.0).a > 0.5 : true;
 
 			// A mirror is solid; it reflects rather than letting anything past.
 			if (kind > 2.5)
@@ -511,7 +605,7 @@ std::string Shaders::Trace()
 			// palette entry zero - magenta - added over whatever lay behind.
 			if (shadowRay)
 				return false;
-			return textured ? texture(sceneTextures[nonuniformEXT(index)], uv).a > 0.5 : true;
+			return textured ? textureLod(sceneTextures[nonuniformEXT(index)], uv, 0.0).a > 0.5 : true;
 		}
 
 		// Is anything between two points? Terminate on the first hit rather than
@@ -1021,6 +1115,15 @@ std::string Shaders::Trace()
 			vec3 direction = normalize(CameraForward.xyz + CameraRight.xyz * uv.x + CameraUp.xyz * uv.y);
 			vec3 viewDirection = direction;
 
+			// The ray's footprint, for choosing mip levels (surfaceLod): a cone
+			// a pixel across at the eye - an output pixel across when Ray
+			// Reconstruction upscales - widening as it goes. coneWidth is its
+			// width where the ray now starts, coneSpread how fast it widens.
+			float pixelSpread = 2.0 * length(CameraUp.xyz) / float(size.y) * exp2(MipBias);
+			float coneWidth = 0.0;
+			float coneSpread = pixelSpread;
+			float surfaceConeWidth = 0.0;
+
 			vec3 radiance = vec3(0.0);
 			vec3 throughput = vec3(1.0);
 			// Passing through a translucent surface is not a bounce: a window
@@ -1113,6 +1216,9 @@ std::string Shaders::Trace()
 					throughput = pendingGloss ? reflectionThroughput : vec3(1.0);
 					origin = specularOrigin;
 					direction = specularDirection;
+					// A mirror keeps the view's cone; a glossy reflection spreads.
+					coneWidth = surfaceConeWidth;
+					coneSpread = pendingGloss ? 0.1 : pixelSpread;
 					rayMin = Params.z;
 					passes = 0u;
 					hitDistance = 0.0;
@@ -1178,6 +1284,10 @@ std::string Shaders::Trace()
 					}
 
 					float t = rayQueryGetIntersectionTEXT(rq, true);
+					// The footprint's width here, which is where the ray carries
+					// on from, through glass or into the sky zone or off a bounce.
+					float hitWidth = coneWidth + coneSpread * t;
+					coneWidth = hitWidth;
 					// How far the first ray off the surface went, which a denoiser
 					// uses to judge how widely that light can be blurred.
 					if (wantHitDistance)
@@ -1220,7 +1330,11 @@ std::string Shaders::Trace()
 					vec3 position = origin + direction * t;
 					vec3 lifted;
 					vec3 normal = smoothNormal(attr, bary, mat3(objectToWorld), faceNormal, side, position, lifted);
-					attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal), attr.Albedo.w);
+					Footprint footprint;
+					footprint.logWidth = footprintOf(hitWidth, faceNormal, direction, objectToWorld, attr.Normal.xyz);
+					footprint.graded = footprintAxes(attr, hitWidth, faceNormal, direction,
+						mat3(rayQueryGetIntersectionWorldToObjectEXT(rq, true)), footprint.dx, footprint.dy);
+					attr.Albedo = vec4(surfaceAlbedo(attr, bary, direction, normal, footprint), attr.Albedo.w);
 					// The engine lays a detail texture over what is in view, a
 					// mirror's reflection included, where the depth is the
 					// reflection's own, as far behind the glass as it looks.
@@ -1233,7 +1347,7 @@ std::string Shaders::Trace()
 							depth = dot(toMirror, CameraForward.xyz) * (1.0 + distance(position, specularOrigin) / max(length(toMirror), 1.0));
 						}
 						if (depth > 0.0)
-							attr.Albedo.rgb *= detailFactor(attr, surfaceUV(attr, bary, direction, normal), depth);
+							attr.Albedo.rgb *= detailFactor(attr, surfaceUV(attr, bary, direction, normal), depth, footprint);
 					}
 
 					// Translucent: add what this surface contributes and carry on
@@ -1444,6 +1558,7 @@ std::string Shaders::Trace()
 						}
 						surfacePosition = position;
 						surfaceObject = rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(position, 1.0);
+						surfaceConeWidth = hitWidth;
 						surfaceInstance = rayQueryGetIntersectionInstanceIdEXT(rq, true);
 						wantHitDistance = true;
 					}
@@ -1624,6 +1739,10 @@ std::string Shaders::Trace()
 					if (!glossyBounce)
 						direction = cosineDirection(normal);
 					direction = aboveFace(direction, faceNormal);
+					// Light bounced off a surface is gathered from all over, and
+					// the fine detail where it lands next hardly shows in it: a
+					// wide cone, and coarse mips that are quicker to read.
+					coneSpread = 0.25;
 				}
 			}
 

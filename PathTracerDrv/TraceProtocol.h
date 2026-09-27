@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 6;
+	static const uint32_t Version = 7;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -190,9 +190,10 @@ namespace TraceProtocol
 		uint32_t FogCount;
 	};
 
-	// A texture array slot: its pixels as RGBA8 (Width * Height of them, or
-	// none for a texture the device could not convert, which is bound white)
-	// and what the surfaces using it are made of.
+	// A texture array slot: its pixels as RGBA8, MipLevels levels of them end
+	// to end from Width * Height down, each half the last (or none for a
+	// texture the device could not convert, which is bound white), and what
+	// the surfaces using it are made of.
 	struct TextureCommand
 	{
 		CommandHeader H;
@@ -200,8 +201,19 @@ namespace TraceProtocol
 		uint32_t Width;
 		uint32_t Height;
 		uint32_t Animated;          // its pixels change: keep them uploadable
+		uint32_t MipLevels;
+		uint32_t Pad;
 		vec4 Material;
 	};
+
+	// How many pixels a chain of mips from width x height holds.
+	inline size_t MipChainPixels(uint32_t width, uint32_t height, uint32_t levels)
+	{
+		size_t total = 0;
+		for (uint32_t i = 0; i < levels; i++)
+			total += (size_t)(width >> i ? width >> i : 1) * (height >> i ? height >> i : 1);
+		return total;
+	}
 
 	// New pixels for a slot that already exists, at the size it has: a frame
 	// of fire, water, a screen.
@@ -237,7 +249,7 @@ namespace TraceProtocol
 		float SkyIntensity;
 		uint32_t DlssQuality;       // 0 DLAA, 1 quality, 2 balanced, 3 performance, 4 ultra performance
 		uint32_t LightSize;         // radius shadows are cast from around each light, in world units; 0 a point
-		uint32_t Spare;
+		uint32_t MaxAnisotropy;     // most samples the texture filter takes along a footprint; 1 or less, none
 		// Origin, right, up and forward, as the trace shader's push constants
 		// carry them - w holding the screen flash - and the same for last frame.
 		vec4 Camera[4];

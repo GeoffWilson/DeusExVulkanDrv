@@ -48,6 +48,10 @@ struct TriangleAttributes
 	// start off the flat triangle onto the rounded surface: see smoothNormal in
 	// Shaders.cpp.
 	uint32_t CornerOffsets[4] = {};
+	// CornerOffsets[3] is every triangle's: how finely its texture is laid on
+	// it, for picking a mip level (SetUvDensity). On a flat triangle, which
+	// has no corner normals, CornerNormals[0..2] say how its texture
+	// coordinates change across it, for filtering its texture anisotropically.
 };
 
 // A unit vector in 32 bits: octahedral, 16 bits a component, laid out as the
@@ -103,6 +107,53 @@ inline void SetCornerNormals(TriangleAttributes& attr, const vec3 corners[3], co
 	}
 	attr.CornerNormals[3] = 1;
 	attr.CornerOffsets[3] = 0;
+}
+
+// How finely a triangle's texture is laid on it: half the log2 of its area in
+// texture coordinates over its area in space, measured in its geometry's own
+// space. The trace adds the texture's size and the width of the ray's
+// footprint where it lands to choose a mip level (surfaceLod in Shaders.cpp).
+// In CornerOffsets[3], after SetCornerNormals, which clears it; zero for a
+// triangle with no texture laid across it.
+inline void SetUvDensity(TriangleAttributes& attr, const vec3 corners[3])
+{
+	attr.CornerOffsets[3] = 0;
+	const float du1 = attr.UV01.z - attr.UV01.x, dv1 = attr.UV01.w - attr.UV01.y;
+	const float du2 = attr.UV2Tex.x - attr.UV01.x, dv2 = attr.UV2Tex.y - attr.UV01.y;
+	const float uvArea = std::abs(du1 * dv2 - dv1 * du2);
+	const vec3 e1 = corners[1] - corners[0], e2 = corners[2] - corners[0];
+	const vec3 c(e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x);
+	const float area = std::sqrt(c.x * c.x + c.y * c.y + c.z * c.z);
+	if (!(uvArea > 0.0f) || !(area > 0.0f))
+		return;
+	float density = 0.5f * std::log2(uvArea / area);
+	if (density == 0.0f)
+		density = 1.0e-6f;
+	memcpy(&attr.CornerOffsets[3], &density, sizeof(density));
+
+	// A flat triangle also carries how its texture coordinates change across
+	// it: the gradients of u and of v along its plane, each as a direction
+	// and a length, which the trace turns a ray's footprint into texture
+	// space with to filter along the footprint's longer axis - a floor seen
+	// at a glance down a corridor is a pixel wide one way and twenty texels
+	// the other. Solved from the corners: the vector g in the plane with
+	// g.e1 and g.e2 the change along each edge.
+	if (attr.CornerNormals[3] == 0)
+	{
+		const float nn = c.x * c.x + c.y * c.y + c.z * c.z;
+		const vec3 a(e2.y * c.z - e2.z * c.y, e2.z * c.x - e2.x * c.z, e2.x * c.y - e2.y * c.x);   // e2 x n
+		const vec3 b(c.y * e1.z - c.z * e1.y, c.z * e1.x - c.x * e1.z, c.x * e1.y - c.y * e1.x);   // n x e1
+		const vec3 tu = (a * du1 + b * du2) * (1.0f / nn);
+		const vec3 tv = (a * dv1 + b * dv2) * (1.0f / nn);
+		const float lu = std::sqrt(tu.x * tu.x + tu.y * tu.y + tu.z * tu.z);
+		const float lv = std::sqrt(tv.x * tv.x + tv.y * tv.y + tv.z * tv.z);
+		if (lu > 0.0f && lv > 0.0f)
+		{
+			attr.CornerNormals[0] = PackUnitVector(tu * (1.0f / lu));
+			attr.CornerNormals[1] = PackUnitVector(tv * (1.0f / lv));
+			attr.CornerNormals[2] = PackHalf(lu) | (PackHalf(lv) << 16);
+		}
+	}
 }
 
 // A light as the engine describes it, converted to something physical.

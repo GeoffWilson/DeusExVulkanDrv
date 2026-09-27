@@ -158,6 +158,7 @@ public:
 	// meets its shadow and soften with distance from it, as real ones do.
 	// PT LIGHTSIZE n changes it for the session.
 	INT LightSize;
+	FLOAT MaxAnisotropy;
 
 private:
 	FString DescribeDenoiser() const;

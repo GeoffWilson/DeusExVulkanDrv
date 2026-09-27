@@ -62,9 +62,10 @@ public:
 
 	// A texture array slot, made or remade: RGBA8 pixels, or none for one that
 	// is bound white, and what surfaces using it are made of.
-	void SetTexture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material);
+	void SetTexture(uint32_t index, uint32_t width, uint32_t height, uint32_t levels, const uint32_t* pixels, const vec4& material);
 	// New pixels for an existing slot, copied in as the next frame starts.
 	void SetTexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels);
+	void SetAnisotropy(uint32_t samples);
 
 	// Records a frame into one of the FramesInFlight slots, whose last frame
 	// the caller has waited for: the uploads, the structures, the trace, and
@@ -205,13 +206,15 @@ private:
 	{
 		std::unique_ptr<VulkanImage> Image;
 		std::unique_ptr<VulkanImageView> View;
-		uint32_t Width = 0, Height = 0;
+		uint32_t Width = 0, Height = 0, Levels = 1;
+		vec4 Material;
 	};
 	std::vector<Slot> Slots;
 	size_t BoundTextures = 0;
 	std::unique_ptr<VulkanImage> WhiteImage;
 	std::unique_ptr<VulkanImageView> WhiteView;
 	std::unique_ptr<VulkanSampler> SceneSampler;
+	uint32_t SceneAnisotropy = 0;
 	// What each slot's surfaces are made of, indexed the same way.
 	std::unique_ptr<VulkanBuffer> MaterialBuffer;
 

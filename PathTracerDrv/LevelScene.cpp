@@ -436,6 +436,8 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 					out.HasMasked = true;
 				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
 				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, kind);
+				const vec3 corners[3] = { v0, v1, v2 };
+				SetUvDensity(attr, corners);
 			}
 			if (surf.PolyFlags & PF_FakeBackdrop)
 				attr.UV2Tex.w = 5.0f;
@@ -728,6 +730,8 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 				const vec2 uv2 = polyUV(p2);
 				attr.UV01 = vec4(uv0.x, uv0.y, uv1.x, uv1.y);
 				attr.UV2Tex = vec4(uv2.x, uv2.y, (float)textureIndex, kind);
+				const vec3 corners[3] = { v0, v1, v2 };
+				SetUvDensity(attr, corners);
 				SetDetail(attr, poly.Texture);
 			}
 			else
@@ -903,6 +907,8 @@ int LevelScene::GeometryForSprite(UTexture* texture, float kind)
 		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
 		attr.UV01 = vec4(uv[tri[0]][0], uv[tri[0]][1], uv[tri[1]][0], uv[tri[1]][1]);
 		attr.UV2Tex = vec4(uv[tri[2]][0], uv[tri[2]][1], (float)textureIndex, kind);
+		const vec3 laid[3] = { corners[tri[0]], corners[tri[1]], corners[tri[2]] };
+		SetUvDensity(attr, laid);
 
 		for (int v = 0; v < 3; v++)
 			geometry.Positions.push_back(corners[tri[v]]);
@@ -1093,6 +1099,8 @@ void LevelScene::CollectDecals(ULevel* level)
 					attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
 					attr.UV01 = vec4(uv[tri[0]][0], uv[tri[0]][1], uv[tri[1]][0], uv[tri[1]][1]);
 					attr.UV2Tex = vec4(uv[tri[2]][0], uv[tri[2]][1], (float)textureIndex, kind);
+					const vec3 laid[3] = { corners[tri[0]], corners[tri[1]], corners[tri[2]] };
+					SetUvDensity(attr, laid);
 					for (int v = 0; v < 3; v++)
 						geometry.Positions.push_back(corners[tri[v]]);
 					geometry.Attributes.push_back(attr);
@@ -1635,6 +1643,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 				cornerNormals[v] = normal;
 		}
 		SetCornerNormals(attr, posedTri.Corners, cornerNormals);
+		SetUvDensity(attr, posedTri.Corners);
 
 		geometry.Positions.push_back(v0);
 		geometry.Positions.push_back(v1);

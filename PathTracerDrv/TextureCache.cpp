@@ -224,16 +224,28 @@ std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bo
 }
 
 
-// The top mip of a texture read straight off the object rather than through
+// One mip of a texture read straight off the object rather than through
 // UTexture::Lock. Lock expects to be called while the engine is handing
 // surfaces to a render device, and this runs at a different point entirely;
 // it also takes an FTextureInfo that the engine partly reads, which as an
 // uninitialised local was undefined behaviour.
-static bool MipPixels(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height)
+static bool MipPixels(UTexture* texture, INT level, bool masked, std::vector<uint32_t>& pixels, int& width, int& height)
 {
-	if (!texture || texture->Mips.Num() < 1)
+	if (!texture || texture->Mips.Num() <= level)
 		return false;
-	FMipmap& mip = texture->Mips(0);
+	FMipmap& mip = texture->Mips(level);
+	// Off disk if it is not resident yet. This SDK's lazy arrays do not load
+	// themselves when indexed (LOAD_ON_DEMAND is off), and read as empty
+	// until something asks: the engine had loaded every top level by the
+	// time it was wanted here, but never the levels below, so every texture
+	// went to the helper without its mips.
+	//
+	// Through the engine's own vtable: the SDK declares TLazyArray<BYTE>'s
+	// functions imported, and neither import library exports Load, so a
+	// direct call cannot link. The pointer is volatile so the compiler, which
+	// knows the member's type, cannot call it directly anyway.
+	FLazyLoader* volatile loader = &mip.DataArray;
+	loader->Load();
 	if (mip.USize <= 0 || mip.VSize <= 0 || mip.DataArray.Num() <= 0)
 		return false;
 
@@ -253,15 +265,27 @@ static bool MipPixels(UTexture* texture, bool masked, std::vector<uint32_t>& pix
 	info.Palette = (texture->Palette && texture->Palette->Colors.Num() > 0)
 		? &texture->Palette->Colors(0) : nullptr;
 
-	// Indexing the lazy array is what pulls it off disk if it is not resident.
 	mip.DataPtr = &mip.DataArray(0);
 	return TextureCache::ConvertPixels(info, masked, pixels, width, height);
 }
 
-bool TextureCache::ScenePixels(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height)
+bool TextureCache::SceneMips(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height, int& levels)
 {
-	guard(TextureCache::ScenePixels);
-	return MipPixels(texture, masked, pixels, width, height);
+	guard(TextureCache::SceneMips);
+	levels = 0;
+	if (!MipPixels(texture, 0, masked, pixels, width, height))
+		return false;
+	levels = 1;
+	std::vector<uint32_t> level;
+	for (INT i = 1; i < texture->Mips.Num(); i++)
+	{
+		int w = 0, h = 0;
+		if (!MipPixels(texture, i, masked, level, w, h) || w != Max(1, width >> i) || h != Max(1, height >> i))
+			break;
+		pixels.insert(pixels.end(), level.begin(), level.end());
+		levels++;
+	}
+	return true;
 	unguard;
 }
 
@@ -315,7 +339,7 @@ bool TextureCache::AnimatedPixels(UTexture* texture, bool masked, double time, i
 	lastFrame = frame;
 
 	int w = 0, h = 0;
-	if (!MipPixels(frame, masked, pixels, w, h) || w != width || h != height)
+	if (!MipPixels(frame, 0, masked, pixels, w, h) || w != width || h != height)
 		return false;
 	return true;
 

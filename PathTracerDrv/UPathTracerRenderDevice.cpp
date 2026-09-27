@@ -306,6 +306,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseDLSS = 1;
 	DLSSQuality = 1;
 	DetailTextures = 1;
+	MaxAnisotropy = 16.0f;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -322,6 +323,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("WidescreenFOV"), RF_Public) UBoolProperty(CPP_PROPERTY(UseWidescreenFOV), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("PinnedUI"), RF_Public) UFloatProperty(CPP_PROPERTY(PinnedUI), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LightSize"), RF_Public) UIntProperty(CPP_PROPERTY(LightSize), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("MaxAnisotropy"), RF_Public) UFloatProperty(CPP_PROPERTY(MaxAnisotropy), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
@@ -1490,13 +1492,15 @@ bool UPathTracerRenderDevice::SendScene()
 	}
 
 	const double texturesStart = NowMs();
+	const size_t firstNew = SentTextures.size();
+	int sentWithMips = 0, sentLevels = 0;
 	for (size_t i = SentTextures.size(); i < Scene.Textures.size(); i++)
 	{
 		SentTexture sent;
 		sent.Source = Scene.Textures[i];
 		sent.Masked = Scene.TextureMasked[i];
-		int width = 0, height = 0;
-		const bool converted = TextureCache::ScenePixels(sent.Source, sent.Masked, Pixels, width, height);
+		int width = 0, height = 0, levels = 0;
+		const bool converted = TextureCache::SceneMips(sent.Source, sent.Masked, Pixels, width, height, levels);
 		// Named, so a texture that comes out wrong on screen can be identified
 		// rather than guessed at.
 		if (!converted && TextureFailuresLogged < 24)
@@ -1510,10 +1514,21 @@ bool UPathTracerRenderDevice::SendScene()
 		sent.Width = converted ? width : 0;
 		sent.Height = converted ? height : 0;
 		sent.Animated = TextureCache::Animates(sent.Source);
+		// One that changes sends its top level alone from then on, so it has
+		// no mips to fall behind it.
+		const uint32_t sentMips = sent.Animated ? 1u : (uint32_t)levels;
 		Tracer->Texture((uint32_t)i, (uint32_t)sent.Width, (uint32_t)sent.Height, converted ? Pixels.data() : nullptr,
-			Scene.TextureMaterials[i], sent.Animated);
+			Scene.TextureMaterials[i], sent.Animated, sentMips);
 		SentTextures.push_back(sent);
+		if (converted && sentMips > 1)
+		{
+			sentWithMips++;
+			sentLevels += (int)sentMips;
+		}
 	}
+	if (SentTextures.size() > firstNew)
+		debugf(TEXT("PathTracer textures: %d sent, %d of them with mips (%.1f levels on average)"),
+			(int)(SentTextures.size() - firstNew), sentWithMips, sentWithMips ? sentLevels / (float)sentWithMips : 0.0f);
 
 	// Asked afresh every frame rather than remembered from the first sending,
 	// since a script can give a texture an animation chain after it was first
@@ -1658,6 +1673,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.Denoise = !DenoiseEnabled ? TraceProtocol::DenoiseOff : (DlssEnabled ? TraceProtocol::DenoiseDlss : TraceProtocol::DenoiseNrd);
 				frame.DlssQuality = (uint32_t)DlssQualityNow;
 				frame.LightSize = (uint32_t)LightSizeNow;
+				frame.MaxAnisotropy = (uint32_t)Clamp(appRound(MaxAnisotropy), 0, 16);
 				frame.Materials = MaterialsEnabled ? 1 : 0;
 				frame.RestartDenoiser = DenoiseRestart ? 1 : 0;
 				frame.Timing = LogTimings ? 1 : 0;
@@ -2205,6 +2221,19 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				: TEXT("as the engine lights them, brighter and flatter, with its rim"));
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("ANISOTROPY")))
+		{
+			MaxAnisotropy = (FLOAT)Clamp(appAtoi(Cmd), 0, 16);
+			Ar.Logf(TEXT("PT: texture filter %s"), MaxAnisotropy > 1.0f ? *FString::Printf(TEXT("%dx anisotropic"), appRound(MaxAnisotropy)) : TEXT("trilinear"));
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("MIPS")))
+		{
+			DisableBits ^= 4096u;
+			AccumulatedFrames = 0;
+			Ar.Logf(TEXT("PT: mipmaps %s"), (DisableBits & 4096u) ? TEXT("off, every texture at its top level") : TEXT("on"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("DETAIL")))
 		{
 			DetailTextures = !DetailTextures;
@@ -2309,7 +2338,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | MESHLIGHT | DETAIL | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | MESHLIGHT | DETAIL | MIPS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

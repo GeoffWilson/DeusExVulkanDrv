@@ -124,6 +124,9 @@ crash, flushed as they happen.
   else were over twice as bright; and `AmbientGlow` on lit meshes.
 - **Light fittings no longer block their own lamps**, which left the floor
   under a hanging lamp dark and the ceiling above it lit.
+- **Mipmapped textures**: the packages' own mip chains, the levels the other
+  devices draw, chosen per ray by how wide its footprint is where it lands,
+  so distant floors and walls no longer sparkle and crawl.
 - **Materials off by default** until they have been checked by hand.
 - **Fixes:** a crash loading a save of the map already being played; a crash
   starting the game in a mode narrower than the screen under Proton's Wayland
@@ -198,6 +201,21 @@ full at 107; each after is 4.223 times finer and fades in a 4.223th as far out.
 They multiply the displayed colour, so the linear one takes them to the power
 2.2. The game's Detail Textures setting (`DetailTextures`) switches them, as it
 does in the other devices.
+
+Textures are sampled with their mips - the chains the packages store, which
+are what the other devices upload - at a level chosen per ray from a cone
+traced alongside it ("Texture Level of Detail Strategies for Real-Time Ray
+Tracing", Ray Tracing Gems chapter 20): a pixel wide at the eye, or an output
+pixel wide when DLSS upscales, as NVIDIA asks, widening with distance and more
+steeply after a bounce, where fine detail no longer shows. Each triangle
+carries how much texture is laid across it for this, and a flat one - the
+level, its movers, decals, sprites - how its texture coordinates change
+across it too: from those the footprint's two axes go to the texture unit,
+which filters anisotropically along the longer (`MaxAnisotropy`), so a floor
+seen at a glance down a corridor stays sharp and still. A mesh's is filtered
+by the middle of its footprint's two axes. Masked textures are still tested for holes at their
+full size, so a grille keeps its bars. A texture that changes as it is drawn -
+fire, water, a screen - is sent without mips, as its frames are.
 
 Each shaded point samples one light, chosen in proportion to its contribution
 from the lights listed for its cell of a uniform grid over the level, and fires
@@ -350,6 +368,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	WidescreenFOV=True
 	PinnedUI=1.333333
 	LightSize=4
+	MaxAnisotropy=16
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Exposure`: overall brightness, a byte around a midpoint of 128.
@@ -402,6 +421,11 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   starts sharp where something meets it and softens with distance, as a real
   one does. 0 casts from a point: hard all the way out, which NRD blurs
   evenly and DLSS keeps. `PT LIGHTSIZE n` changes it for the session.
+- `MaxAnisotropy`: the texture filter's anisotropy, as the other devices call
+  it: how many samples it may take along a surface seen at a slant - a floor
+  down a corridor - to keep it sharp without sparkling. 16 by default; 4 and 8
+  are cheaper, and 0 or 1 filters trilinearly. `PT ANISOTROPY n` changes it
+  for the session.
 - `GlossBounces`: how far a smooth surface's reflection is traced. 1 lights what
   it shows by the lights and the zone's ambient; more carries the reflection on
   bouncing, at a cost; 0 traces none and keeps only the highlights.
@@ -443,6 +467,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   it. Says whether it is running, and why not when NRD stands in.
 - `PT MESHLIGHT`: meshes lit as the engine lights them, or as flat surfaces are.
 - `PT DETAIL`: detail textures on or off, as the game's setting.
+- `PT MIPS`: mipmaps off and on, to compare: off, every texture is read at
+  its full size however far away it is.
+- `PT ANISOTROPY n`: the texture filter's anisotropy, as `MaxAnisotropy`.
 - `PT WIDESCREEN`: the widescreen field of view on or off.
 - `PT LIGHTSIZE n`: the size lights cast shadows from, as `LightSize`.
 - `PT PINNEDUI 16:9 | 4:3 | OFF`: the UI kept to a box of that shape in the

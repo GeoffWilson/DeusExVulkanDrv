@@ -252,6 +252,45 @@ void TraceRenderer::ResetScene()
 	DenoiseRestart = true;
 }
 
+// The texture filter's anisotropy, the device's MaxAnisotropy: how many
+// samples it may take along a footprint that is long one way and short the
+// other - a floor seen at a glance - which the trace hands over as its two
+// axes (footprintAxes in Shaders.cpp). A sampler cannot be changed, so a new
+// one goes into every slot of the array, once the frames in flight are done
+// with the old.
+void TraceRenderer::SetAnisotropy(uint32_t samples)
+{
+	const float limit = Device->PhysicalDevice.Properties.Properties.limits.maxSamplerAnisotropy;
+	samples = std::min(samples, (uint32_t)std::max(limit, 1.0f));
+	if (samples <= 1)
+		samples = 1;
+	if (samples == SceneAnisotropy)
+		return;
+	Context->WaitForGpu();
+	SceneAnisotropy = samples;
+
+	SamplerBuilder builder;
+	builder.MinFilter(VK_FILTER_LINEAR)
+		.MagFilter(VK_FILTER_LINEAR)
+		.AddressMode(VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT)
+		.DebugName("PathTracerSceneSampler");
+	if (samples > 1)
+		builder.Anisotropy((float)samples);
+	SceneSampler = builder.Create(Device);
+
+	WriteDescriptors writes;
+	for (int i = 0; i < MaxTextures; i++)
+	{
+		VulkanImageView* view = Slots[i].View ? Slots[i].View.get() : WhiteView.get();
+		writes.AddCombinedImageSampler(DescriptorSet.get(), 6, i, view, SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+	writes.Execute(Device);
+	if (samples > 1)
+		debugf("PathTracer texture filter: %ux anisotropic", samples);
+	else
+		debugf("PathTracer texture filter: trilinear");
+}
+
 void TraceRenderer::BindWhite(uint32_t index)
 {
 	WriteDescriptors()
@@ -262,7 +301,11 @@ void TraceRenderer::BindWhite(uint32_t index)
 // A new level's textures, or one first seen mid-level. It rewrites the
 // materials and a descriptor the frames in flight read, so it waits for them:
 // a stall, but not a per frame one.
-void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material)
+// A texture with its mips as the engine stores them, levels of them end to
+// end in pixels: sampled at the level the width of a ray's footprint calls
+// for, as the other devices sample theirs, rather than always at the top -
+// which is what made distant floors and walls sparkle.
+void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, uint32_t levels, const uint32_t* pixels, const vec4& material)
 {
 	if (index >= (uint32_t)MaxTextures)
 		return;
@@ -283,15 +326,17 @@ void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, 
 
 	slot.Width = width;
 	slot.Height = height;
+	slot.Levels = std::max(levels, 1u);
+	slot.Material = material;
 	slot.Image = ImageBuilder()
 		.Format(VK_FORMAT_R8G8B8A8_UNORM)
-		.Size(width, height)
+		.Size(width, height, (int)slot.Levels)
 		.Usage(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
 		.DebugName("PathTracerSceneTexture")
 		.Create(Device);
 	slot.View = ImageViewBuilder().Image(slot.Image.get(), VK_FORMAT_R8G8B8A8_UNORM).DebugName("PathTracerSceneTextureView").Create(Device);
 
-	const size_t bytes = (size_t)width * height * 4;
+	const size_t bytes = TraceProtocol::MipChainPixels(width, height, slot.Levels) * 4;
 	auto staging = BufferBuilder()
 		.Size(bytes)
 		.Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY)
@@ -302,18 +347,27 @@ void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, 
 
 	VulkanImage* image = slot.Image.get();
 	VulkanBuffer* src = staging.get();
-	Context->ExecuteImmediate([image, src, width, height](VulkanCommandBuffer* cmd)
+	const int levelCount = (int)slot.Levels;
+	Context->ExecuteImmediate([image, src, width, height, levelCount](VulkanCommandBuffer* cmd)
 	{
 		PipelineBarrier()
-			.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
+			.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, levelCount)
 			.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-		VkBufferImageCopy region = {};
-		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		region.imageSubresource.layerCount = 1;
-		region.imageExtent = { width, height, 1 };
-		cmd->copyBufferToImage(src->buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		VkBufferImageCopy regions[16] = {};
+		VkDeviceSize offset = 0;
+		for (int i = 0; i < levelCount; i++)
+		{
+			const uint32_t w = std::max(width >> i, 1u), h = std::max(height >> i, 1u);
+			regions[i].bufferOffset = offset;
+			regions[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			regions[i].imageSubresource.mipLevel = (uint32_t)i;
+			regions[i].imageSubresource.layerCount = 1;
+			regions[i].imageExtent = { w, h, 1 };
+			offset += (VkDeviceSize)w * h * 4;
+		}
+		cmd->copyBufferToImage(src->buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levelCount, regions);
 		PipelineBarrier()
-			.AddImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+			.AddImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, levelCount)
 			.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	});
 
@@ -326,6 +380,16 @@ void TraceRenderer::SetTexturePixels(uint32_t index, uint32_t width, uint32_t he
 {
 	if (index >= (uint32_t)MaxTextures || !Slots[index].Image || Slots[index].Width != width || Slots[index].Height != height)
 		return;
+	// A texture sent with its mips that has since started to change - a
+	// script can give one an animation - has only its top level sent from
+	// then on, and mips left as they were would show its first frame from a
+	// distance. It becomes a single level instead, as a changing texture is.
+	if (Slots[index].Levels > 1)
+	{
+		const vec4 material = Slots[index].Material;
+		SetTexture(index, width, height, 1, pixels, material);
+		return;
+	}
 
 	const size_t bytes = (size_t)width * height * 4;
 	PendingPixels pending;
@@ -754,8 +818,15 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	PushConstants.Disable = frame.DisableBits | ((frame.ViewMode || denoising) ? 64u : 0u) | (frame.Materials ? 0u : 128u) | (useRr ? 256u : 0u);
 	PushConstants.Counts[0] = frame.Frame;
 	PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
+	// The top byte, signed, in sixteenths: how many mip levels sharper to
+	// sample than the traced pixels' size calls for, when they are fewer than
+	// the output's - Ray Reconstruction rebuilds the finer detail, and NVIDIA
+	// asks for textures at the output's resolution, log2(render / output).
+	const float mipBias = (OutputHeight > 0 && TraceHeight > 0 && TraceHeight < OutputHeight)
+		? std::log2((float)TraceHeight / (float)OutputHeight) : 0.0f;
+	const int mipBiasSteps = std::max(-128, std::min(127, (int)std::lround(mipBias * 16.0f)));
 	PushConstants.Counts[2] = std::min(std::max(frame.Bounces, 1u), 255u) | (std::min(frame.GlossBounces, 255u) << 8) |
-		(std::min(frame.LightSize, 255u) << 16);
+		(std::min(frame.LightSize, 255u) << 16) | ((uint32_t)(uint8_t)(int8_t)mipBiasSteps << 24);
 	PushConstants.Counts[3] = frame.AccumulatedFrames;
 	PushConstants.TextureCount = CanSampleTextures ? (uint32_t)BoundTextures : 0u;
 	PushConstants.MaxSamples = std::max(frame.MaxSamples, 1u);

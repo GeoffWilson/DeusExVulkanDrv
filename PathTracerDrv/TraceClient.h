@@ -35,7 +35,7 @@ public:
 	void Geometry(uint32_t index, const SceneGeometry& geometry);
 	void Instances(const std::vector<SceneInstance>& instances, int staticGeometries);
 	void Lights(const std::vector<SceneLight>& lights, const std::vector<SceneLight>& fogLights);
-	void Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated);
+	void Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels = 1);
 	void TexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels);
 
 	// Sends what is queued and a request to trace it, and waits until the

@@ -50,7 +50,11 @@ public:
 	// engine. Masked says whether palette entry zero is a hole: the engine
 	// masks by the polygon's flags as well as the texture's, so one texture can
 	// be needed both ways.
-	static bool ScenePixels(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height);
+	//
+	// With its mips as the package stores them - the levels the other
+	// devices upload - end to end after it, top first; levels says how many,
+	// stopping at the first that is missing or is not half the one above.
+	static bool SceneMips(UTexture* texture, bool masked, std::vector<uint32_t>& pixels, int& width, int& height, int& levels);
 
 	// Whether a texture changes by itself - fire, water, a computer screen, the
 	// laser sight's dot, or a chain of frames cycled through.
