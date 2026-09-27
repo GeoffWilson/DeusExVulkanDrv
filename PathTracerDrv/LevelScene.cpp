@@ -168,6 +168,7 @@ void LevelScene::Clear()
 	Instances.clear();
 	BrushGeometry.clear();
 	MeshGeometry.clear();
+	MeshTriangleCache.clear();
 	AverageCache.clear();
 	ActorPoseKeys.clear();
 	SpriteGeometry.clear();
@@ -1435,6 +1436,80 @@ static float KindFromStyle(BYTE style)
 	}
 }
 
+// A mesh's triangles, gathered from its faces and wedges the first time it is
+// posed: the same for every pose, where gathering them again cost every
+// character every frame. Deus Ex's characters are ULodMesh, which keeps its
+// geometry in Faces and Wedges rather than in the Tris it inherits.
+const LevelScene::MeshTriangles& LevelScene::TrianglesOf(UMesh* mesh)
+{
+	auto found = MeshTriangleCache.find(mesh);
+	if (found != MeshTriangleCache.end())
+		return found->second;
+
+	MeshTriangles& gathered = MeshTriangleCache[mesh];
+	ULodMesh* lod = Cast<ULodMesh>(mesh);
+	const bool useLod = lod && lod->Faces.Num() > 0;
+	const bool remap = useLod && lod->RemapAnimVerts.Num() > 0;
+	if (useLod)
+	{
+		gathered.Triangles.reserve(lod->Faces.Num());
+		for (INT i = 0; i < lod->Faces.Num(); i++)
+		{
+			const FMeshFace& face = lod->Faces(i);
+
+			MeshTriangle tri = {};
+			tri.PolyFlags = 0;
+			tri.TextureIndex = -1;
+			if (face.MaterialIndex < lod->Materials.Num())
+			{
+				const FMeshMaterial& material = lod->Materials(face.MaterialIndex);
+				tri.PolyFlags = material.PolyFlags;
+				tri.TextureIndex = material.TextureIndex;
+			}
+
+			bool ok = true;
+			for (int v = 0; v < 3; v++)
+			{
+				const _WORD iWedge = face.iWedge[v];
+				if (iWedge >= lod->Wedges.Num()) { ok = false; break; }
+				tri.Tex[v] = lod->Wedges(iWedge).TexUV;
+				INT iVertex = lod->Wedges(iWedge).iVertex;
+				INT keyVertex = iVertex;
+				if (remap)
+				{
+					if (iVertex >= lod->RemapAnimVerts.Num()) { ok = false; break; }
+					keyVertex = lod->RemapAnimVerts(iVertex);
+				}
+				tri.Vertex[v] = iVertex;
+				tri.KeyVertex[v] = keyVertex;
+				gathered.VertexCount = Max(gathered.VertexCount, iVertex + 1);
+			}
+			if (ok)
+				gathered.Triangles.push_back(tri);
+		}
+	}
+	else
+	{
+		gathered.Triangles.reserve(mesh->Tris.Num());
+		for (INT i = 0; i < mesh->Tris.Num(); i++)
+		{
+			const FMeshTri& src = mesh->Tris(i);
+			MeshTriangle tri = {};
+			for (int v = 0; v < 3; v++)
+			{
+				tri.Vertex[v] = src.iVertex[v];
+				tri.KeyVertex[v] = src.iVertex[v];
+				tri.Tex[v] = src.Tex[v];
+				gathered.VertexCount = Max(gathered.VertexCount, (INT)src.iVertex[v] + 1);
+			}
+			tri.PolyFlags = src.PolyFlags;
+			tri.TextureIndex = src.TextureIndex;
+			gathered.Triangles.push_back(tri);
+		}
+	}
+	return gathered;
+}
+
 int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], int reuseIndex, float styleKind, AActor* owner, const FCoords* toLocal, AActor* envSource)
 {
 	// The skin set is part of the identity. Hashed rather than compared, so two
@@ -1519,7 +1594,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	// it take world space back into the instance's own, so the points land in
 	// the same space the keyframe path produces and the instance transform is
 	// untouched.
-	std::vector<FVector> enginePoints;
+	std::vector<FVector>& enginePoints = PosePoints;
 	const bool enginePose = owner && toLocal && useLod && lod->ModelVerts > 0;
 	if (enginePose)
 	{
@@ -1556,90 +1631,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	geometry.Attributes.clear();
 	geometry.HasMasked = false;
 
-	struct SourceTriangle
-	{
-		INT iVertex[3];
-		// The same corners as indices into the stored keyframes, which for a
-		// remapped mesh are not the ones the engine's pose is ordered by.
-		INT keyVertex[3];
-		// UE1 stores mesh texture coordinates as a byte per axis spanning the
-		// whole texture, so they divide out to 0..1 rather than needing the
-		// texture's size the way a BSP surface does.
-		FMeshUV Tex[3];
-		DWORD PolyFlags;
-		INT TextureIndex;
-		// The vertex each corner is, as the engine counts them when it
-		// smooths the normals: what the faces sharing a vertex share.
-		INT smoothVertex[3];
-	};
-
-	std::vector<SourceTriangle> triangles;
-	INT smoothVertexCount = 0;
-	if (useLod)
-	{
-		triangles.reserve(lod->Faces.Num());
-		for (INT i = 0; i < lod->Faces.Num(); i++)
-		{
-			const FMeshFace& face = lod->Faces(i);
-
-			SourceTriangle tri = {};
-			tri.PolyFlags = 0;
-			tri.TextureIndex = -1;
-			if (face.MaterialIndex < lod->Materials.Num())
-			{
-				const FMeshMaterial& material = lod->Materials(face.MaterialIndex);
-				tri.PolyFlags = material.PolyFlags;
-				tri.TextureIndex = material.TextureIndex;
-			}
-
-			bool ok = true;
-			for (int v = 0; v < 3; v++)
-			{
-				const _WORD iWedge = face.iWedge[v];
-				if (iWedge >= lod->Wedges.Num()) { ok = false; break; }
-				tri.Tex[v] = lod->Wedges(iWedge).TexUV;
-				INT iVertex = lod->Wedges(iWedge).iVertex;
-				INT keyVertex = iVertex;
-				if (remap)
-				{
-					if (iVertex >= lod->RemapAnimVerts.Num()) { ok = false; break; }
-					keyVertex = lod->RemapAnimVerts(iVertex);
-				}
-				tri.iVertex[v] = enginePose ? iVertex : keyVertex;
-				tri.keyVertex[v] = keyVertex;
-				tri.smoothVertex[v] = iVertex;
-				smoothVertexCount = Max(smoothVertexCount, iVertex + 1);
-			}
-			if (ok)
-				triangles.push_back(tri);
-		}
-	}
-	else
-	{
-		triangles.reserve(mesh->Tris.Num());
-		for (INT i = 0; i < mesh->Tris.Num(); i++)
-		{
-			const FMeshTri& src = mesh->Tris(i);
-			SourceTriangle tri = {};
-			tri.iVertex[0] = src.iVertex[0];
-			tri.iVertex[1] = src.iVertex[1];
-			tri.iVertex[2] = src.iVertex[2];
-			tri.keyVertex[0] = src.iVertex[0];
-			tri.keyVertex[1] = src.iVertex[1];
-			tri.keyVertex[2] = src.iVertex[2];
-			for (int v = 0; v < 3; v++)
-			{
-				tri.smoothVertex[v] = src.iVertex[v];
-				smoothVertexCount = Max(smoothVertexCount, (INT)src.iVertex[v] + 1);
-			}
-			tri.Tex[0] = src.Tex[0];
-			tri.Tex[1] = src.Tex[1];
-			tri.Tex[2] = src.Tex[2];
-			tri.PolyFlags = src.PolyFlags;
-			tri.TextureIndex = src.TextureIndex;
-			triangles.push_back(tri);
-		}
-	}
+	const MeshTriangles& gathered = TrianglesOf(mesh);
+	const std::vector<MeshTriangle>& triangles = gathered.Triangles;
+	const INT smoothVertexCount = gathered.VertexCount;
 
 	// The mesh's own import rotation. Deus Ex's characters are modelled facing a
 	// different axis and carry a yaw here to correct it, which is why every NPC
@@ -1663,19 +1657,14 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	// mesh at those, normalised, blending the light across each face: that is
 	// what makes a security camera's eight flat sides look round, where
 	// shading each face by its own normal cut it from a block.
-	struct PosedTriangle
-	{
-		vec3 Corners[3];
-		vec3 Normal;        // unit
-		bool Ok = false;    // posed, and with an area to have a normal
-		bool Blended = false;
-	};
-	std::vector<PosedTriangle> posedTriangles(triangles.size());
-	std::vector<vec3> vertexNormals(smoothVertexCount, vec3(0.0f));
+	std::vector<PosedTriangle>& posedTriangles = PosedTriangles;
+	std::vector<vec3>& vertexNormals = VertexNormals;
+	posedTriangles.assign(triangles.size(), PosedTriangle());
+	vertexNormals.assign(smoothVertexCount, vec3(0.0f));
 
 	for (size_t t = 0; t < triangles.size(); t++)
 	{
-		const SourceTriangle& tri = triangles[t];
+		const MeshTriangle& tri = triangles[t];
 
 		FVector p[3];
 		bool ok = true;
@@ -1685,7 +1674,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			FVector posed;
 			if (enginePose)
 			{
-				const size_t index = (size_t)lod->SpecialVerts + (size_t)tri.iVertex[v];
+				const size_t index = (size_t)lod->SpecialVerts + (size_t)tri.Vertex[v];
 				if (index >= enginePoints.size()) { ok = false; break; }
 				posed = enginePoints[index];
 				if (!blendActive)
@@ -1695,8 +1684,8 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 				}
 			}
 
-			const INT index = base + tri.keyVertex[v];
-			const INT indexB = baseB + tri.keyVertex[v];
+			const INT index = base + tri.KeyVertex[v];
+			const INT indexB = baseB + tri.KeyVertex[v];
 			if (index < 0 || index >= mesh->Verts.Num()) { ok = false; break; }
 			if (indexB < 0 || indexB >= mesh->Verts.Num()) { ok = false; break; }
 			// The mesh's own scale and origin are part of its definition rather
@@ -1744,21 +1733,30 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		posedTri.Ok = true;
 		posedTri.Blended = blended;
 		for (int v = 0; v < 3; v++)
-			vertexNormals[tri.smoothVertex[v]] += posedTri.Normal;
+			vertexNormals[tri.Vertex[v]] += posedTri.Normal;
 	}
 
-	for (size_t t = 0; t < triangles.size(); t++)
+	// What each material comes to - its skin, its slot, its colour and kind -
+	// is the same for every triangle using it, and a mesh has a handful: each
+	// is worked out the first time a triangle uses it rather than for every
+	// triangle, where two table lookups a triangle were a good part of what
+	// posing a character cost.
+	struct MaterialResult
 	{
-		const SourceTriangle& tri = triangles[t];
-		const PosedTriangle& posedTri = posedTriangles[t];
-		if ((tri.PolyFlags & PF_Invisible) || !posedTri.Ok)
-			continue;
-
-		const vec3 v0 = posedTri.Corners[0];
-		const vec3 v1 = posedTri.Corners[1];
-		const vec3 v2 = posedTri.Corners[2];
-		const vec3 normal = posedTri.Normal;
-		const bool blended = posedTri.Blended;
+		INT TextureIndex;
+		DWORD PolyFlags;
+		bool Environment, Animates, Unlit;
+		vec3 Albedo;
+		int Texture;
+		float Kind;
+	};
+	static const int MaxMaterials = 32;
+	MaterialResult materials[MaxMaterials];
+	int materialCount = 0;
+	auto resolve = [&](const MeshTriangle& tri, MaterialResult& m)
+	{
+		m.TextureIndex = tri.TextureIndex;
+		m.PolyFlags = tri.PolyFlags;
 
 		// The actor's own skin for this material first: Deus Ex's characters
 		// carry no textures on the mesh at all, so without this every person in
@@ -1772,34 +1770,19 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		// Environment mapped: the reflected picture replaces the skin, looked
 		// up by reflection direction in the shader rather than by the wedge's
 		// coordinates.
-		const bool environment = envMap && ((tri.PolyFlags & PF_Environment) || enviroAll);
-		if (environment)
+		m.Environment = envMap && ((tri.PolyFlags & PF_Environment) || enviroAll);
+		if (m.Environment)
 			skin = envMap;
 
-		const vec3 albedo = AverageColour(skin, vec3(0.6f, 0.6f, 0.6f));
-
-		bool unlit = actorUnlit;
-		if (tri.PolyFlags & PF_Unlit)
-			unlit = true;
-
-		TriangleAttributes attr;
-		attr.Normal = vec4(normal.x, normal.y, normal.z, environment ? 1.0f : 0.0f);
-		// w says the surface keeps no history: a texture that animates, or a
-		// part being moved by a blend channel.
-		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, (blended || TextureAnimates(skin)) ? 1.0f : 0.0f);
-		// w marks the surface as self lit. The colour it emits is whatever it
-		// turns out to be once sampled, so it cannot be decided here: doing so
-		// is what made unlit masked surfaces glow the key colour.
-		// An unlit actor's whole mesh is drawn at its ScaleGlow, which its
-		// instance carries: 1.25 says so. A polygon flagged unlit on a lit
-		// actor, like the Dragon's Tooth blade, is drawn at full brightness.
-		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? (actorUnlit ? 1.25f : 1.0f) : 0.0f);
+		m.Albedo = AverageColour(skin, vec3(0.6f, 0.6f, 0.6f));
+		m.Animates = TextureAnimates(skin);
+		m.Unlit = actorUnlit || (tri.PolyFlags & PF_Unlit) != 0;
 
 		// Masked by the polygon as well as by the texture, as the engine does:
 		// a character with no glasses has a masked glasses slot showing a
 		// texture that is nothing but palette entry zero.
 		const bool masked = skin && ((skin->PolyFlags & PF_Masked) != 0 || (tri.PolyFlags & PF_Masked) != 0);
-		const int textureIndex = TextureFor(skin, masked, envSource ? envSource : owner);
+		m.Texture = TextureFor(skin, masked, envSource ? envSource : owner);
 		const bool translucent = (tri.PolyFlags & PF_Translucent) != 0;
 		const bool modulated = (tri.PolyFlags & PF_Modulated) != 0;
 		const bool mirrored = (tri.PolyFlags & PF_Mirrored) != 0;
@@ -1815,12 +1798,52 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			kind = styleKind;
 		else if (kind == 0.0f)
 			kind = styleKind;
-		if (kind != 0.0f && kind != 3.0f)
+		m.Kind = kind;
+	};
+
+	for (size_t t = 0; t < triangles.size(); t++)
+	{
+		const MeshTriangle& tri = triangles[t];
+		const PosedTriangle& posedTri = posedTriangles[t];
+		if ((tri.PolyFlags & PF_Invisible) || !posedTri.Ok)
+			continue;
+
+		const vec3 v0 = posedTri.Corners[0];
+		const vec3 v1 = posedTri.Corners[1];
+		const vec3 v2 = posedTri.Corners[2];
+		const vec3 normal = posedTri.Normal;
+		const bool blended = posedTri.Blended;
+
+		const MaterialResult* material = nullptr;
+		for (int m = 0; m < materialCount && !material; m++)
+			if (materials[m].TextureIndex == tri.TextureIndex && materials[m].PolyFlags == tri.PolyFlags)
+				material = &materials[m];
+		MaterialResult uncached;
+		if (!material)
+		{
+			MaterialResult& slot = materialCount < MaxMaterials ? materials[materialCount++] : uncached;
+			resolve(tri, slot);
+			material = &slot;
+		}
+		if (material->Kind != 0.0f && material->Kind != 3.0f)
 			geometry.HasMasked = true;
+
+		TriangleAttributes attr;
+		attr.Normal = vec4(normal.x, normal.y, normal.z, material->Environment ? 1.0f : 0.0f);
+		// w says the surface keeps no history: a texture that animates, or a
+		// part being moved by a blend channel.
+		attr.Albedo = vec4(material->Albedo.x, material->Albedo.y, material->Albedo.z, (blended || material->Animates) ? 1.0f : 0.0f);
+		// w marks the surface as self lit. The colour it emits is whatever it
+		// turns out to be once sampled, so it cannot be decided here: doing so
+		// is what made unlit masked surfaces glow the key colour.
+		// An unlit actor's whole mesh is drawn at its ScaleGlow, which its
+		// instance carries: 1.25 says so. A polygon flagged unlit on a lit
+		// actor, like the Dragon's Tooth blade, is drawn at full brightness.
+		attr.Emission = vec4(0.0f, 0.0f, 0.0f, material->Unlit ? (actorUnlit ? 1.25f : 1.0f) : 0.0f);
 		attr.UV01 = vec4(tri.Tex[0].U / 255.0f, tri.Tex[0].V / 255.0f,
 		                 tri.Tex[1].U / 255.0f, tri.Tex[1].V / 255.0f);
 		attr.UV2Tex = vec4(tri.Tex[2].U / 255.0f, tri.Tex[2].V / 255.0f,
-		                   (float)textureIndex, kind);
+		                   (float)material->Texture, material->Kind);
 
 		// A mesh is instanced into whatever room the actor is standing in, so
 		// its ambient comes from the instance rather than from here.
@@ -1832,7 +1855,7 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 		vec3 cornerNormals[3];
 		for (int v = 0; v < 3; v++)
 		{
-			const vec3 sum = vertexNormals[tri.smoothVertex[v]];
+			const vec3 sum = vertexNormals[tri.Vertex[v]];
 			const float sum2 = dot(sum, sum);
 			cornerNormals[v] = sum2 > 1e-8f ? sum * (1.0f / std::sqrt(sum2)) : normal;
 			if (dot(cornerNormals[v], normal) <= 0.0f)
@@ -2185,12 +2208,21 @@ void LevelScene::CollectDynamic(ULevel* level)
 	if (!level)
 		return;
 
+	DWORD lapStart = appCycles();
+	auto lap = [&](int stage)
+	{
+		const DWORD now = appCycles();
+		CollectStageMs[stage] += (DWORD)(now - lapStart) * GSecondsPerCycle * 1000.0;
+		lapStart = now;
+	};
+
 	const INT actorCount = level->Actors.Num();
 	for (INT i = 0; i < actorCount; i++)
 	{
 		AActor* actor = level->Actors(i);
 		if (!actor)
 			continue;
+		lapStart = appCycles();
 
 		// Before the visibility rules: a light still lights the room when the
 		// actor carrying it is not drawn, which is exactly what the player's
@@ -2198,6 +2230,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 		AddLight(actor);
 		if (actor->LightType != LT_None && actor->LightBrightness)
 			LightPositions.push_back(actor->Location);
+		lap(0);
 
 		if (actor->bHidden)
 		{
@@ -2234,16 +2267,23 @@ void LevelScene::CollectDynamic(ULevel* level)
 		// was, pasted over the picture with nothing in front of it.
 		if (actor->RenderInterface)
 			PlaceIterated(actor, mask, counts);
+		lap(4);
 
 		PlaceActor(actor, mask, false, counts);
+		lap((actor->DrawType == DT_Mesh && actor->Mesh && actor->Mesh->AnimFrames > 1) ? 1 : 2);
 		if (actor->IsA(APawn::StaticClass()) && PlaceHeldItem((APawn*)actor, mask))
 			counts.Held++;
+		lap(3);
 	}
 
+	lapStart = appCycles();
 	UnshadowFittings();
+	lap(5);
 	CollectDecals(level);
+	lap(6);
 	const size_t beforeViewModel = Instances.size();
 	AddViewModel();
+	lap(7);
 	// No weapon this frame: the next one drawn has no previous placement.
 	if (Instances.size() == beforeViewModel)
 		HaveViewModelTransform = false;

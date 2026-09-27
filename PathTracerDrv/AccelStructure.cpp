@@ -2,6 +2,7 @@
 #include "AccelStructure.h"
 #include "GpuContext.h"
 #include "FrameUploads.h"
+#include <chrono>
 
 // The driver strides through the instance array by its own idea of this
 // struct's size. This package compiles the engine's 4 byte packed headers
@@ -40,6 +41,8 @@ void AccelStructure::Reset()
 	LightCapacity = 0;
 	attributesChanged = false;
 	LoggedInstances = false;
+	LastGridInputs.clear();
+	LastCylinders.clear();
 }
 
 // A shape that never changes: its vertices uploaded with the frame, and its
@@ -213,6 +216,7 @@ void AccelStructure::SyncGeometry(const SceneData& scene, FrameUploads& uploads)
 void AccelStructure::WriteLights(const SceneData& scene, FrameUploads& uploads)
 {
 	guard(AccelStructure::WriteLights);
+	const auto lightsStart = std::chrono::steady_clock::now();
 
 	Lights = (int)scene.Lights.size();
 	const size_t wanted = std::max<size_t>(scene.Lights.size() + scene.FogLights.size(), 1);
@@ -245,6 +249,7 @@ void AccelStructure::WriteLights(const SceneData& scene, FrameUploads& uploads)
 		memcpy(staged + scene.Lights.size(), scene.FogLights.data(), scene.FogLights.size() * sizeof(SceneLight));
 
 	WriteLightGrid(scene, uploads);
+	LightsMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lightsStart).count();
 
 	unguard;
 }
@@ -267,6 +272,27 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 
 	const size_t lightCount = scene.Lights.size();
 	auto reachOf = [&](size_t i) { return std::abs(scene.Lights[i].PositionRadius.w); };
+
+	// What the grid is made from: where each light is, how far it reaches and
+	// whether it is a cylinder, in the list's order, and how many fog lights
+	// follow. Most of a level's lights never move, so most frames it is the
+	// same as the last, and the buffer already holds it.
+	GridInputs.resize(lightCount + 1);
+	Cylinders.resize(lightCount);
+	for (size_t i = 0; i < lightCount; i++)
+	{
+		GridInputs[i] = scene.Lights[i].PositionRadius;
+		// Worked out once a light: the test below runs for every cell a
+		// light's box covers, twice, and an fmod there - a slow library
+		// call - cost 6.5 ms a frame in the Hong Kong market.
+		Cylinders[i] = ((int)scene.Lights[i].Flags.y & 1) != 0;
+	}
+	GridInputs[lightCount] = vec4((float)scene.FogLights.size(), 0.0f, 0.0f, 0.0f);
+	if (LightGridBuffer && GridInputs.size() == LastGridInputs.size() && Cylinders == LastCylinders &&
+		memcmp(GridInputs.data(), LastGridInputs.data(), GridInputs.size() * sizeof(vec4)) == 0)
+		return;
+	LastGridInputs.swap(GridInputs);
+	LastCylinders = Cylinders;
 
 	// The box around every light's reach.
 	vec3 lo(0.0f), hi(0.0f);
@@ -306,7 +332,7 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 	{
 		const vec4& p = scene.Lights[i].PositionRadius;
 		const float r = reachOf(i);
-		const bool cylinder = std::fmod(scene.Lights[i].Flags.y, 2.0f) > 0.5f;
+		const bool cylinder = Cylinders[i] != 0;
 		float d2 = 0.0f;
 		const float centre[3] = { p.x, p.y, p.z };
 		const int cell[3] = { x, y, z };
@@ -326,7 +352,7 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 	{
 		const vec4& p = scene.Lights[i].PositionRadius;
 		const float r = reachOf(i);
-		const bool cylinder = std::fmod(scene.Lights[i].Flags.y, 2.0f) > 0.5f;
+		const bool cylinder = Cylinders[i] != 0;
 		int x0, x1, y0, y1, z0, z1;
 		cellRange(p.x, r, 0, x0, x1);
 		cellRange(p.y, r, 1, y0, y1);

@@ -467,7 +467,10 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   build, the trace, the denoiser and the pass that puts the picture back
   together, from timestamps, and the frame rate and 1% low all that came to.
   Written to `PathTracerTimings.log` as well as the game's log, which loses its
-  last few lines when the game closes under wine.
+  last few lines when the game closes under wine. Gathering the scene is
+  broken down there by what it spent the time on (lights, animated meshes,
+  other actors, held weapons, particles, fittings, decals, the view model),
+  and the helper's own time by stage in `PathTracerHelper.log`.
 - `DebugMode`: 1 shows only what moves, 2 shows plain albedo with no lighting.
 - `Materials`: surfaces made of something, as above; off by default until the
   materials have been checked by hand. Off, everything is matte and the frame

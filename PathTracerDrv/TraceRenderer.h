@@ -98,6 +98,11 @@ public:
 	const char* DlssStatus() const;
 	bool GpuTimed = false;
 	float GpuMs[4] = {};    // build, trace, denoise, composite
+	// The host's time recording frames, by stage, summed until the helper
+	// logs it: setup, shapes and placements, lights and their grid, motion,
+	// uploads, structure builds, descriptors, trace, denoiser, insets.
+	static const int RecordStages = 10;
+	double RecordStageMs[RecordStages] = {};
 
 private:
 	void CreateTracePipeline();

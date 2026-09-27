@@ -719,6 +719,13 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	using namespace TraceProtocol;
 	if (frame.Width == 0 || frame.Height == 0)
 		return false;
+	auto lapStart = std::chrono::steady_clock::now();
+	auto lap = [&](int stage)
+	{
+		const auto t = std::chrono::steady_clock::now();
+		RecordStageMs[stage] += std::chrono::duration<double, std::milli>(t - lapStart).count();
+		lapStart = t;
+	};
 
 	// Which denoiser. Ray Reconstruction is started the first time it is
 	// asked for, and where it cannot run - no NVIDIA GPU, an old driver, wine
@@ -771,8 +778,14 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	FrameUploads& uploads = *Uploads[slot];
 	uploads.Begin();
 	Accel->HideStatic = (frame.DebugMode == 1);
+	lap(0);
+	const double lightsBefore = Accel->LightsMs;
 	Accel->Update(Scene, uploads);
+	lap(1);
+	RecordStageMs[1] -= Accel->LightsMs - lightsBefore;
+	RecordStageMs[2] += Accel->LightsMs - lightsBefore;
 	WriteMotion(frame.PreviousCamera, jitter, uploads);
+	lap(3);
 	if (Accel->AttributesChanged())
 	{
 		Accel->ClearAttributesChanged();
@@ -817,14 +830,17 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	// Textures that generate themselves get their new frame before the trace
 	// reads them.
 	RecordTexturePixels(commands, uploads);
+	lap(4);
 
 	// New shapes and changed poses, then the top level structure.
 	Accel->Record(commands, uploads);
 	if (!Accel->IsReady())
 		return false;
 	stamp(1);
+	lap(5);
 
 	UpdateDescriptors();
+	lap(6);
 
 	PushConstants.CameraOrigin = frame.Camera[0];
 	PushConstants.CameraRight = frame.Camera[1];
@@ -859,6 +875,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
 	commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
 	stamp(2);
+	lap(7);
 
 	// Denoised: NRD over the trace's split lighting, then the picture rebuilt
 	// from it over the one the trace wrote.
@@ -950,8 +967,10 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		stamp(3);
 		LastDenoiser = DenoiseOff;
 	}
+	lap(8);
 	RecordInsets(commands, frame);
 	stamp(4);
+	lap(9);
 	TimestampsPending[slot] = timing;
 	return true;
 }

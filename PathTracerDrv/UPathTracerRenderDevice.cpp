@@ -2117,6 +2117,10 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 					Timings.Wait / n, (Timings.Total - Timings.Limit) / n, Timings.Limit / n,
 					(int)Scene.Instances.size(), (int)Scene.Textures.size(), Scene.MeshBuilds);
 				WriteTimingLine(line);
+				const double* c = Scene.CollectStageMs;
+				snprintf(line, sizeof(line), "PathTracer collect ms/frame: lights %.2f animated %.2f other actors %.2f held weapons %.2f particles %.2f fittings %.2f decals %.2f view model %.2f",
+					c[0] / n, c[1] / n, c[2] / n, c[3] / n, c[4] / n, c[5] / n, c[6] / n, c[7] / n);
+				WriteTimingLine(line);
 				if (!FrameIntervals.empty())
 				{
 					// The 1% low is the frame rate the slowest one frame in a
@@ -2147,6 +2151,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			}
 			const int logged = Timings.Logged;
 			Timings = FrameTimings();
+			for (double& ms : Scene.CollectStageMs)
+				ms = 0.0;
 			FrameIntervals.clear();
 			Timings.Logged = logged;
 		}

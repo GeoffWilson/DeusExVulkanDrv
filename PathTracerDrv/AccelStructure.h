@@ -25,6 +25,8 @@ class VulkanAccelerationStructure;
 class AccelStructure
 {
 public:
+	// The host's time writing the lights and their grid, summed until read.
+	double LightsMs = 0.0;
 	AccelStructure(GpuContext* renderer);
 	~AccelStructure();
 
@@ -119,11 +121,14 @@ private:
 	size_t LightCapacity = 0;
 
 	// Which lights can reach which part of the level, so a shaded point only
-	// considers those. Rebuilt with the light list every frame.
+	// considers those. Built again when a light moves, changes its reach or
+	// comes or goes; GridInputs is what it was last built from.
 	void WriteLightGrid(const SceneData& scene, FrameUploads& uploads);
 	std::unique_ptr<VulkanBuffer> LightGridBuffer;
 	size_t LightGridCapacity = 0;
 	std::vector<uint32_t> LightGrid;
+	std::vector<vec4> GridInputs, LastGridInputs;
+	std::vector<uint8_t> Cylinders, LastCylinders;
 	uint32_t LoggedGridCells = 0;
 
 	// The engine's shadow masks (SceneData's Lightmaps), written when a level

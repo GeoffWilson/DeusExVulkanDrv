@@ -109,6 +109,14 @@ private:
 	double BatchWaitMs = 0.0;
 	uint32_t BatchStalls = 0;
 
+	// The host's time on each frame by stage, logged every StageFrames with
+	// LogTimings, a hundred times at most: the slot wait, the command buffer,
+	// the recording, ending it, the handoff, the submission and the status
+	// written back.
+	double FrameStageMs[7] = {};
+	int StagedFrames = 0, StagesLogged = 0;
+	static const int StageFrames = 300;
+
 	// Ready, signalled once a frame is in the shared image; Released, signalled
 	// by the device once it has copied the frame out. Every Ready is answered
 	// by one Released, which the next frame waits for before writing.
@@ -403,15 +411,26 @@ void Helper::WaitForSlot(int slot)
 // device, not the frame's uploads and trace.
 void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 {
+	double lapStart = NowMs();
+	auto lap = [&](int stage)
+	{
+		const double t = NowMs();
+		FrameStageMs[stage] += t - lapStart;
+		lapStart = t;
+	};
 	const int slotIndex = NextSlot;
 	WaitForSlot(slotIndex);
 	FrameSlot& slot = Slots[slotIndex];
+	lap(0);
 
 	Renderer->SetAnisotropy(frame.MaxAnisotropy);
 	slot.Trace = CommandPool->createBuffer();
 	slot.Trace->begin();
+	lap(1);
 	const bool traced = Renderer->Record(slot.Trace.get(), frame, slotIndex);
+	lap(2);
 	slot.Trace->end();
+	lap(3);
 
 	if (traced)
 	{
@@ -469,6 +488,7 @@ void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 		slot.Handoff->end();
 	}
 
+	lap(4);
 	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 	const bool waitRelease = traced && AwaitingRelease;
 	VkSubmitInfo submits[2] = {};
@@ -488,6 +508,7 @@ void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 	}
 	if (vkQueueSubmit(Device->GraphicsQueue, traced ? 2 : 1, submits, slot.Fence->fence) != VK_SUCCESS)
 		throw std::runtime_error("vkQueueSubmit failed");
+	lap(5);
 	slot.Pending = true;
 	NextSlot = (slotIndex + 1) % FramesInFlight;
 	if (waitRelease)
@@ -512,6 +533,29 @@ void Helper::TraceFrame(const TraceProtocol::TraceCommand& frame)
 	Shared->RenderHeight = (uint32_t)Renderer->RenderHeight();
 	Shared->DenoisedWith = Renderer->DenoisedWith();
 	snprintf(Shared->DlssStatus, sizeof(Shared->DlssStatus), "%s", Renderer->DlssStatus());
+	lap(6);
+
+	// Where the host's time goes, which the device's timings see only as
+	// one figure.
+	if (++StagedFrames >= StageFrames)
+	{
+		const double n = StagedFrames;
+		const double* r = Renderer->RecordStageMs;
+		if (frame.Timing && StagesLogged < 100)
+		{
+			StagesLogged++;
+			HelperLog("host ms/frame: slot wait %.2f begin %.2f record %.2f (setup %.2f shapes %.2f lights %.2f motion %.2f uploads %.2f builds %.2f descriptors %.2f trace %.2f denoise %.2f insets %.2f) end %.2f handoff %.2f submit %.2f status %.2f | %d instances, %d lights",
+				FrameStageMs[0] / n, FrameStageMs[1] / n, FrameStageMs[2] / n,
+				r[0] / n, r[1] / n, r[2] / n, r[3] / n, r[4] / n, r[5] / n, r[6] / n, r[7] / n, r[8] / n, r[9] / n,
+				FrameStageMs[3] / n, FrameStageMs[4] / n, FrameStageMs[5] / n, FrameStageMs[6] / n,
+				(int)Renderer->Scene.Instances.size(), (int)Renderer->Scene.Lights.size());
+		}
+		for (double& ms : FrameStageMs)
+			ms = 0.0;
+		for (double& ms : Renderer->RecordStageMs)
+			ms = 0.0;
+		StagedFrames = 0;
+	}
 }
 
 void Helper::Fail(const char* what)

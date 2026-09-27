@@ -105,6 +105,43 @@ private:
 	// pose is not rebuilt.
 	std::unordered_map<AActor*, uint64_t> ActorPoseKeys;
 
+	// A mesh's triangles as its faces and wedges lay them out, which never
+	// change: gathered the first time it is posed rather than for every pose.
+	struct MeshTriangle
+	{
+		// The corners as the engine numbers vertices when it poses and
+		// smooths the mesh, and as indices into the stored keyframes - not
+		// the same for a mesh converted from the older format.
+		INT Vertex[3];
+		INT KeyVertex[3];
+		// UE1 stores mesh texture coordinates as a byte per axis spanning the
+		// whole texture, so they divide out to 0..1 rather than needing the
+		// texture's size the way a BSP surface does.
+		FMeshUV Tex[3];
+		DWORD PolyFlags;
+		INT TextureIndex;
+	};
+	struct MeshTriangles
+	{
+		std::vector<MeshTriangle> Triangles;
+		INT VertexCount = 0;
+	};
+	std::unordered_map<UMesh*, MeshTriangles> MeshTriangleCache;
+	const MeshTriangles& TrianglesOf(UMesh* mesh);
+
+	// Scratch for posing a mesh, kept from one to the next rather than
+	// allocated for each.
+	struct PosedTriangle
+	{
+		vec3 Corners[3];
+		vec3 Normal;            // unit
+		bool Ok = false;        // posed, and with an area to have a normal
+		bool Blended = false;
+	};
+	std::vector<FVector> PosePoints;
+	std::vector<PosedTriangle> PosedTriangles;
+	std::vector<vec3> VertexNormals;
+
 	// A ceiling on how many poses are kept. Each one is a bottom level
 	// structure, and a level with many characters could otherwise build them
 	// without limit.
@@ -194,6 +231,11 @@ public:
 
 	// How many animated shapes were rebuilt this frame.
 	int MeshBuilds = 0;
+	// Where the gathering's time goes, summed until the device logs it:
+	// lights, animated meshes, other actors, held weapons, particles,
+	// fittings, decals, the view model.
+	static const int CollectStages = 8;
+	double CollectStageMs[CollectStages] = {};
 	void AddViewModel();
 	bool PlaceHeldItem(APawn* pawn, uint32_t mask);
 	// A character's posed points, reused from one to the next.
