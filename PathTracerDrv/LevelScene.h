@@ -233,8 +233,9 @@ public:
 	int MeshBuilds = 0;
 	// Where the gathering's time goes, summed until the device logs it:
 	// lights, animated meshes, other actors, held weapons, particles,
-	// fittings, decals, the view model.
-	static const int CollectStages = 8;
+	// fittings, decals, the view model, and of the animated meshes' time the
+	// engine's own posing (GetFrame).
+	static const int CollectStages = 9;
 	double CollectStageMs[CollectStages] = {};
 	void AddViewModel();
 	bool PlaceHeldItem(APawn* pawn, uint32_t mask);

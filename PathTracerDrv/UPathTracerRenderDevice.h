@@ -371,6 +371,8 @@ private:
 	struct FrameTimings
 	{
 		double Collect = 0, Send = 0, Textures = 0, Wait = 0, Total = 0, Limit = 0;
+		// Waiting for a swap chain image, and handing one to be presented.
+		double Acquire = 0, Present = 0;
 		int Frames = 0;
 		// The helper's side of Send: waiting for the GPU, taking in the scene,
 		// recording the frame.
@@ -380,6 +382,33 @@ private:
 		int GpuFrames = 0;
 		int Logged = 0;
 	} Timings;
+	// PT BENCH: the costlier features switched off one at a time while the
+	// view holds still, and what the frame took with each, to the log. Step
+	// is -1 when it is not running.
+	struct BenchState
+	{
+		int Step = -1;
+		int Frame = 0;
+		// What was set when it started, put back before every step and at
+		// the end.
+		uint32_t DisableBits = 0;
+		bool EngineLighting = true, Detail = true, Vsync = false;
+		FLOAT Anisotropy = 0.0f;
+		int LightSize = 0;
+		INT Bounces = 1;
+		// This step's sums, from when it has settled.
+		double Gpu = 0, Trace = 0, Collect = 0, FrameSum = 0;
+		int GpuFrames = 0, Frames = 0;
+		struct Result { const TCHAR* Name; double Gpu, Trace, Collect, Frame; };
+		std::vector<Result> Results;
+		bool Measuring() const { return Step >= 0 && Frame >= Settle; }
+		static const int Settle = 60, Measure = 240;
+	} Bench;
+	void StartBench();
+	bool ApplyBenchStep(int step);
+	void AdvanceBench();
+	void LogBench();
+
 	// Every frame's length, Unlock to Unlock, for the frame rate and the
 	// slowest frames in the timings log.
 	std::vector<float> FrameIntervals;

@@ -33,6 +33,15 @@ UPathTracerRenderDevice::UPathTracerRenderDevice()
 // its stack buffer in bytes for a string of wide characters, so anything longer
 // than a few words wrote past the end of it - which is what a timing line in
 // the log did, taking the game down with it.
+// The other way, for the timings log: anything past Latin-1 becomes '?'.
+static std::string Narrow(const TCHAR* text)
+{
+	std::string result;
+	for (; text && *text; text++)
+		result += (*text < 256) ? (char)*text : '?';
+	return result;
+}
+
 static FString Widen(const char* text)
 {
 	FString result;
@@ -1257,6 +1266,136 @@ void UPathTracerRenderDevice::WriteTimingLine(const char* line)
 	}
 }
 
+// PT BENCH's steps: the settings as they are, then each costlier feature
+// switched off on its own, then the settings again to show how far the
+// measurement drifted.
+static const TCHAR* const BenchSteps[] = {
+	TEXT("as set"),
+	TEXT("linear lighting, not the engine's"),
+	TEXT("no baked shadow masks"),
+	TEXT("no mipmaps"),
+	TEXT("trilinear, not anisotropic"),
+	TEXT("no detail textures"),
+	TEXT("meshes lit as flat surfaces"),
+	TEXT("hard shadows, from points"),
+	TEXT("glowing surfaces light nothing"),
+	TEXT("one bounce"),
+	TEXT("no shadows"),
+	TEXT("as set, again"),
+};
+static const int BenchStepCount = (int)(sizeof(BenchSteps) / sizeof(BenchSteps[0]));
+
+void UPathTracerRenderDevice::StartBench()
+{
+	Bench.DisableBits = DisableBits;
+	Bench.EngineLighting = EngineLightingNow;
+	Bench.Detail = DetailTextures != 0;
+	Bench.Anisotropy = MaxAnisotropy;
+	Bench.LightSize = LightSizeNow;
+	Bench.Bounces = Bounces;
+	// Off meanwhile, as the frame limit is, so the frame times are the
+	// frame's own; the swap chain is made again for it.
+	Bench.Vsync = UseVSync != 0;
+	UseVSync = 0;
+	Bench.Results.clear();
+	Bench.Step = 0;
+	Bench.Frame = 0;
+	ApplyBenchStep(0);
+}
+
+// Everything back as it was when the benchmark started, then this step's one
+// change. False when the step would change nothing - the feature already off.
+bool UPathTracerRenderDevice::ApplyBenchStep(int step)
+{
+	DisableBits = Bench.DisableBits;
+	EngineLightingNow = Bench.EngineLighting;
+	DetailTextures = Bench.Detail ? 1 : 0;
+	MaxAnisotropy = Bench.Anisotropy;
+	LightSizeNow = Bench.LightSize;
+	Bounces = Bench.Bounces;
+	AccumulatedFrames = 0;
+	DenoiseRestart = true;
+
+	auto setBit = [&](uint32_t bit)
+	{
+		if (DisableBits & bit)
+			return false;
+		DisableBits |= bit;
+		return true;
+	};
+	switch (step)
+	{
+	case 1:  if (!EngineLightingNow) return false; EngineLightingNow = false; return true;
+	case 2:  return EngineLightingNow && setBit(16384u);
+	case 3:  return setBit(4096u);
+	case 4:  if (MaxAnisotropy <= 1.0f) return false; MaxAnisotropy = 1.0f; return true;
+	case 5:  if (!DetailTextures) return false; DetailTextures = 0; return true;
+	case 6:  return setBit(1024u);
+	case 7:  if (LightSizeNow <= 0) return false; LightSizeNow = 0; return true;
+	case 8:  return setBit(512u);
+	case 9:  if (Bounces <= 1) return false; Bounces = 1; return true;
+	case 10: return setBit(2u);
+	default: return true;
+	}
+}
+
+// Once a traced frame: a step settles, is measured, and gives way to the next
+// that changes anything; after the last, everything goes back and the table
+// is logged.
+void UPathTracerRenderDevice::AdvanceBench()
+{
+	if (Bench.Step < 0)
+		return;
+	if (++Bench.Frame == BenchState::Settle)
+	{
+		Bench.Gpu = Bench.Trace = Bench.Collect = Bench.FrameSum = 0.0;
+		Bench.GpuFrames = Bench.Frames = 0;
+	}
+	if (Bench.Frame < BenchState::Settle + BenchState::Measure)
+		return;
+
+	const double g = Max(Bench.GpuFrames, 1), f = Max(Bench.Frames, 1);
+	Bench.Results.push_back({ BenchSteps[Bench.Step], Bench.Gpu / g, Bench.Trace / g, Bench.Collect / f, Bench.FrameSum / f });
+	do
+		Bench.Step++;
+	while (Bench.Step < BenchStepCount && !ApplyBenchStep(Bench.Step));
+	Bench.Frame = 0;
+	if (Bench.Step >= BenchStepCount)
+	{
+		ApplyBenchStep(0);
+		Bench.Step = -1;
+		LogBench();
+		UseVSync = Bench.Vsync ? 1 : 0;
+	}
+}
+
+void UPathTracerRenderDevice::LogBench()
+{
+	if (Bench.Results.empty())
+		return;
+	const TraceProtocol::Header* status = (Tracer && Tracer->Alive()) ? &Tracer->Status() : nullptr;
+	static const char* denoisers[] = { "off", "NRD", "DLSS-RR" };
+	const TCHAR* map = (Viewport && Viewport->Actor && Viewport->Actor->XLevel && Viewport->Actor->XLevel->GetOuter())
+		? Viewport->Actor->XLevel->GetOuter()->GetName() : TEXT("?");
+	char line[512];
+	snprintf(line, sizeof(line), "PT BENCH: %s, %dx%d traced at %ux%u, denoiser %s, materials %s, bounces %d, %d instances, %d lights, vsync %s",
+		Narrow(map).c_str(), TraceWidth, TraceHeight, status ? status->RenderWidth : 0u, status ? status->RenderHeight : 0u,
+		denoisers[Min<uint32_t>(status ? status->DenoisedWith : 0u, 2)], MaterialsEnabled ? "on" : "off", (int)Bounces,
+		(int)Scene.Instances.size(), (int)Scene.Lights.size(), UsingVsync ? "on" : "off");
+	WriteTimingLine(line);
+	WriteTimingLine("PT BENCH:                                     GPU ms (trace)   collect ms   frame ms   fps    change: GPU, frame");
+	const BenchState::Result& base = Bench.Results[0];
+	for (const BenchState::Result& r : Bench.Results)
+	{
+		snprintf(line, sizeof(line), "PT BENCH:   %-34s %6.2f (%5.2f)   %6.2f     %7.2f  %6.1f   %+6.2f, %+6.2f",
+			Narrow(r.Name).c_str(), r.Gpu, r.Trace, r.Collect, r.Frame, r.Frame > 0.0 ? 1000.0 / r.Frame : 0.0,
+			r.Gpu - base.Gpu, r.Frame - base.Frame);
+		WriteTimingLine(line);
+	}
+	if (Viewport && Viewport->Actor)
+		Viewport->Actor->eventClientMessage(TEXT("PT BENCH: done, the table is in PathTracerTimings.log"), NAME_None, 0);
+}
+
 // The scene holds the engine's own objects - the level's textures, meshes and
 // actors - by pointer from one frame to the next, and a garbage collection can
 // free any of them. EnsureSceneBuilt rebuilds when the level changes, but it
@@ -1326,6 +1465,8 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	const double collectStart = NowMs();
 	Scene.CollectDynamic(level);
 	Timings.Collect += NowMs() - collectStart;
+	if (Bench.Measuring())
+		Bench.Collect += NowMs() - collectStart;
 	CollectedThisFrame = true;
 
 	// Only when something new appeared, so this says what is being traced
@@ -1725,7 +1866,14 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	{
 		const double now = NowMs();
 		if (LastUnlockMs > 0.0 && now - LastUnlockMs < 1000.0)
+		{
 			FrameIntervals.push_back((float)(now - LastUnlockMs));
+			if (Bench.Measuring())
+			{
+				Bench.FrameSum += now - LastUnlockMs;
+				Bench.Frames++;
+			}
+		}
 		LastUnlockMs = now;
 	}
 
@@ -1830,7 +1978,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.Lighting = EngineLightingNow ? 1 : 0;
 				frame.Materials = MaterialsEnabled ? 1 : 0;
 				frame.RestartDenoiser = DenoiseRestart ? 1 : 0;
-				frame.Timing = LogTimings ? 1 : 0;
+				frame.Timing = (LogTimings || Bench.Step >= 0) ? 1 : 0;
 				frame.Time = (Viewport && Viewport->Actor && Viewport->Actor->Level)
 					? (float)fmod((double)Viewport->Actor->Level->TimeSeconds, 1000.0) : 0.0f;
 				frame.Exposure = 0.2f + Exposure * (2.0f / 255.0f);
@@ -1898,6 +2046,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 						Timings.GpuDenoise += status.GpuDenoiseMs;
 						Timings.GpuComposite += status.GpuCompositeMs;
 						Timings.GpuFrames++;
+						if (Bench.Measuring())
+						{
+							Bench.Gpu += status.GpuBuildMs + status.GpuTraceMs + status.GpuDenoiseMs + status.GpuCompositeMs;
+							Bench.Trace += status.GpuTraceMs;
+							Bench.GpuFrames++;
+						}
 					}
 				}
 			}
@@ -1924,7 +2078,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, false, false);
 		}
 
+		const double acquireStart = NowMs();
 		int imageIndex = SwapChain->AcquireImage(ImageAvailableSemaphore.get());
+		Timings.Acquire += NowMs() - acquireStart;
 		if (imageIndex == -1)
 		{
 			PathTracerEvent("no swap chain image%s", SwapChain->Lost() ? " (lost)" : "");
@@ -2093,13 +2249,19 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		PendingCommands = std::move(commands);
 		FramePending = true;
 
+		const double presentStart = NowMs();
 		SwapChain->QueuePresent(imageIndex, RenderFinishedSemaphore.get());
+		Timings.Present += NowMs() - presentStart;
 
 		// Paced after the present rather than before the next frame's work,
 		// so the game's own tick is what waits.
+		// Not while benchmarking, whose frame times would be the limit's.
 		const double limitStart = NowMs();
-		LimitFrameRate();
+		if (Bench.Step < 0)
+			LimitFrameRate();
 		Timings.Limit += NowMs() - limitStart;
+		if (HaveCamera)
+			AdvanceBench();
 
 		// The scene gathering happens earlier, in SetSceneNode, so it is
 		// added to the frame's total rather than measured inside it.
@@ -2111,15 +2273,15 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				Timings.Logged++;
 				const double n = Timings.Frames;
 				char line[512];
-				snprintf(line, sizeof(line), "PathTracer ms/frame: collect %.2f send %.2f (textures %.2f; helper wait %.2f apply %.2f record %.2f, %d stalls) gpu-wait %.2f unlock %.2f limiter %.2f | %d instances, %d textures, %d poses rebuilt",
+				snprintf(line, sizeof(line), "PathTracer ms/frame: collect %.2f send %.2f (textures %.2f; helper wait %.2f apply %.2f record %.2f, %d stalls) gpu-wait %.2f acquire %.2f present %.2f unlock %.2f limiter %.2f | %d instances, %d textures, %d poses rebuilt",
 					Timings.Collect / n, Timings.Send / n, Timings.Textures / n,
 					Timings.HelperWait / n, Timings.HelperApply / n, Timings.HelperRecord / n, Timings.HelperStalls,
-					Timings.Wait / n, (Timings.Total - Timings.Limit) / n, Timings.Limit / n,
+					Timings.Wait / n, Timings.Acquire / n, Timings.Present / n, (Timings.Total - Timings.Limit) / n, Timings.Limit / n,
 					(int)Scene.Instances.size(), (int)Scene.Textures.size(), Scene.MeshBuilds);
 				WriteTimingLine(line);
 				const double* c = Scene.CollectStageMs;
-				snprintf(line, sizeof(line), "PathTracer collect ms/frame: lights %.2f animated %.2f other actors %.2f held weapons %.2f particles %.2f fittings %.2f decals %.2f view model %.2f",
-					c[0] / n, c[1] / n, c[2] / n, c[3] / n, c[4] / n, c[5] / n, c[6] / n, c[7] / n);
+				snprintf(line, sizeof(line), "PathTracer collect ms/frame: lights %.2f animated %.2f (the engine posing them %.2f) other actors %.2f held weapons %.2f particles %.2f fittings %.2f decals %.2f view model %.2f",
+					c[0] / n, c[1] / n, c[8] / n, c[2] / n, c[3] / n, c[4] / n, c[5] / n, c[6] / n, c[7] / n);
 				WriteTimingLine(line);
 				if (!FrameIntervals.empty())
 				{
@@ -2493,6 +2655,22 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		// engine's lighting (Disable bit 16384 leaves them out).
 		// Every 2D draw of the next frame, to the log: what the HUD and the
 		// menus hand this device, to find what it leaves out.
+		if (ParseCommand(&Cmd, TEXT("BENCH")))
+		{
+			if (Bench.Step >= 0)
+			{
+				ApplyBenchStep(0);
+				Bench.Step = -1;
+				UseVSync = Bench.Vsync ? 1 : 0;
+				Ar.Logf(TEXT("PT BENCH: stopped, everything as it was"));
+			}
+			else
+			{
+				StartBench();
+				Ar.Logf(TEXT("PT BENCH: hold still for about half a minute; the frame limit and VSync are off meanwhile. PT BENCH again stops it."));
+			}
+			return 1;
+		}
 		if (ParseCommand(&Cmd, TEXT("TILES")))
 		{
 			LogDrawsArmed = true;
@@ -2653,7 +2831,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

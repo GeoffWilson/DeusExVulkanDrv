@@ -67,8 +67,37 @@ inline uint32_t PackUnitVector(vec3 n)
 		x = foldedX;
 		y = foldedY;
 	}
-	auto snorm = [](float v) { return (uint32_t)(uint16_t)(int16_t)std::floor((v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v)) * 32767.0f + 0.5f); };
+	// floor(v * 32767 + 0.5), without the library's floor: this runs for
+	// every corner of every character every frame, and the call made packing
+	// a triangle's normals seven times slower in the 32 bit device.
+	auto snorm = [](float v)
+	{
+		const float f = (v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v)) * 32767.0f + 0.5f;
+		int r = (int)f;
+		if ((float)r > f)
+			r--;
+		return (uint32_t)(uint16_t)(int16_t)r;
+	};
 	return snorm(x) | (snorm(y) << 16);
+}
+
+// log2 to within 2e-6, for a triangle's mip density, without the library
+// call, which took 50 ns in the 32 bit device - more than all the rest of
+// posing a character's triangle. The exponent from the bits, and the rest
+// from the series for ln((1 + t) / (1 - t)) with t under a third.
+inline float FastLog2(float x)
+{
+	uint32_t bits;
+	memcpy(&bits, &x, sizeof(bits));
+	const uint32_t exponent = (bits >> 23) & 255u;
+	if (exponent == 0 || exponent == 255)
+		return std::log2(x);
+	bits = (bits & 0x7fffffu) | 0x3f800000u;
+	float m;
+	memcpy(&m, &bits, sizeof(m));
+	const float t = (m - 1.0f) / (m + 1.0f), t2 = t * t;
+	const float series = t * (1.0f + t2 * (1.0f / 3.0f + t2 * (1.0f / 5.0f + t2 * (1.0f / 7.0f + t2 * (1.0f / 9.0f)))));
+	return (float)((int)exponent - 127) + 2.8853900817779268f * series;
 }
 
 // A float as a half, rounded to nearest, for distances across one of a mesh's
@@ -126,7 +155,7 @@ inline void SetUvDensity(TriangleAttributes& attr, const vec3 corners[3])
 	const float area = std::sqrt(c.x * c.x + c.y * c.y + c.z * c.z);
 	if (!(uvArea > 0.0f) || !(area > 0.0f))
 		return;
-	float density = 0.5f * std::log2(uvArea / area);
+	float density = 0.5f * FastLog2(uvArea / area);
 	if (density == 0.0f)
 		density = 1.0e-6f;
 	memcpy(&attr.CornerOffsets[3], &density, sizeof(density));

@@ -77,10 +77,12 @@ tenth of a millisecond, whatever its size.
 It has been developed on an RTX 4090 with a 3440x1440 display, first with the
 game at 1920x1440 and, since 1.2, at the display's own 3440x1440 with the HUD
 pinned. At 1920x1440 the Hong Kong market, one of the heaviest scenes, runs at
-about 145 frames a second uncapped with materials on and NRD, with a 1% low of
-about 130, and at about 190 with DLSS Ray Reconstruction at Quality, 1% low
-160; the frame limiter holds it to 120 by default. `LogTimings` says where a
-frame's time goes, the GPU's side included, and what frame rate that came to.
+about 160 frames a second uncapped with DLSS Ray Reconstruction at Quality,
+with a 1% low of about 120, and at about 95 with NRD, 1% low 85: standing
+still, with the default settings, under Proton. The frame limiter holds it to
+120 by default. `PT BENCH` measures it, and what each of the costlier features
+takes out of it, and `LogTimings` says where a frame's time goes, the GPU's
+side included, and what frame rate that came to.
 
 Fullscreen is a borderless window over the whole screen. Alt-tabbing away
 leaves it fullscreen, behind whatever was switched to and tracing at 20 frames
@@ -107,7 +109,8 @@ crash, flushed as they happen.
 - **DLSS Ray Reconstruction**, NVIDIA's denoiser and upscaler, on an RTX GPU,
   and the default there at Quality (`DLSS`, `PT DLSS`); see Noise below.
 - **Faster frames.** The CPU gathers and records the next frame while the GPU
-  traces the last: 106 frames a second became 146 in the Hong Kong market.
+  traces the last: 106 frames a second became 146 in the Hong Kong market with
+  1.1's lighting and NRD. The engine's lighting costs some of that back.
 - **Wide screens.** A Hor+ field of view, cinematics and conversations framed
   whole on a wide screen, the HUD's markers on what they mark, and the HUD pinned
   to a 4:3 box in the middle of the screen by default, or 16:9; see Wide
@@ -579,6 +582,14 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).
 - `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
+- `PT BENCH`: hold still for about half a minute while it switches the
+  costlier features off one at a time - the engine's lighting, the baked
+  shadow masks, mipmaps, anisotropic filtering, detail textures, the engine's
+  mesh lighting, soft shadows, glowing surfaces lighting the room, the extra
+  bounces, shadows - with the frame limit and VSync off, then logs a table to
+  `PathTracerTimings.log`: the GPU's time, the scene gathering and the frame
+  with each, and how each compares with the settings as they are. `PT BENCH`
+  again stops it.
 - `PT TILES`: logs every 2D draw of the next frame - each tile and mesh the
   HUD and the menus hand the device, and each view - to find what it leaves
   out.

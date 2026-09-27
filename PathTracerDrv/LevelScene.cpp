@@ -1600,7 +1600,9 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	{
 		INT request = lod->ModelVerts;
 		enginePoints.resize(lod->SpecialVerts + Max(lod->ModelVerts, lod->FrameVerts) + 1);
+		const DWORD poseStart = appCycles();
 		lod->GetFrame(&enginePoints[0], sizeof(FVector), *toLocal, owner, request);
+		CollectStageMs[8] += (DWORD)(appCycles() - poseStart) * GSecondsPerCycle * 1000.0;
 	}
 	const bool keyframesValid =
 		base + (frameVerts - specialVerts) <= mesh->Verts.Num() &&
