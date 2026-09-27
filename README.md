@@ -103,7 +103,8 @@ save they were taken on:
 Every line agrees within the drift between two runs of the same bench, so the
 handoff to the helper costs nothing measurable on either platform and the trace
 is the trace wherever it runs. The 1% lows were if anything steadier on Windows:
-about 155 against a 170 average with DLSS, where Proton's sits nearer 120.
+about 155 against a 170 average with DLSS, where Proton's sits nearer 120, and
+about 92 against 97 with NRD, where Proton's is about 85.
 
 `PT BENCH` wants a settled frame rate: the row it measures first, straight
 after a `PT DLSS` switch, came out 1.4 ms slower than the same settings
