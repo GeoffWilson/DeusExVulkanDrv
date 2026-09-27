@@ -66,7 +66,9 @@ towards the camera; `--lightsize n` casts shadows from a light of that
 radius; `--detail` gives the floor a striped detail texture; `--bc1` sends
 its checker as S3TC blocks, as New Vision's textures go; `--engine-lighting`
 lights it as the device's default `Lighting=Engine` does, where the harness
-otherwise keeps to the linear lighting its scene was made for. The Windows SDK that `xwin` fetches carries the Direct3D
+otherwise keeps to the linear lighting its scene was made for; with it,
+`--baked-mask` bakes the light into the floor's lightmap with a shadow mask
+covering only the floor's left half, which the right half should go without. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 

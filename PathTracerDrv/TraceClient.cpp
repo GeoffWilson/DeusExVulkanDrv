@@ -265,6 +265,21 @@ void TraceClient::Lights(const std::vector<SceneLight>& lights, const std::vecto
 	memcpy(p + sizeof(c) + lights.size() * sizeof(SceneLight), fogLights.data(), fogLights.size() * sizeof(SceneLight));
 }
 
+void TraceClient::Lightmaps(const std::vector<uint32_t>& words)
+{
+	using namespace TraceProtocol;
+	const uint32_t bytes = Rounded(sizeof(LightmapsCommand) + words.size() * sizeof(uint32_t));
+	uint8_t* p = Reserve(bytes);
+	if (!p)
+		return;
+	LightmapsCommand c = {};
+	c.H = { CmdLightmaps, bytes };
+	c.Words = (uint32_t)words.size();
+	memcpy(p, &c, sizeof(c));
+	if (!words.empty())
+		memcpy(p + sizeof(c), words.data(), words.size() * sizeof(uint32_t));
+}
+
 void TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels, uint32_t format)
 {
 	using namespace TraceProtocol;

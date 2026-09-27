@@ -95,10 +95,12 @@ crash, flushed as they happen.
 
 - **The level lit as the engine lights it**: each light's falloff, its
   brightness and the zone's ambient added up the way the engine builds its
-  lightmaps, and drawn at the brightness every device draws them at - but
-  with traced shadows (`Lighting`). The pools of light, the saturated colour
-  and the contrast of the original are back, where the lighting before was
-  flatter, greyer and dimmer. See How it works below.
+  lightmaps, held to the shadow masks the map was built with, and drawn at
+  the brightness every device draws them at - but with traced shadows as
+  well (`Lighting`). The pools of light, the saturated colour and the
+  contrast of the original are back, where the lighting before was flatter,
+  greyer and dimmer, and a room comes out as bright as the other devices
+  draw it. See How it works below.
 - **A neutral tone curve**, which leaves all but the brightest fifth of the
   picture as the other devices draw it (`NeutralToneMap`); and a new default
   `Exposure` of 90.
@@ -189,11 +191,20 @@ source and was read by disassembly:
   together than light adds up. The trace takes that sum of the lights that
   actually reach the point - a shadow ray at each of the four strongest in
   reach and at one picked from the rest - so shadows are traced ones, and a
-  light behind a wall adds nothing. Rebuilt from the map's shadow masks, this
-  matches the engine's own lightmaps, which `PT LOOK` reads, to about 1.5%. It
-  costs about 0.9 ms of GPU time a frame (a Vandenberg room, RTX 4090, traced
-  at 1280x960). `Lighting=Linear` lights them as before 1.2, each light linear
-  to nothing at its radius in linear light: flatter, greyer and dimmer;
+  light behind a wall adds nothing. Each light baked into a surface is also
+  held to its shadow mask there, filtered as the engine filters it: the masks
+  are coarse - a texel can be most of a metre across - and blurred, and on a
+  small wall most of them can lie in shadow where the light in fact reaches
+  it all, so a room traced alone came out several times as bright as the
+  engine draws it. So a surface is no brighter than the engine's lightmap,
+  and no brighter than the trace lets it be: a lamp the lightmap lets through
+  a wall still adds nothing. This matches the engine's own lightmaps, which
+  `PT LOOK` reads, to about 1.5%. The engine's lighting cost about 0.9 ms of
+  GPU time a frame over the linear (a Vandenberg room, RTX 4090, traced at
+  1280x960); the masks added nothing measurable, since only the lights that
+  are traced look theirs up. `Lighting=Linear` lights them as before 1.2,
+  each light linear to nothing at its radius in linear light: flatter, greyer
+  and dimmer;
 
 - light types: pulse, subtle pulse, blink, flicker and strobe, on the engine's
   clock and with its exact formulas;
@@ -499,9 +510,10 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   of. For the level itself, `PT LOOK` names the surface's texture, its group,
   its material, its detail texture and its zone's ambient, and logs every light
   that reaches the spot: what the engine's lightmap takes from it and what the
-  trace does, whether the level's own geometry blocks it, and which lights the
-  map's build baked into the surface with how much of each it left lit, and
-  reads the engine's own lightmap there, as the engine built it. Where
+  trace does, whether the level's own geometry blocks it, each baked light's
+  shadow mask there, and which lights the map's build baked into the surface
+  with how much of each it left lit, and reads the engine's own lightmap
+  there, as the engine built it. Where
   the trace is darker than the other devices, this says which lights the
   engine lets through walls - a map lit before its geometry was finished. For
   an actor it lists the lights in its reach, with their own values and the
@@ -519,6 +531,10 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   other way.
 - `PT EXPOSURE n`, `PT TONEMAP`: the exposure, as `Exposure`, and the tone
   curve, as `NeutralToneMap`.
+- `PT BAKEDSHADOWS`: with the engine's lighting, the baked lights held to the
+  map's shadow masks as well as traced (the default), or traced alone.
+- `PT NOGLOW`: glowing surfaces - unlit ones, a sign, a light panel - still
+  seen but lighting nothing, to see what they add to a room.
 - `PT MESHLIGHT`: meshes lit as the engine lights them, or as flat surfaces are.
 - `PT DETAIL`: detail textures on or off, as the game's setting.
 - `PT MIPS`: mipmaps off and on, to compare: off, every texture is read at
@@ -541,11 +557,11 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
   while denoising.
 - A character's motion vectors follow the whole character, not its animation.
   No ghosting has been seen, but it is not exact.
-- Lit surfaces come out brighter than in the rasterised game, by about a
-  third on screen in the rooms measured, even with direct light alone, for a
-  reason not yet found; the default `Exposure` takes up most of it. Where a
-  map's lightmaps take light from lamps behind its walls, the trace keeps
-  those shadowed, and the spot is darker; `PT LOOK` at a surface lists which.
+- Where a map's lightmaps take light from lamps behind its walls, the trace
+  keeps those shadowed, and the spot is darker; `PT LOOK` at a surface lists
+  which.
+- Some lockers come out about three times as bright as in the rasterised
+  game; not yet looked into.
 
 ### Building it on Windows
 

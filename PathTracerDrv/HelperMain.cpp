@@ -610,6 +610,16 @@ bool Helper::Batch()
 			break;
 		}
 
+		case CmdLightmaps:
+		{
+			LightmapsCommand c;
+			memcpy(&c, body, sizeof(c));
+			const uint32_t* words = (const uint32_t*)(body + sizeof(c));
+			Renderer->Scene.Lightmaps.assign(words, words + c.Words);
+			Renderer->Scene.LightmapsChanged = true;
+			break;
+		}
+
 		case CmdTexture:
 		{
 			TextureCommand c;

@@ -131,6 +131,7 @@ int main(int argc, char** argv)
 	bool still = false, reference = false, backlight = false, detail = false, bc1 = false;
 	uint32_t lightSize = 0;
 	uint32_t engineLighting = 0;
+	bool bakedMask = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -149,6 +150,8 @@ int main(int argc, char** argv)
 			bc1 = true;
 		else if (!strcmp(argv[i], "--engine-lighting"))
 			engineLighting = 1;
+		else if (!strcmp(argv[i], "--baked-mask"))
+			bakedMask = true;
 		else
 			args.push_back(argv[i]);
 	}
@@ -282,6 +285,35 @@ int main(int argc, char** argv)
 		light.Flags = vec4(0, 0, 0, -1);
 		std::vector<SceneLight> lights = { light };
 
+		// --baked-mask: the light baked into the floor's lightmap, as the
+		// engine's lights are into a level's, with a shadow mask that has it
+		// reach only the floor's left half (x < 0) - which, with
+		// --engine-lighting, is all of the floor it should light.
+		std::vector<uint32_t> lightmaps;
+		if (bakedMask)
+		{
+			lights[0].Flags.y = 2.0f;
+			const int size = 12;
+			const float perTexel = 1200.0f / (size - 1);
+			auto bits = [](float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return u; };
+			lightmaps.assign(1 + 12 + 1 + size * size / 4, 0u);
+			lightmaps[0] = 1;
+			const float axes[8] = { 1.0f / perTexel, 0, 0, 600.0f / perTexel, 0, 1.0f / perTexel, 0, 600.0f / perTexel };
+			for (int k = 0; k < 8; k++)
+				lightmaps[1 + k] = bits(axes[k]);
+			lightmaps[9] = 14 * 4;
+			lightmaps[10] = size | (size << 16);
+			lightmaps[11] = 13;
+			lightmaps[12] = 1;
+			lightmaps[13] = 1;
+			uint8_t* mask = (uint8_t*)&lightmaps[14];
+			for (int y = 0; y < size; y++)
+				for (int x = 0; x < size; x++)
+					mask[y * size + x] = x < size / 2 ? 255 : 0;
+			for (int t = 0; t < 2; t++)
+				world.Attributes[t].Emission.z = 1.0f;
+		}
+
 		// --detail: a detail texture on the floor, as LevelScene::SetDetail
 		// describes one - stripes, a light and a dark one to each checker
 		// square at the first pass's scale - which shows on the floor nearer
@@ -334,6 +366,7 @@ int main(int argc, char** argv)
 		if (detail)
 			client.Texture(1, 64, 64, stripes.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false);
 		client.Geometry(0, world);
+		client.Lightmaps(lightmaps);
 
 		// The camera, as the render device builds it: right and "up" - which
 		// points down the screen - scaled to the view's half extents.

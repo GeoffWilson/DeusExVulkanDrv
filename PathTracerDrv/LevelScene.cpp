@@ -188,7 +188,13 @@ void LevelScene::Clear()
 	SourceLevel = nullptr;
 	SourceNodeCount = 0;
 	MirroredSurfaces = 0;
-	BakedLights.clear();
+	BakedLightIds.clear();
+	LightmapRecords.clear();
+	LightmapRecordWords.clear();
+	LightmapLightWords.clear();
+	LightmapMaskBytes.clear();
+	LightmappedModel = nullptr;
+	Lightmaps.clear();
 }
 
 bool LevelScene::BuildStatic(ULevel* level)
@@ -207,8 +213,19 @@ bool LevelScene::BuildStatic(ULevel* level)
 	// is what did it there: looking back along the dock, every long ray paid
 	// for every triangle it passed. Now only the surfaces that need judging
 	// are in the slow half.
+	// The lights baked into the lightmaps, numbered, before the surfaces
+	// that list them.
+	for (INT i = 0; i < level->Model->Lights.Num(); i++)
+	{
+		AActor* light = level->Model->Lights(i);
+		if (light && !BakedLightIds.count(light))
+			BakedLightIds[light] = (uint32_t)BakedLightIds.size() + 1;
+	}
+
 	SceneGeometry all;
+	LightmappedModel = level->Model;
 	AddBspSurfaces(level->Model, all, true);
+	FinishLightmaps();
 
 	Geometries.emplace_back();
 	Geometries.emplace_back();
@@ -242,11 +259,6 @@ bool LevelScene::BuildStatic(ULevel* level)
 	// light that moves, and a lamp that is shot out stops being one - none of
 	// which a list built once at level load can express.
 
-	BakedLights.clear();
-	for (INT i = 0; i < level->Model->Lights.Num(); i++)
-		if (level->Model->Lights(i))
-			BakedLights.insert(level->Model->Lights(i));
-
 	SourceLevel = level;
 	SourceNodeCount = level->Model->Nodes.Num();
 	GeometryAdded = true;
@@ -254,6 +266,158 @@ bool LevelScene::BuildStatic(ULevel* level)
 	return !Geometries[0].Positions.empty();
 
 	unguard;
+}
+
+// A baked light's shadow mask on a lightmap as the engine filters it before
+// lighting the surface (Render.dll's FUN_10b02650): each texel the sum of its
+// 3x3 neighbourhood's bits weighted 24 40 24 / 40 64 40 / 24 40 24 out of
+// 320, so 255 where the light is clear all round - twice the 127 the engine
+// fills a light with no mask with, which is why a baked light counts double.
+// The bits are stored a row at a time, whole bytes a row, the first texel in
+// each byte's lowest bit; past the first and last rows and the row's first
+// texel, the nearest stands in, and past its last byte the last bit of it.
+static void FilteredMask(UModel* model, const FLightMapIndex& index, INT k, uint8_t* out)
+{
+	const INT width = index.UClamp, height = index.VClamp;
+	const INT rowBytes = (width + 7) >> 3;
+	const INT start = index.DataOffset + k * rowBytes * height;
+	auto bit = [&](INT x, INT y) -> int
+	{
+		x = Clamp(x, 0, rowBytes * 8 - 1);
+		y = Clamp(y, 0, height - 1);
+		const INT b = start + y * rowBytes + (x >> 3);
+		return (b >= 0 && b < model->LightBits.Num()) ? (model->LightBits(b) >> (x & 7)) & 1 : 0;
+	};
+	static const int weights[3][3] = { { 24, 40, 24 }, { 40, 64, 40 }, { 24, 40, 24 } };
+	for (INT y = 0; y < height; y++)
+		for (INT x = 0; x < width; x++)
+		{
+			int sum = 0;
+			for (int dy = -1; dy <= 1; dy++)
+				for (int dx = -1; dx <= 1; dx++)
+					sum += weights[dy + 1][dx + 1] * bit(x + dx, y + dy);
+			out[x + y * width] = (uint8_t)(sum * 255 / 320);
+		}
+}
+
+// Where a point falls on a surface's lightmap, in texels, the engine's
+// samples at whole numbers: as the devices place it, from the surface's
+// texture axes and the lightmap's own pan and scale.
+static void LightmapAxes(UModel* model, const FBspSurf& surf, const FLightMapIndex& index, float u[4], float v[4])
+{
+	const FVector base = model->Points(surf.pBase);
+	const FVector tu = model->Vectors(surf.vTextureU), tv = model->Vectors(surf.vTextureV);
+	const float us = index.UScale != 0.0f ? 1.0f / index.UScale : 0.0f;
+	const float vs = index.VScale != 0.0f ? 1.0f / index.VScale : 0.0f;
+	u[0] = tu.X * us; u[1] = tu.Y * us; u[2] = tu.Z * us; u[3] = (-(base | tu) - index.Pan.X) * us;
+	v[0] = tv.X * vs; v[1] = tv.Y * vs; v[2] = tv.Z * vs; v[3] = (-(base | tv) - index.Pan.Y) * vs;
+}
+
+static bool LightmapUsable(UModel* model, INT iSurf, FLightMapIndex*& index)
+{
+	index = (iSurf >= 0 && iSurf < model->Surfs.Num()) ? model->GetLightMapIndex(iSurf) : nullptr;
+	if (!index || index->UClamp <= 0 || index->VClamp <= 0 || index->UClamp > 65535 || index->VClamp > 65535 || index->iLightActors < 0)
+		return false;
+	const FBspSurf& surf = model->Surfs(iSurf);
+	return surf.pBase >= 0 && surf.pBase < model->Points.Num() &&
+		surf.vTextureU >= 0 && surf.vTextureU < model->Vectors.Num() && surf.vTextureV >= 0 && surf.vTextureV < model->Vectors.Num();
+}
+
+// The record for a level surface's lightmap, made the first time one of its
+// nodes asks: its mapping, the numbers of the lights baked into it and each
+// one's filtered mask. Its number plus one, or 0 for a surface without one.
+uint32_t LevelScene::AddLightmap(UModel* model, INT iSurf)
+{
+	auto found = LightmapRecords.find(iSurf);
+	if (found != LightmapRecords.end())
+		return found->second;
+	uint32_t record = 0;
+	FLightMapIndex* index = nullptr;
+	if (LightmapUsable(model, iSurf, index))
+	{
+		float u[4], v[4];
+		LightmapAxes(model, model->Surfs(iSurf), *index, u, v);
+		const uint32_t lightStart = (uint32_t)LightmapLightWords.size();
+		const size_t maskStart = LightmapMaskBytes.size();
+		const size_t texels = (size_t)index->UClamp * index->VClamp;
+		for (INT k = 0; index->iLightActors + k < model->Lights.Num(); k++)
+		{
+			AActor* light = model->Lights(index->iLightActors + k);
+			if (!light)
+				break;
+			auto id = BakedLightIds.find(light);
+			LightmapLightWords.push_back(id != BakedLightIds.end() ? id->second : 0u);
+			LightmapMaskBytes.resize(LightmapMaskBytes.size() + texels);
+			FilteredMask(model, *index, k, LightmapMaskBytes.data() + LightmapMaskBytes.size() - texels);
+		}
+		// Each surface's masks start on a whole word.
+		LightmapMaskBytes.resize((LightmapMaskBytes.size() + 3) & ~(size_t)3);
+		auto floatBits = [](float f) { uint32_t w; memcpy(&w, &f, sizeof(w)); return w; };
+		for (int i = 0; i < 4; i++)
+			LightmapRecordWords.push_back(floatBits(u[i]));
+		for (int i = 0; i < 4; i++)
+			LightmapRecordWords.push_back(floatBits(v[i]));
+		LightmapRecordWords.push_back((uint32_t)maskStart);
+		LightmapRecordWords.push_back((uint32_t)index->UClamp | ((uint32_t)index->VClamp << 16));
+		LightmapRecordWords.push_back(lightStart);
+		LightmapRecordWords.push_back((uint32_t)LightmapLightWords.size() - lightStart);
+		record = (uint32_t)(LightmapRecordWords.size() / 12);
+	}
+	LightmapRecords[iSurf] = record;
+	return record;
+}
+
+// The records, lists and masks put together as Lightmaps lays them out, the
+// records' starts moved to where their lists and masks ended up.
+void LevelScene::FinishLightmaps()
+{
+	const uint32_t count = (uint32_t)(LightmapRecordWords.size() / 12);
+	const uint32_t listBase = 1 + count * 12;
+	const uint32_t maskBase = (listBase + (uint32_t)LightmapLightWords.size()) * 4;
+	Lightmaps.assign(1 + LightmapRecordWords.size() + LightmapLightWords.size() + LightmapMaskBytes.size() / 4, 0u);
+	Lightmaps[0] = count;
+	for (uint32_t r = 0; r < count; r++)
+	{
+		uint32_t* out = &Lightmaps[1 + r * 12];
+		memcpy(out, &LightmapRecordWords[r * 12], 12 * sizeof(uint32_t));
+		out[8] += maskBase;
+		out[10] += listBase;
+	}
+	if (!LightmapLightWords.empty())
+		memcpy(&Lightmaps[listBase], LightmapLightWords.data(), LightmapLightWords.size() * sizeof(uint32_t));
+	if (!LightmapMaskBytes.empty())
+		memcpy((uint8_t*)Lightmaps.data() + maskBase, LightmapMaskBytes.data(), LightmapMaskBytes.size());
+	debugf(TEXT("PathTracer lightmaps: %d surfaces, %d masks, %.1f MB of the engine's shadows"),
+		(int)count, (int)LightmapLightWords.size(), Lightmaps.size() * 4 / (1024.0f * 1024.0f));
+	LightmapRecordWords.clear();
+	LightmapLightWords.clear();
+	LightmapMaskBytes.clear();
+}
+
+float LevelScene::BakedMaskAt(UModel* model, INT iSurf, AActor* light, const FVector& point)
+{
+	FLightMapIndex* index = nullptr;
+	if (!model || !LightmapUsable(model, iSurf, index))
+		return -1.0f;
+	INT k = 0;
+	for (; index->iLightActors + k < model->Lights.Num(); k++)
+	{
+		AActor* baked = model->Lights(index->iLightActors + k);
+		if (!baked || baked == light)
+			break;
+	}
+	if (index->iLightActors + k >= model->Lights.Num() || model->Lights(index->iLightActors + k) != light)
+		return 0.0f;
+	std::vector<uint8_t> mask((size_t)index->UClamp * index->VClamp);
+	FilteredMask(model, *index, k, mask.data());
+	float u[4], v[4];
+	LightmapAxes(model, model->Surfs(iSurf), *index, u, v);
+	const float x = u[0] * point.X + u[1] * point.Y + u[2] * point.Z + u[3];
+	const float y = v[0] * point.X + v[1] * point.Y + v[2] * point.Z + v[3];
+	const INT x0 = appFloor(x), y0 = appFloor(y);
+	const float fx = x - x0, fy = y - y0;
+	auto at = [&](INT tx, INT ty) { return (float)mask[Clamp(tx, 0, index->UClamp - 1) + Clamp(ty, 0, index->VClamp - 1) * index->UClamp]; };
+	return ((at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy) / 255.0f;
 }
 
 // Walk a BSP and turn every solid surface into triangles.
@@ -351,6 +515,10 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
 		// w: the surface is special lit, and only special lights reach it.
 		attr.Ambient = vec4(ambient.x, ambient.y, ambient.z, (surf.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f);
+		// z: which of the level's lightmaps the surface has, for the engine's
+		// own shadow masks on it (see Lightmaps).
+		if (model == LightmappedModel)
+			attr.Emission.z = (float)AddLightmap(model, node.iSurf);
 
 		// A BSP surface has no stored texture coordinates: the engine derives
 		// them from two axis vectors and an origin point, which is what lets one
@@ -647,7 +815,7 @@ void LevelScene::AddLight(AActor* actor)
 
 	light.Flags = vec4(
 		actor->LightEffect == LE_NonIncidence ? 1.0f : 0.0f,
-		(actor->LightEffect == LE_Cylinder ? 1.0f : 0.0f) + (BakedLights.count(actor) ? 2.0f : 0.0f),
+		(actor->LightEffect == LE_Cylinder ? 1.0f : 0.0f) + (BakedLightIds.count(actor) ? 2.0f * (float)BakedLightIds[actor] : 0.0f),
 		changing ? 1.0f : 0.0f,
 		pattern);
 

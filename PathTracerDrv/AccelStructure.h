@@ -31,7 +31,7 @@ public:
 	// The host's half: a bottom level structure for any geometry that does not
 	// have one yet, the shapes that animate and their shading data, the lights
 	// and their grid, and the top level structure's instances.
-	void Update(const SceneData& scene, FrameUploads& uploads);
+	void Update(SceneData& scene, FrameUploads& uploads);
 
 	// The GPU's half, after uploads is recorded: the bottom level builds
 	// Update asked for, then the top level structure, rebuilt every frame.
@@ -53,6 +53,7 @@ public:
 	VulkanBuffer* GetAttributeBuffer() const { return AttributeBuffer.get(); }
 	VulkanBuffer* GetLightBuffer() const { return LightBuffer.get(); }
 	VulkanBuffer* GetLightGridBuffer() const { return LightGridBuffer.get(); }
+	VulkanBuffer* GetLightmapBuffer() const { return LightmapBuffer.get(); }
 	// One entry per instance, indexed in the shader by the intersection's
 	// instance id. Carries what varies by placement rather than by shape.
 	VulkanBuffer* GetInstanceDataBuffer() const { return InstanceDataBuffer.get(); }
@@ -124,6 +125,12 @@ private:
 	size_t LightGridCapacity = 0;
 	std::vector<uint32_t> LightGrid;
 	uint32_t LoggedGridCells = 0;
+
+	// The engine's shadow masks (SceneData's Lightmaps), written when a level
+	// sends them. Never empty: a level without them has a count of none.
+	void WriteLightmaps(SceneData& scene, FrameUploads& uploads);
+	std::unique_ptr<VulkanBuffer> LightmapBuffer;
+	size_t LightmapCapacity = 0;
 	size_t AttributeCapacity = 0;
 	bool haveDynamic = false;
 	bool attributesChanged = false;

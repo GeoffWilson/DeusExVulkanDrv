@@ -190,7 +190,7 @@ private:
 	void RenderTiles(VulkanCommandBuffer* commands);
 	void CreateBrightnessPipeline();
 	void DescribeLightingOf(AActor* target);
-	void DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, FOutputDevice& Ar);
+	void DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar);
 	void ApplyBrightness(VulkanCommandBuffer* commands);
 	void EnsureSceneBuilt(ULevel* level);
 	// Whether the engine has collected garbage since last asked, told by a
@@ -241,6 +241,8 @@ private:
 		UTexture* LastFrame = nullptr;
 	};
 	std::vector<SentTexture> SentTextures;
+	// Whether the helper has the level's shadow masks (Scene.Lightmaps).
+	bool LightmapsSent = false;
 	std::vector<uint32_t> Pixels;
 	int TextureFailuresLogged = 0;
 	bool TracerLost = false;

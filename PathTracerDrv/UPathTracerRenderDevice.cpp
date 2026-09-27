@@ -567,14 +567,14 @@ void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
 // gets from it on the scale where 1 is full brightness - its colour at
 // FGetHSV's full brightness, times its brightness and the level's, times
 // 1 - 3x^2 + 2x^3 of the way x out to its radius, times the cosine at the
-// surface, twice over for a light with a shadow mask, as Render.dll builds a
-// lightmap - whether the level's own geometry is in the way, which is all
-// that shadows a lightmap, and what the trace takes from it: the engine's own
-// figure with its lighting, linear light with the linear. Written to the
-// log, strongest first.
-void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, FOutputDevice& Ar)
+// surface, times twice its shadow mask there for a light baked into the
+// surface's lightmap, as Render.dll builds a lightmap - whether the level's
+// own geometry is in the way, and what the trace takes from it: the
+// engine's own figure with its lighting, linear light with the linear.
+// Written to the log, strongest first.
+void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar)
 {
-	struct Entry { AActor* Light; float Engine[3]; float Traced[3]; float Distance, Radius, Cosine; bool Clear, Baked; };
+	struct Entry { AActor* Light; float Engine[3]; float Traced[3]; float Distance, Radius, Cosine, Mask; bool Clear, Baked; };
 	std::vector<Entry> entries;
 	const FVector from = point + normal * 2.0f;
 	const float levelBrightness = level->GetLevelInfo() ? (float)level->GetLevelInfo()->Brightness : 1.0f;
@@ -612,16 +612,22 @@ void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& p
 		const float x = distance / radius;
 		const float smooth = 1.0f - 3.0f * x * x + 2.0f * x * x * x;
 		const float brightness = light->LightBrightness / 255.0f;
-		const float mask = baked.count(light) ? 2.0f : 1.0f;
+		// A baked light's shadow mask on this surface, which the trace holds
+		// it to as well unless PT BAKEDSHADOWS has it left out; -1 where the
+		// surface has no lightmap.
+		const float bakedMask = baked.count(light) ? LevelScene::BakedMaskAt(level->Model, iSurf, light, point) : -1.0f;
+		const float mask = baked.count(light) ? 2.0f * (bakedMask >= 0.0f ? bakedMask : 1.0f) : 1.0f;
+		const float tracedMask = (baked.count(light) && bakedMask >= 0.0f && (DisableBits & 16384u)) ? 2.0f : mask;
 		const FPlane c = FGetHSV(light->LightHue, light->LightSaturation, 255);
 		Entry e;
 		e.Light = light;
+		e.Mask = bakedMask;
 		const float colour[3] = { c.X, c.Y, c.Z };
 		for (int k = 0; k < 3; k++)
 		{
 			e.Engine[k] = Min(mask * colour[k] * brightness * levelBrightness * smooth * spot * incidence, 1.0f);
 			e.Traced[k] = EngineLightingNow
-				? Min(mask * colour[k] * brightness * smooth * spot * incidence, 1.0f)
+				? Min(tracedMask * colour[k] * brightness * smooth * spot * incidence, 1.0f)
 				: powf(colour[k], 2.2f) * brightness * (1.0f - x) * spot * incidence;
 		}
 		e.Baked = baked.count(light) != 0;
@@ -656,7 +662,7 @@ void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& p
 		debugf(TEXT("  %s %s: brightness %d hue %d saturation %d, %.0f of %.0f away, cosine %.2f, %s, %s; engine %.3f %.3f %.3f, trace %.4f %.4f %.4f"),
 			e.Light->GetName(), e.Light->GetClass()->GetName(), (int)e.Light->LightBrightness, (int)e.Light->LightHue,
 			(int)e.Light->LightSaturation, e.Distance, e.Radius, e.Cosine, e.Clear ? TEXT("clear") : TEXT("BLOCKED"),
-			e.Baked ? TEXT("baked") : TEXT("dynamic"),
+			!e.Baked ? TEXT("dynamic") : (e.Mask < 0.0f ? TEXT("baked, no lightmap here") : *FString::Printf(TEXT("baked, shadow mask %.2f"), e.Mask)),
 			e.Engine[0], e.Engine[1], e.Engine[2], e.Traced[0], e.Traced[1], e.Traced[2]);
 	}
 	debugf(TEXT("  engine's lightmap, unclear lights too: %.3f %.3f %.3f; the clear ones: %.3f %.3f %.3f (1 is the lightmap's full, which the devices draw at twice the texture, before the ambient); trace, the clear ones: %.4f %.4f %.4f %s"),
@@ -1499,7 +1505,24 @@ bool UPathTracerRenderDevice::SendScene()
 		Tracer->ResetScene();
 		SentVersions.clear();
 		SentTextures.clear();
+		LightmapsSent = false;
 		SceneReset = false;
+	}
+
+	// The engine's shadow masks, once a level. More than the command area
+	// could carry would stop the helper, so a level that big goes without,
+	// its baked lights shadowed by the trace alone.
+	if (!LightmapsSent)
+	{
+		LightmapsSent = true;
+		const size_t bytes = Scene.Lightmaps.size() * sizeof(uint32_t);
+		if (bytes < (48u << 20))
+			Tracer->Lightmaps(Scene.Lightmaps);
+		else
+		{
+			debugf(TEXT("PathTracer lightmaps: %.1f MB is too much to send; the engine's shadows are left out"), bytes / (1024.0f * 1024.0f));
+			Tracer->Lightmaps(std::vector<uint32_t>());
+		}
 	}
 
 	// Shapes are sent once, and those that are rebuilt - an animating
@@ -2156,7 +2179,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				else
 					Ar.Logf(TEXT("PT: zone %s has no ambient"), zone ? zone->GetName() : TEXT("none"));
 				DescribeLightingAt(player->XLevel, hit.Location, hit.Normal, texture,
-					node.iSurf < model->Surfs.Num() && (model->Surfs(node.iSurf).PolyFlags & PF_SpecialLit) != 0, Ar);
+					node.iSurf < model->Surfs.Num() && (model->Surfs(node.iSurf).PolyFlags & PF_SpecialLit) != 0, node.iSurf, Ar);
 				LightmapProbeSurf = node.iSurf;
 				LightmapProbePoint = hit.Location;
 				LightmapProbeUntil = FrameIndex + 30;
@@ -2239,7 +2262,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 
 		struct Switch { const TCHAR* Name; uint32_t Bit; };
 		static const Switch switches[] = {
-			{ TEXT("NOLIGHTS"), 1u }, { TEXT("NOSHADOWS"), 2u }, { TEXT("NOSKY"), 4u }, { TEXT("OPAQUE"), 8u }, { TEXT("HIGHLIGHT"), 16u }, { TEXT("NOFOG"), 32u }, { TEXT("GUIDES"), 64u },
+			{ TEXT("NOLIGHTS"), 1u }, { TEXT("NOSHADOWS"), 2u }, { TEXT("NOSKY"), 4u }, { TEXT("OPAQUE"), 8u }, { TEXT("HIGHLIGHT"), 16u }, { TEXT("NOFOG"), 32u }, { TEXT("GUIDES"), 64u }, { TEXT("NOGLOW"), 512u },
 		};
 		bool handled = false;
 		for (const Switch& s : switches)
@@ -2275,6 +2298,17 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		{
 			MaxAnisotropy = (FLOAT)Clamp(appAtoi(Cmd), 0, 16);
 			Ar.Logf(TEXT("PT: texture filter %s"), MaxAnisotropy > 1.0f ? *FString::Printf(TEXT("%dx anisotropic"), appRound(MaxAnisotropy)) : TEXT("trilinear"));
+			handled = true;
+		}
+		// The engine's own shadow masks on its baked lights, with the
+		// engine's lighting (Disable bit 16384 leaves them out).
+		if (ParseCommand(&Cmd, TEXT("BAKEDSHADOWS")))
+		{
+			DisableBits ^= 16384u;
+			AccumulatedFrames = 0;
+			Ar.Logf(TEXT("PT: the engine's baked shadows %s"), (DisableBits & 16384u)
+				? TEXT("off, baked lights shadowed by the trace alone")
+				: TEXT("on, each baked light held to the lightmap's shadow mask as well as traced"));
 			handled = true;
 		}
 		if (ParseCommand(&Cmd, TEXT("MIPS")))
@@ -2422,7 +2456,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | MATERIALS | MESHLIGHT | DETAIL | MIPS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT LIGHTS | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 
@@ -2541,6 +2575,7 @@ void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo
 			poly = p;
 	if (!poly)
 		return;
+	const INT probedSurf = LightmapProbeSurf;
 	LightmapProbeSurf = -1;
 
 	FTextureInfo* lm = Surface.LightMap;
@@ -2594,6 +2629,16 @@ void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo
 		offCamera < offWorld ? TEXT("camera") : TEXT("world"), Min(offWorld, offCamera), u, v, lm->UClamp, lm->VClamp,
 		value[0], value[1], value[2], value[0] * 4.0f / 255.0f, value[1] * 4.0f / 255.0f, value[2] * 4.0f / 255.0f,
 		peak[0], peak[1], peak[2], mean[0], mean[1], mean[2]);
+	// Where the trace puts the same point on it, from the level's own record
+	// of the lightmap, which is what the shadow masks are laid on with.
+	if (FLightMapIndex* index = model->GetLightMapIndex(probedSurf))
+	{
+		const FBspSurf& surf = model->Surfs(probedSurf);
+		const FVector d = world - model->Points(surf.pBase);
+		debugf(TEXT("PT: the level's record of it: texel %.2f %.2f (pan %.1f %.1f, scale %.2f %.2f; drawn with pan %.1f %.1f, scale %.2f %.2f)"),
+			((d | model->Vectors(surf.vTextureU)) - index->Pan.X) / index->UScale, ((d | model->Vectors(surf.vTextureV)) - index->Pan.Y) / index->VScale,
+			index->Pan.X, index->Pan.Y, index->UScale, index->VScale, lm->Pan.X, lm->Pan.Y, lm->UScale, lm->VScale);
+	}
 }
 
 void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span) {}

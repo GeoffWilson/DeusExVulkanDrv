@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 9;
+	static const uint32_t Version = 10;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -137,6 +137,7 @@ namespace TraceProtocol
 		CmdTexturePixels,
 		CmdTrace,
 		CmdQuit,
+		CmdLightmaps,
 	};
 
 	// Every command starts with this, and Bytes covers the header and whatever
@@ -188,6 +189,15 @@ namespace TraceProtocol
 		CommandHeader H;
 		uint32_t LightCount;
 		uint32_t FogCount;
+	};
+
+	// The engine's shadow masks on the level's surfaces, SceneData's
+	// Lightmaps. Followed by Words words.
+	struct LightmapsCommand
+	{
+		CommandHeader H;
+		uint32_t Words;
+		uint32_t Pad;
 	};
 
 	// How a texture's pixels come: RGBA8, or S3TC's 4x4 blocks as they were

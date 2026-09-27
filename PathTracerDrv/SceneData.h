@@ -165,7 +165,8 @@ struct SceneLight
 	// -1 for a light that shines every way.
 	vec4 DirectionCone;
 	// x no incidence falloff, y 1 for distance measured horizontally (a
-	// cylinder) plus 2 for a light baked into the level's lightmaps, z
+	// cylinder) plus twice the light's number among those baked into the
+	// level's lightmaps (numbered from 1, so 2 or more is baked), z
 	// brightness changes from frame to frame, w the light's pattern: 0
 	// disco, 1 searchlight (its sweep offset in DirectionCone.x), 2 rotor
 	// (which way it turns, 1 or -1, in DirectionCone.x), -1 none.
@@ -244,6 +245,20 @@ public:
 
 	// Rebuilt each frame. The first entry is always the static world.
 	std::vector<SceneInstance> Instances;
+
+	// The engine's own shadow masks on the level's lightmapped surfaces, as
+	// words: the number of surfaces, then each one's record of 12 words -
+	// how a point maps onto its lightmap (u = dot(xyz, point) + w, texel
+	// centres at whole numbers), four floats for u and four for v; the byte
+	// its masks start at; its width and height, 16 bits each; where its list
+	// of baked light numbers starts and how long it is - then the lists, then
+	// the masks, a byte a texel, one after another in the list's order. A
+	// level surface's triangles carry their record's number plus one in
+	// Emission.z. Sent once a level (LevelScene::AddLightmap).
+	std::vector<uint32_t> Lightmaps;
+	// Set when they arrive, so the buffer the shader reads them from is
+	// written once rather than every frame.
+	bool LightmapsChanged = false;
 
 	// Set when geometry was added, so whoever keeps acceleration structures
 	// for it knows to extend them.

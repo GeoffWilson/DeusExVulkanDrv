@@ -77,6 +77,9 @@ std::string Shaders::Trace()
 		layout(binding = 5, std430) readonly buffer InstanceData { vec4 instanceAmbient[]; };
 		// Which lights reach which cell of the level: see WriteLightGrid.
 		layout(binding = 8, std430) readonly buffer LightGrid { uint lightGrid[]; };
+		// The engine's shadow masks on the level's lightmapped surfaces: see
+		// SceneData's Lightmaps.
+		layout(binding = 25, std430) readonly buffer Lightmaps { uint lightmapData[]; };
 		// What each texture is made of, indexed as the texture array is: x
 		// roughness, y metalness, z reflectance face on. See Materials.h.
 		layout(binding = 20, std430) readonly buffer MaterialData { vec4 materials[1024]; };
@@ -130,7 +133,7 @@ std::string Shaders::Trace()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve; 64 write NRD's inputs, 256 Ray Reconstruction's
+			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks; 64 write NRD's inputs, 256 Ray Reconstruction's
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -754,7 +757,82 @@ std::string Shaders::Trace()
 		// a mesh, which the engine scales its mesh lighting by, and negative
 		// anywhere else; viewDir is the way the ray that found the point was
 		// going.
-		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir,
+		// One texel of a lightmap's shadow mask, 0 to 255, a byte each.
+		float maskTexel(uint start, int x, int y, int width)
+		{
+			uint b = start + uint(y * width + x);
+			return float((lightmapData[b >> 2u] >> ((b & 3u) * 8u)) & 255u);
+		}
+
+		// Where a point lies on its surface's lightmap, worked out once for
+		// every light there. present is false with no lightmap, or with the
+		// masks left out (PT BAKEDSHADOWS, Disable bit 16384).
+		struct LightmapPoint
+		{
+			bool present;
+			uint listStart;
+			uint listCount;
+			uint start;
+			uint texels;
+			int width;
+			ivec4 corners;   // x0 x1 y0 y1
+			vec2 f;
+		};
+
+		// surface is the record's number plus one (Emission.z).
+		LightmapPoint lightmapPoint(uint surface, vec3 position)
+		{
+			LightmapPoint p;
+			p.present = surface != 0u && (Disable & 16384u) == 0u;
+			p.listStart = 0u;
+			p.listCount = 0u;
+			p.start = 0u;
+			p.texels = 0u;
+			p.width = 1;
+			p.corners = ivec4(0);
+			p.f = vec2(0.0);
+			if (!p.present)
+				return p;
+			uint record = 1u + (surface - 1u) * 12u;
+			vec4 ua = uintBitsToFloat(uvec4(lightmapData[record], lightmapData[record + 1u], lightmapData[record + 2u], lightmapData[record + 3u]));
+			vec4 va = uintBitsToFloat(uvec4(lightmapData[record + 4u], lightmapData[record + 5u], lightmapData[record + 6u], lightmapData[record + 7u]));
+			uint size = lightmapData[record + 9u];
+			int width = int(size & 65535u), height = int(size >> 16u);
+			p.start = lightmapData[record + 8u];
+			p.listStart = lightmapData[record + 10u];
+			p.listCount = lightmapData[record + 11u];
+			p.texels = uint(width * height);
+			p.width = width;
+			vec2 t = vec2(dot(ua.xyz, position) + ua.w, dot(va.xyz, position) + va.w);
+			p.f = fract(t);
+			ivec2 t0 = ivec2(floor(t));
+			p.corners = ivec4(clamp(t0.x, 0, width - 1), clamp(t0.x + 1, 0, width - 1), clamp(t0.y, 0, height - 1), clamp(t0.y + 1, 0, height - 1));
+			return p;
+		}
+
+		// A baked light's shadow mask at the point, doubled as the engine
+		// counts it: 2 where the light is clear all round, falling to 0 in
+		// shadow, as the engine filters its masks before lighting a surface
+		// (LevelScene's FilteredMask) and filtered between texels as a
+		// device draws a lightmap; 0 where the surface's lightmap does not
+		// have the light at all, and 2 on a surface without one. bakedId is
+		// the light's number (Flags.y).
+		float bakedScale(LightmapPoint p, uint bakedId)
+		{
+			if (!p.present)
+				return 2.0;
+			uint k = 0u;
+			while (k < p.listCount && lightmapData[p.listStart + k] != bakedId)
+				k++;
+			if (k == p.listCount)
+				return 0.0;
+			uint start = p.start + k * p.texels;
+			float top = mix(maskTexel(start, p.corners.x, p.corners.z, p.width), maskTexel(start, p.corners.y, p.corners.z, p.width), p.f.x);
+			float bottom = mix(maskTexel(start, p.corners.x, p.corners.w, p.width), maskTexel(start, p.corners.y, p.corners.w, p.width), p.f.x);
+			return 2.0 * mix(top, bottom, p.f.y) / 255.0;
+		}
+
+		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir, LightmapPoint lightmap, bool masked,
 			out vec3 value, out vec3 base, out vec3 dir, out float distance, out bool behind)
 		{
 			value = vec3(0.0);
@@ -894,8 +972,20 @@ std::string Shaders::Trace()
 				// apart. A light baked into the lightmaps counts twice what a
 				// dynamic one does: its shadow mask is filtered out to 255
 				// where a light without one is filled at 127.
+				//
+				// And on a surface with a lightmap, it is held to the mask as
+				// the engine has it there as well as to the trace's shadows.
+				// The engine's masks are coarse - a texel can be the best part
+				// of a metre across - and blurred, and most of a small wall's
+				// texels can lie in shadow where the light reaches the whole
+				// of it; traced alone, such a room came out several times as
+				// bright as the engine draws it. Unless masked, the light is
+				// taken as clear all round: see directLight.
 				float x = reach / radius;
-				float lit = shade * (1.0 - x * x * (3.0 - 2.0 * x)) * (light.Flags.y > 1.5 ? 2.0 : 1.0);
+				float mask = 1.0;
+				if (light.Flags.y > 1.5)
+					mask = masked ? bakedScale(lightmap, uint(light.Flags.y * 0.5)) : 2.0;
+				float lit = shade * (1.0 - x * x * (3.0 - 2.0 * x)) * mask;
 				base = pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) * lit;
 				value = min(base * response, vec3(1.0));
 			}
@@ -968,12 +1058,19 @@ std::string Shaders::Trace()
 		// was worth. shownAmbient is the zone's ambient on a level surface as
 		// displayed, which with the engine's lighting goes into the sum with
 		// the lights, and what it then gives is left in lightmapAmbient.
-		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, vec3 shownAmbient, uint strongest,
+		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, vec3 shownAmbient, uint strongest, uint surface,
 			out vec3 lightDirection, out vec3 lightBase)
 		{
 			lightDirection = normal;
 			lightBase = vec3(0.0);
 			bool engineSum = EngineLighting && meshGlow < 0.0;
+			// The engine's shadow masks, looked up only for the lights that
+			// are traced: the strongest are chosen by what they would give
+			// clear all round, and each pick weighed by that, which is what
+			// makes the estimate come out right whatever its mask turns out
+			// to be. Looking up every light in reach cost more than the rest
+			// of the lighting together.
+			LightmapPoint lightmap = lightmapPoint(engineSum ? surface : 0u, position);
 			// A lightmap's full is drawn at twice the texture's brightness.
 			lightmapAmbient = EngineLighting ? pow(2.0 * min(shownAmbient, vec3(1.0)), vec3(2.2)) : vec3(0.0);
 			if ((Disable & 1u) != 0u)
@@ -1014,7 +1111,7 @@ std::string Shaders::Trace()
 				vec3 value, base, dir;
 				float distance;
 				bool behind;
-				if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, value, base, dir, distance, behind))
+				if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmap, everyLight, value, base, dir, distance, behind))
 					continue;
 				float weight = luminance(value);
 				total += value;
@@ -1086,15 +1183,16 @@ std::string Shaders::Trace()
 				vec3 value, base, dir;
 				float distance;
 				bool behind;
-				lightAt(strongIndex[t], position, normal, specialLit, meshGlow, viewDir, value, base, dir, distance, behind);
+				lightAt(strongIndex[t], position, normal, specialLit, meshGlow, viewDir, lightmap, true, value, base, dir, distance, behind);
 				if (lights[strongIndex[t]].Flags.z > 0.5)
 					litByChangingLight = true;
-				if (!lightReaches(position, dir, distance, behind))
+				float weight = luminance(value);
+				if (weight <= 0.0 || !lightReaches(position, dir, distance, behind))
 					continue;
 				reaches += value;
-				if (strongWeight[t] > highlightWeight)
+				if (weight > highlightWeight)
 				{
-					highlightWeight = strongWeight[t];
+					highlightWeight = weight;
 					lightDirection = dir;
 					lightBase = base;
 				}
@@ -1104,10 +1202,10 @@ std::string Shaders::Trace()
 				vec3 value, base, dir;
 				float distance;
 				bool behind;
-				lightAt(uint(chosen), position, normal, specialLit, meshGlow, viewDir, value, base, dir, distance, behind);
+				lightAt(uint(chosen), position, normal, specialLit, meshGlow, viewDir, lightmap, true, value, base, dir, distance, behind);
 				if (lights[chosen].Flags.z > 0.5)
 					litByChangingLight = true;
-				if (lightReaches(position, dir, distance, behind))
+				if (luminance(value) > 0.0 && lightReaches(position, dir, distance, behind))
 				{
 					float scale = restWeight / chosenWeight;
 					reaches += value * scale;
@@ -1439,7 +1537,7 @@ std::string Shaders::Trace()
 
 					float t = rayQueryGetIntersectionTEXT(rq, true);
 					// The footprint's width here, which is where the ray carries
-					// on from, through glass or into the sky zone or off a bounce.
+					// on from, through glass or off a bounce.
 					float hitWidth = coneWidth + coneSpread * t;
 					coneWidth = hitWidth;
 					// How far the first ray off the surface went, which a denoiser
@@ -1534,6 +1632,12 @@ std::string Shaders::Trace()
 							inSky = true;
 							origin = SkyOrigin.xyz;
 							rayMin = RayEpsilon;
+							// The eye is at the sky zone's viewpoint now, so the
+							// cone starts again from a point there. Carried on from
+							// the window, however far off that was, it reached the
+							// skybox - a small room close by - as wide as the
+							// window's distance made it, and blurred the skyline.
+							coneWidth = 0.0;
 							if (passes < 8u)
 							{
 								passes++;
@@ -1587,14 +1691,14 @@ std::string Shaders::Trace()
 							vec3 contribution;
 							if (sprite || attr.Emission.w > 0.5)
 							{
-								contribution = attr.Albedo.rgb * glow;
+								contribution = bounce > firstBounce && (Disable & 512u) != 0u ? vec3(0.0) : attr.Albedo.rgb * glow;
 							}
 							else
 							{
 								vec3 surroundings = linearAmbient(attr, rayQueryGetIntersectionInstanceIdEXT(rq, true));
 								vec3 unusedDirection, unusedBase;
 								contribution = attr.Albedo.rgb * directLight(position, normal, attr.Ambient.w > 0.5, true, -1.0, direction,
-									pow(surroundings, vec3(1.0 / 2.2)), 0u, unusedDirection, unusedBase);
+									pow(surroundings, vec3(1.0 / 2.2)), 0u, uint(attr.Emission.z + 0.5), unusedDirection, unusedBase);
 								contribution += attr.Albedo.rgb * (EngineLighting ? lightmapAmbient : surroundings);
 							}
 							radiance += throughput * contribution;
@@ -1775,8 +1879,10 @@ std::string Shaders::Trace()
 					if (attr.Emission.w > 0.5)
 					{
 						// Already counted, as emission, when it is the
-						// denoiser's surface.
-						if (!firstSurface)
+						// denoiser's surface. PT NOGLOW (Disable bit 512) has
+						// it light nothing, to see what glowing surfaces add
+						// to a room.
+						if (!firstSurface && !(bounce > firstBounce && (Disable & 512u) != 0u))
 							radiance += throughput * attr.Albedo.rgb * glow;
 						break;
 					}
@@ -1797,7 +1903,7 @@ std::string Shaders::Trace()
 					}
 					vec3 ambient = linearAmbient(attr, hitInstance);
 					vec3 lit = directLight(lifted, normal, attr.Ambient.w > 0.5, false, meshGlow, direction,
-						pow(ambient, vec3(1.0 / 2.2)), firstSurface ? 4u : 1u, lightDirection, lightBase);
+						pow(ambient, vec3(1.0 / 2.2)), firstSurface ? 4u : 1u, uint(attr.Emission.z + 0.5), lightDirection, lightBase);
 					if (meshGlow >= 0.0)
 						lit = meshLight(lit, instanceAmbient[hitInstance].rgb);
 

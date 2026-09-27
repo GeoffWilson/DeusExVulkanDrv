@@ -27,6 +27,8 @@ void AccelStructure::Reset()
 	InstanceBuffer.reset();
 	InstanceDataBuffer.reset();
 	LightBuffer.reset();
+	LightmapBuffer.reset();
+	LightmapCapacity = 0;
 	AttributeBuffer.reset();
 	AttributeCapacity = 0;
 	haveDynamic = false;
@@ -117,10 +119,44 @@ void AccelStructure::CreateStaticBottomLevel(const SceneGeometry& geometry, Bott
 	unguard;
 }
 
-void AccelStructure::Update(const SceneData& scene, FrameUploads& uploads)
+void AccelStructure::Update(SceneData& scene, FrameUploads& uploads)
 {
 	SyncGeometry(scene, uploads);
+	WriteLightmaps(scene, uploads);
 	WriteInstances(scene, uploads);
+}
+
+void AccelStructure::WriteLightmaps(SceneData& scene, FrameUploads& uploads)
+{
+	guard(AccelStructure::WriteLightmaps);
+
+	if (LightmapBuffer && !scene.LightmapsChanged)
+		return;
+	scene.LightmapsChanged = false;
+	const size_t wanted = std::max<size_t>(scene.Lightmaps.size(), 4);
+	if (!LightmapBuffer || wanted > LightmapCapacity)
+	{
+		LightmapCapacity = wanted;
+		uploads.Retire(std::move(LightmapBuffer));
+		LightmapBuffer = BufferBuilder()
+			.Size(LightmapCapacity * sizeof(uint32_t))
+			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+			.MinAlignment(256)
+			.DebugName("PathTracerLightmaps")
+			.Create(renderer->GetDevice());
+		attributesChanged = true;
+	}
+	if (scene.Lightmaps.empty())
+	{
+		const uint32_t none[4] = {};
+		uploads.Upload(LightmapBuffer.get(), 0, none, sizeof(none));
+	}
+	else
+	{
+		uploads.Upload(LightmapBuffer.get(), 0, scene.Lightmaps.data(), scene.Lightmaps.size() * sizeof(uint32_t));
+	}
+
+	unguard;
 }
 
 void AccelStructure::SyncGeometry(const SceneData& scene, FrameUploads& uploads)

@@ -101,13 +101,14 @@ void TraceRenderer::CreateTracePipeline()
 		.AddBinding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerSetLayout")
 		.Create(Device);
 
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 + GuideImageCount)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxTextures)
 		.MaxSets(1)
 		.DebugName("PathTracerDescriptorPool")
@@ -635,7 +636,7 @@ void TraceRenderer::WriteFinishDescriptors()
 
 void TraceRenderer::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !MotionBuffer)
+	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !Accel->GetLightmapBuffer() || !MotionBuffer)
 		return;
 	Context->WaitForGpu();
 
@@ -656,6 +657,7 @@ void TraceRenderer::UpdateDescriptors()
 		.AddBuffer(DescriptorSet.get(), 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
 		.AddBuffer(DescriptorSet.get(), 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
 		.AddBuffer(DescriptorSet.get(), 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightGridBuffer())
+		.AddBuffer(DescriptorSet.get(), 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightmapBuffer())
 		.Execute(Device);
 	WriteCompositeDescriptors();
 	WriteFinishDescriptors();

@@ -32,6 +32,12 @@ public:
 	ULevel* SourceLevel = nullptr;
 	int SourceNodeCount = 0;
 
+	// A baked light's shadow mask on one of the level's surfaces at a point,
+	// 0 to 1, as the engine filters it before lighting the surface: 1 where
+	// the light is clear all round, 0 where the surface's lightmap does not
+	// have the light at all. -1 when the surface has no lightmap. For PT LOOK.
+	static float BakedMaskAt(UModel* model, INT iSurf, AActor* light, const FVector& point);
+
 private:
 	static void AnimationPose(UMesh* mesh, FName sequence, FLOAT animFrame, int& frameA, int& frameB, float& alpha);
 	int AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int frameB, float alpha, UTexture* const skins[8], float styleKind = 0.0f, const FCoords* toLocal = nullptr);
@@ -123,8 +129,19 @@ private:
 	int MirroredSurfaces = 0;
 	// The lights the level's build baked into its lightmaps, with a shadow
 	// mask on each surface they reach, which the engine counts at twice the
-	// brightness of a light without one.
-	std::unordered_set<AActor*> BakedLights;
+	// brightness of a light without one. Numbered from 1, as the shader
+	// finds them in a surface's list.
+	std::unordered_map<AActor*, uint32_t> BakedLightIds;
+	// Each lightmapped surface of the level's, by its index, as its record's
+	// number plus one; and the records, light lists and masks as they are
+	// gathered, put together into Lightmaps once the level is built.
+	std::unordered_map<INT, uint32_t> LightmapRecords;
+	UModel* LightmappedModel = nullptr;
+	std::vector<uint32_t> LightmapRecordWords;
+	std::vector<uint32_t> LightmapLightWords;
+	std::vector<uint8_t> LightmapMaskBytes;
+	uint32_t AddLightmap(UModel* model, INT iSurf);
+	void FinishLightmaps();
 	std::unordered_map<AActor*, PlacedPose> PreviousPoses;
 	std::unordered_map<AActor*, PlacedPose> CurrentPoses;
 	// The first person weapon's last placement, which is not an actor's
