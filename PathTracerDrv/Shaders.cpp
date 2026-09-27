@@ -284,7 +284,9 @@ std::string Shaders::Trace()
 			dy = vec2(dot(tu, a1), dot(tv, a1));
 			return true;
 		}
+	)";
 
+	source += R"(
 		// A texel of a hit's texture at the footprint's size: filtered along
 		// it where the surface is flat, at one level where it is not, at the
 		// top level with mipmaps switched off (Disable bit 4096). scale
@@ -977,7 +979,9 @@ std::string Shaders::Trace()
 				if (disco <= 0.0)
 					return false;
 			}
+	)";
 
+	source += R"(
 			// Linear to zero at the radius, as the engine lights a mesh and as
 			// the linear lighting lights everything; the engine's lighting
 			// takes the level's surfaces by its lightmaps' curve below.
