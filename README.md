@@ -469,11 +469,11 @@ that is not meant to repeat - so the HUD is as sharp as it is in D3D.
 **Wide screens.** The engine's field of view is horizontal: on a screen wider
 than 4:3 it keeps the width and crops the top and bottom, so at 21:9 the game's
 75 degrees shows under 60% of the height it does at 4:3, and conversations and
-cinematics framed for 4:3 lose heads and feet. The raster devices cannot help
-it, since they only draw what the engine has projected. The trace builds the
-view from the level, so it keeps the height the same field of view gives at 4:3
-and widens the view to fill the screen ("Hor+", `WidescreenFOV`). Everything
-that frames the view follows from that:
+cinematics framed for 4:3 lose heads and feet. The trace keeps the height the
+same field of view gives at 4:3 and widens the view to fill the screen ("Hor+",
+`WidescreenFOV`), building it from the level; VulkanDrv does the same by having
+the engine compute the wider view itself. Everything that frames the view
+follows from that:
 
 - **Cinematics and conversations.** A cinematic camera's field of view is taken
   from the frame the engine renders with, not the player's. A conversation
@@ -576,9 +576,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   game's field of view gives at 4:3 and widen the view to the screen ("Hor+").
   The engine's field of view is horizontal, so at 21:9 it keeps the width and
   crops the top and bottom, and conversations and cinematics framed for 4:3
-  lose heads and feet; the raster devices cannot help that, since they only
-  draw what the engine has projected, but the trace builds the view from the
-  level. Keep the game's own field of view at its 4:3 value (75 by default).
+  lose heads and feet. Keep the game's own field of view at its 4:3 value
+  (75 by default).
   The HUD's brackets around what can be used, and the augmentations' target
   boxes, are placed with the same view, so they stay on what they mark.
   `PT WIDESCREEN` switches it for the session.
@@ -869,9 +868,39 @@ And what was added:
 - **A frame limiter** (`FPSLimit`), paced against presentation where the device
   allows. Not optional in practice: uncapped, the engine cuts conversation audio
   short and its cinematic cameras drift.
+- **A widescreen field of view** (`WidescreenFOV`, on by default; `VK WIDESCREEN`
+  switches it for the session). On a screen wider than 4:3 the engine keeps
+  the width and crops the top and bottom, so at 21:9 conversations and
+  cinematics framed for 4:3 lose heads and feet. A device cannot widen the view
+  by itself: the engine culls the level, and lights it, for its own view before
+  handing anything over. So the engine is made to compute the wider view
+  itself: every view's projection and the edges it culls against come from one
+  function in `Engine.dll`, `FSceneNode::ComputeRenderSize`, which VulkanDrv
+  redirects to call with the field of view that keeps 4:3's height, handing the
+  player's own angle back afterwards. The engine then culls, lights and draws
+  the wider view as it would any other; the game's scripts never see the wider
+  angle, so zooming and mouse sensitivity work as before. It only redirects the
+  jump the 1112fm `Engine.dll` has there, and leaves any other alone. Keep the
+  game's own field of view at its 4:3 value (75 by default). The engine does
+  more work for the wider view.
+- **A pinned HUD** (`PinnedUI`, 4:3 by default; `VK PINNEDUI 16:9`,
+  `VK PINNEDUI 4:3` and `VK PINNEDUI OFF` switch it for the session), as the
+  path tracer has it. In fullscreen the game is given a mode of that shape at
+  the height chosen and lays its HUD, menus and conversations out in it as it
+  was designed to, while the world fills the rest of the mode chosen around
+  them; what spans the game's whole width - a conversation's bars, a fade, the
+  darkening behind a menu - is carried on to the screen's edges. The world
+  either side comes from the engine too: `URender::DrawWorld` in `Render.dll`
+  is redirected the same way, and for the player's view alone the frame is
+  widened to the screen at the focal length it already had, given a culling
+  buffer of that width, drawn, and put back as it was for the HUD. The sky,
+  mirrors and warp zones drawn inside it follow the same focal length; the
+  cameras' and the spy drone's insets stay in the box. The game lists the
+  narrower mode as its resolution, but the ini keeps the one chosen. 0 lays
+  the UI across the whole width.
 - **Anisotropic filtering** (`MaxAnisotropy`), **sRGB textures**
   (`SRGBTextures`), and 4:3 and 16:9 modes letterboxed at the monitor's full
-  height, which is the practical answer to cinematics on a wide screen.
+  height.
 - **Surviving a lost device**, rebuilding everything under the instance rather
   than taking the process with it.
 
@@ -883,7 +912,12 @@ Recommended in `[VulkanDrv.VulkanRenderDevice]`:
 	MaxAnisotropy=16.000000
 
 Raise `RenderScale` until the cost shows rather than turning on MSAA as well:
-the game is bound by its own engine long before the GPU.
+the game is bound by its own engine long before the GPU. The scene buffers
+also cost the game address space, of which a 32 bit process has 4 GB at most:
+at 3440x1440 with 4x MSAA, `RenderScale=4` left some 430 MB less free than
+`RenderScale=2`. `VulkanDrvEvents.log` records how much is free at each change
+of buffer size, and any fault or C++ exception with the stack that raised it,
+since the engine's own report of a crash leaves out what went wrong.
 
 The rest of its settings, from upstream: `UseVSync`, `Hdr`, `HdrScale`, `Bloom`,
 `BloomAmount`, `Saturation`, `Contrast`, `LinearBrightness`, `GammaMode`,

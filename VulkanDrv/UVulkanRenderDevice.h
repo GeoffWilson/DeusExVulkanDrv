@@ -147,6 +147,41 @@ public:
 	INT VkTestDeviceLoss;
 	BITFIELD VkExclusiveFullscreen;
 
+#if defined(DEUSEX) && defined(WIN32)
+	// On a screen wider than 4:3, has the engine keep the height of view its
+	// field of view gives at 4:3 and widen the view to the screen ("Hor+"),
+	// rather than crop the top and bottom. See WidescreenComputeRenderSize.
+	// VK WIDESCREEN switches it for the session.
+	BITFIELD UseWidescreenFOV;
+	// In fullscreen, lay the game's own 2D - the HUD, menus, conversations and
+	// the pointer - out in a box no wider than this aspect ratio, centred, with
+	// the world filling the screen either side ("PinnedUI" in the ini: 1.333333
+	// for 4:3, the default, 1.777778 for 16:9, 0 to use the whole width). The
+	// engine is given a mode of that shape and the world is drawn wider than
+	// it; see SetRes and PinnedDrawWorld. VK PINNEDUI switches it for the
+	// session.
+	FLOAT PinnedUI;
+
+	bool WidescreenFovWanted = true;
+	bool WidescreenFovActive = false;
+	float PinnedAspect = 4.0f / 3.0f;
+	bool PinnedWorldReady = false;
+	// The mode chosen when the engine was given a narrower one for the UI,
+	// or 0: what the picture is drawn at.
+	int PinnedModeWidth = 0;
+	int PinnedModeHeight = 0;
+
+	void ApplyEngineHooks();
+	void RemoveEngineHooks();
+	void UpdatePinnedWorld();
+#endif
+
+	// The width of the picture drawn, in the engine's pixels: its viewport's,
+	// or with the UI pinned the mode chosen, with the engine's view - and all
+	// it draws in 2D - GetUiOffsetX in from the left.
+	int GetOutputWidth() const;
+	int GetUiOffsetX() const;
+
 	void RunBloomPass();
 	void BloomStep(VulkanCommandBuffer* cmdbuffer, VulkanPipeline* pipeline, VulkanDescriptorSet* input, VulkanFramebuffer* output, int width, int height, const BloomPushConstants &pushconstants);
 	static float ComputeBlurGaussian(float n, float theta);

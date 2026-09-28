@@ -1672,12 +1672,12 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 		// the screen's shape. On one wider than 4:3 the engine keeps the width and
 		// crops the top and bottom - at 21:9 its 75 degrees shows under 60% of the
 		// height it does at 4:3, and the conversations and cinematics, framed for
-		// 4:3, lose heads and feet. The raster devices can do nothing about it:
-		// they draw what the engine has already projected, and it projects only
-		// what fits its own view. The trace builds the view from the level itself,
-		// so it can keep the height the same FovAngle gives at 4:3 and widen the
-		// view to fill the screen instead. A screen 4:3 or narrower is left as the
-		// engine has it.
+		// 4:3, lose heads and feet. The trace builds the view from the level
+		// itself, so it can keep the height the same FovAngle gives at 4:3 and
+		// widen the view to fill the screen instead. (A raster device has to have
+		// the engine compute the wider view, since it draws only what the engine
+		// culled for its own - see VulkanDrv's WidescreenComputeRenderSize.) A
+		// screen 4:3 or narrower is left as the engine has it.
 		if (WidescreenFovEnabled && screenX * 3.0f > screenY * 4.0f)
 			focal = Min(screenY * 0.5f / (0.75f * tanHalfFov), focal);
 

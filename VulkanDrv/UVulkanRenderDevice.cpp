@@ -58,6 +58,424 @@ static void SDLVulkanGetDrawableSizeCompat(SDL_Window* window, int* w, int* h)
 }
 #endif
 
+#if defined(DEUSEX) && defined(WIN32)
+
+// A crash inside the device leaves only the engine's history in DeusEx.log:
+// the functions it unwound through, not what went wrong - a C++ exception's
+// message is dropped by the guard blocks - and the next start overwrites even
+// that. VulkanDrvEvents.log keeps what was raised, with the stack that raised
+// it, and is only started afresh once per run.
+static void VulkanEvent(const char* format, ...)
+{
+	FILE* f = fopen("VulkanDrvEvents.log", "a");
+	if (!f)
+		return;
+	SYSTEMTIME now = {};
+	GetLocalTime(&now);
+	fprintf(f, "%02d:%02d:%02d.%03d ", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+	va_list args;
+	va_start(args, format);
+	vfprintf(f, format, args);
+	va_end(args);
+	fprintf(f, "\n");
+	fclose(f);
+}
+
+// Where an address is: module and offset, which a disassembly or the build's
+// map can turn into a function.
+static void VulkanDescribeAddress(const void* address, char* out, size_t size)
+{
+	HMODULE module = nullptr;
+	char name[MAX_PATH] = "?";
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address, &module))
+		GetModuleFileNameA(module, name, MAX_PATH);
+	const char* base = strrchr(name, '\\');
+	snprintf(out, size, "%s+0x%lx", base ? base + 1 : name, (unsigned long)((uintptr_t)address - (uintptr_t)module));
+}
+
+// The call stack from here, one module and offset per frame, and how much of
+// the 32 bit address space is left: the engine, the driver's own mappings and
+// every texture's CPU copy share four gigabytes at most.
+static void VulkanLogStack(const char* label)
+{
+	void* frames[24] = {};
+	const USHORT count = CaptureStackBackTrace(1, 24, frames, nullptr);
+	MEMORYSTATUSEX memory = { sizeof(memory) };
+	GlobalMemoryStatusEx(&memory);
+	VulkanEvent("%s (address space free %u MB of %u MB), stack:", label,
+		(unsigned)(memory.ullAvailVirtual >> 20), (unsigned)(memory.ullTotalVirtual >> 20));
+	for (USHORT i = 0; i < count; i++)
+	{
+		char where[MAX_PATH + 32];
+		VulkanDescribeAddress(frames[i], where, sizeof(where));
+		VulkanEvent("    %s", where);
+	}
+}
+
+// Exceptions as they are raised, before anything handles them: faults, and
+// C++ exceptions with the type thrown and, for a std::exception, its message.
+// The engine throws and catches a few of its own during a normal start.
+static LONG CALLBACK VulkanExceptionLogger(EXCEPTION_POINTERS* info)
+{
+	static int logged = 0;
+	static int messages = 0;
+	const EXCEPTION_RECORD* record = info->ExceptionRecord;
+	const DWORD code = record->ExceptionCode;
+	// Thread naming and debug output are raised as exceptions and are noise.
+	if (code == 0x406D1388 || code == 0x40010006 || code == 0x4001000A || logged >= 40)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	// An MSVC C++ exception: the thrown type's name is in its throw info, as
+	// a decorated name such as .?AVruntime_error@std@@. x86 keeps pointers
+	// there directly.
+	if (code == 0xE06D7363 && record->NumberParameters >= 3)
+	{
+		const char* type = "?";
+		const DWORD* throwInfo = (const DWORD*)record->ExceptionInformation[2];
+		if (throwInfo && throwInfo[3])
+		{
+			const DWORD* catchables = (const DWORD*)throwInfo[3];
+			if (catchables[0] >= 1 && catchables[1])
+			{
+				const DWORD* catchable = (const DWORD*)catchables[1];
+				if (catchable[1])
+					type = (const char*)catchable[1] + 8;
+			}
+		}
+
+		// A TCHAR* is the engine's own error message, which it throws and
+		// catches several of on every level load. One line each, with the
+		// message, and not counted against the stacks kept for the rest.
+		if (strcmp(type, ".PAG") == 0)
+		{
+			const TCHAR* text = record->ExceptionInformation[1] ? *(const TCHAR**)record->ExceptionInformation[1] : nullptr;
+			char message[256] = "";
+			for (int i = 0; text && text[i] && i < (int)sizeof(message) - 1; i++)
+				message[i] = text[i] < 128 ? (char)text[i] : '?';
+			if (messages++ < 200)
+				VulkanEvent("engine error thrown: \"%s\"", message);
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+		logged++;
+
+		const char* what = "";
+		if (strstr(type, "exception@std") || strstr(type, "error@std") || strstr(type, "bad_alloc@std"))
+		{
+			const std::exception* e = (const std::exception*)record->ExceptionInformation[1];
+			if (e)
+				what = e->what();
+		}
+		char label[512];
+		snprintf(label, sizeof(label), "C++ exception %s \"%s\"", type, what);
+		VulkanLogStack(label);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	logged++;
+	char where[MAX_PATH + 32];
+	VulkanDescribeAddress(record->ExceptionAddress, where, sizeof(where));
+	char label[512];
+	snprintf(label, sizeof(label), "exception %08lx at %s%s", (unsigned long)code, where,
+		code == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2
+			? (record->ExceptionInformation[0] ? " (writing)" : " (reading)") : "");
+	VulkanLogStack(label);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void* VulkanExceptionHandle = nullptr;
+
+static void StartVulkanEvents(int width, int height, bool fullscreen)
+{
+	static bool started = false;
+	if (!started)
+		remove("VulkanDrvEvents.log");
+	started = true;
+	VulkanEvent("Init %dx%d %s", width, height, fullscreen ? "fullscreen" : "windowed");
+	if (!VulkanExceptionHandle)
+		VulkanExceptionHandle = AddVectoredExceptionHandler(1, VulkanExceptionLogger);
+}
+
+// Taken out with the device: the handler lives in this DLL, which the engine
+// can unload while the process goes on.
+static void StopVulkanEvents()
+{
+	if (VulkanExceptionHandle)
+		RemoveVectoredExceptionHandler(VulkanExceptionHandle);
+	VulkanExceptionHandle = nullptr;
+}
+
+// The engine's field of view is horizontal: FovAngle across the screen,
+// whatever the screen's shape. On one wider than 4:3 it keeps the width and
+// crops the top and bottom - at 21:9 its 75 degrees shows under 60% of the
+// height it does at 4:3, and the conversations and cinematics, framed for 4:3,
+// lose heads and feet. A device cannot widen the view by projecting what it is
+// given differently: the engine culls the level to its own view before handing
+// anything over, and the surfaces' light comes from the same pass.
+//
+// So the engine is made to look wider itself. Every scene node's projection
+// and the frustum it culls against come from one function,
+// FSceneNode::ComputeRenderSize in Engine.dll, reading Viewport->Actor's
+// FovAngle: the master frame, the child frames the sky, mirrors and warp
+// zones are drawn through, the console's resizing of the view, and the canvas'
+// clipped actors. Its export is an incremental linker's thunk - a single
+// relative jump - and every caller, inside Engine.dll or out, goes through it.
+// Pointed at WidescreenComputeRenderSize below, the engine computes each frame
+// with the FovAngle that keeps the height of view 4:3 would have, then gets the
+// player's own back. Nothing the game's script runs sees the wider angle, so
+// zooming and mouse sensitivity are as they were; DrawLodMesh reads FovAngle
+// directly, but only for the level of detail, which then follows the height.
+//
+// With the UI pinned the engine is given a mode narrower than the screen, and
+// lays its HUD out in that; the screen either side is filled by drawing the
+// world wider than the engine's view. URender::DrawWorld is reached the same
+// way - its export is such a jump, and URender's vtable holds the jump, not the
+// function - so for the player's view alone the frame is widened to the
+// screen at the focal length it already had, given a culling buffer of that
+// width, drawn, and put back as it was for the HUD. See PinnedDrawWorld.
+namespace
+{
+	// A jump an incremental linker left at a DLL's export, pointed somewhere
+	// else and back again. Only ever the jump that is there: an export that is
+	// not one - another build, another linker - is left alone.
+	struct ThunkRedirect
+	{
+		BYTE* Thunk = nullptr;
+		BYTE* Original = nullptr;
+
+		bool Install(const char* module, const char* name, void* target)
+		{
+			if (Original)
+				return true;
+			HMODULE dll = GetModuleHandleA(module);
+			BYTE* thunk = dll ? (BYTE*)GetProcAddress(dll, name) : nullptr;
+			if (!thunk || thunk[0] != 0xE9)
+				return false;
+			BYTE* original = thunk + 5 + *(INT*)(thunk + 1);
+			if (!Point(thunk, (BYTE*)target))
+				return false;
+			Thunk = thunk;
+			Original = original;
+			return true;
+		}
+
+		// Put back before the device goes: the engine's DLLs outlive it, and a
+		// jump left pointing into an unloaded driver takes the game with it.
+		void Remove()
+		{
+			if (Original)
+				Point(Thunk, Original);
+			Thunk = nullptr;
+			Original = nullptr;
+		}
+
+		static bool Point(BYTE* thunk, BYTE* target)
+		{
+			DWORD oldProtect;
+			if (!VirtualProtect(thunk, 5, PAGE_EXECUTE_READWRITE, &oldProtect))
+				return false;
+			*(INT*)(thunk + 1) = (INT)(target - (thunk + 5));
+			VirtualProtect(thunk, 5, oldProtect, &oldProtect);
+			FlushInstructionCache(GetCurrentProcess(), thunk, 5);
+			return true;
+		}
+	};
+
+	typedef void(__fastcall* ComputeRenderSizeFn)(FSceneNode* Frame, void* Unused);
+	typedef void(__fastcall* DrawWorldFn)(URenderBase* Render, void* Unused, FSceneNode* Frame);
+	typedef void(__fastcall* AllocIndexForScreenFn)(BYTE* Span, void* Unused, INT Width, INT Height, FMemStack* Mem);
+
+	// The layout the frame's fields are copied in and out with below.
+	static_assert(sizeof(FSceneNode) == 0x16c, "FSceneNode is not the engine's");
+
+	ThunkRedirect RenderSizeRedirect;
+	ThunkRedirect DrawWorldRedirect;
+	AllocIndexForScreenFn AllocSpanForScreen = nullptr;
+
+	bool HorPlusWanted = false;
+	// With the UI pinned, how far the picture reaches past each side of the
+	// engine's view, in its pixels; and while the world is drawn out to there,
+	// the focal length every frame is computed with, so the sky, mirrors and
+	// warp zones drawn through child frames match the view they are part of.
+	INT PinnedWorldOffset = 0;
+	FLOAT PinnedFocal = 0.0f;
+
+	// The angle across a frame FrameWidth wide that shows the height FovAngle
+	// shows at 4:3 on a screen ScreenHeight high. The screen's height rather
+	// than the frame's: a conversation narrows the frame to the strip between
+	// its black bars, and the strip should show the middle of the view the
+	// player had, not a view of its own. A frame no wider than 4:3 of that
+	// height - a 4:3 mode, the insets of the spy drone and the cameras, the
+	// canvas' small actor windows - is left as the engine has it.
+	FLOAT HorPlusFov(FLOAT FovAngle, INT FrameWidth, INT ScreenHeight)
+	{
+		if (FovAngle <= 0.0f || FovAngle >= 180.0f || ScreenHeight <= 0 || FrameWidth * 3 <= ScreenHeight * 4)
+			return FovAngle;
+		const double tanHalf = appTan(FovAngle * PI / 360.0) * 0.75 * FrameWidth / ScreenHeight;
+		return (FLOAT)(atan(tanHalf) * 360.0 / PI);
+	}
+
+	void __fastcall WidescreenComputeRenderSize(FSceneNode* Frame, void*)
+	{
+		ComputeRenderSizeFn original = (ComputeRenderSizeFn)RenderSizeRedirect.Original;
+		APlayerPawn* actor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
+		const FLOAT fov = actor ? actor->FovAngle : 0.0f;
+		FLOAT wanted = fov;
+		if (actor && PinnedFocal > 0.0f && Frame->X > 0)
+			wanted = (FLOAT)(atan(Frame->X * 0.5 / PinnedFocal) * 360.0 / PI);
+		else if (actor && HorPlusWanted)
+			wanted = HorPlusFov(fov, Frame->X, Frame->Viewport->SizeY);
+		if (wanted == fov)
+		{
+			original(Frame, nullptr);
+			return;
+		}
+
+		// Given back however the call ends: the angle is the player's.
+		struct Restore
+		{
+			APlayerPawn* Actor;
+			FLOAT Fov;
+			~Restore() { Actor->FovAngle = Fov; }
+		} restore = { actor, fov };
+		actor->FovAngle = wanted;
+		original(Frame, nullptr);
+	}
+
+	// The player's view drawn out to the whole picture with the UI pinned.
+	// Only the view the engine starts each frame with - the whole of its width,
+	// no parent - and not a camera inset or the canvas' actor windows, which
+	// stay inside the box as the game laid them out.
+	void __fastcall PinnedDrawWorld(URenderBase* Render, void*, FSceneNode* Frame)
+	{
+		DrawWorldFn original = (DrawWorldFn)DrawWorldRedirect.Original;
+		UViewport* viewport = Frame->Viewport;
+		const INT offset = PinnedWorldOffset;
+		if (offset <= 0 || !AllocSpanForScreen || !viewport || !viewport->Actor || Frame->Parent || Frame->XB != 0 ||
+			Frame->X != viewport->SizeX || !Frame->Span || Frame->Proj.Z <= 0.0f)
+		{
+			original(Render, nullptr, Frame);
+			return;
+		}
+
+		// The culling buffer the engine starts a view with is one span per
+		// line across its width (FSpanBuffer::AllocIndexForScreen: StartY,
+		// EndY, ValidLines, Index, then the memory it lives in, 0x20 bytes in
+		// all). A wider one is made the same way, in the same frame's memory.
+		BYTE* span = (BYTE*)Frame->Span;
+		FMemStack* mem = *(FMemStack**)(span + 0x10);
+		const INT lines = *(INT*)(span + 4);
+		BYTE* wideSpan = mem && lines > 0 ? mem->PushBytes(0x20, 8) : nullptr;
+		if (!wideSpan)
+		{
+			original(Render, nullptr, Frame);
+			return;
+		}
+		appMemcpy(wideSpan, span, 0x20);
+		AllocSpanForScreen(wideSpan, nullptr, Frame->X + 2 * offset, lines, mem);
+
+		// Put back for the HUD however the world pass ends: the frame's size
+		// and everything computed from it, and the culling buffer. What the
+		// world pass itself leaves in the frame - its draw lists - stays.
+		struct Restore
+		{
+			FSceneNode* Frame;
+			BYTE Saved[sizeof(FSceneNode)];
+			~Restore()
+			{
+				PinnedFocal = 0.0f;
+				const size_t from = offsetof(FSceneNode, X);
+				appMemcpy((BYTE*)Frame + from, Saved + from, sizeof(FSceneNode) - from);
+				Frame->Span = ((FSceneNode*)Saved)->Span;
+				if (Frame->Viewport && Frame->Viewport->RenDev)
+					Frame->Viewport->RenDev->SetSceneNode(Frame);
+			}
+		} restore;
+		restore.Frame = Frame;
+		appMemcpy(restore.Saved, Frame, sizeof(FSceneNode));
+
+		PinnedFocal = Frame->Proj.Z;
+		Frame->X += 2 * offset;
+		Frame->XB -= offset;
+		Frame->Span = (FSpanBuffer*)wideSpan;
+		Frame->ComputeRenderSize();
+		original(Render, nullptr, Frame);
+	}
+}
+
+void UVulkanRenderDevice::ApplyEngineHooks()
+{
+	const bool pin = PinnedAspect > 0.0f && !GIsEditor;
+	HorPlusWanted = WidescreenFovWanted && !GIsEditor;
+
+	bool sized = false;
+	if (HorPlusWanted || pin)
+	{
+		sized = RenderSizeRedirect.Install("Engine.dll", "?ComputeRenderSize@FSceneNode@@QAEXXZ", (void*)&WidescreenComputeRenderSize);
+		if (!sized)
+			debugf(TEXT("VulkanDrv: this Engine.dll's ComputeRenderSize is not the jump expected; the view stays the engine's own"));
+	}
+	else
+		RenderSizeRedirect.Remove();
+
+	bool world = false;
+	if (pin && sized)
+	{
+		HMODULE render = GetModuleHandleA("Render.dll");
+		if (!AllocSpanForScreen && render)
+			AllocSpanForScreen = (AllocIndexForScreenFn)GetProcAddress(render, "?AllocIndexForScreen@FSpanBuffer@@QAEXHHPAVFMemStack@@@Z");
+		world = AllocSpanForScreen && DrawWorldRedirect.Install("Render.dll", "?DrawWorld@URender@@UAEXPAUFSceneNode@@@Z", (void*)&PinnedDrawWorld);
+		if (!world)
+			debugf(TEXT("VulkanDrv: this Render.dll's DrawWorld is not the jump expected; the UI is not pinned"));
+	}
+	else
+		DrawWorldRedirect.Remove();
+
+	WidescreenFovActive = HorPlusWanted && sized;
+	PinnedWorldReady = world;
+	if (!world)
+		PinnedWorldOffset = 0;
+}
+
+void UVulkanRenderDevice::RemoveEngineHooks()
+{
+	DrawWorldRedirect.Remove();
+	RenderSizeRedirect.Remove();
+	HorPlusWanted = false;
+	PinnedWorldOffset = 0;
+	PinnedFocal = 0.0f;
+	WidescreenFovActive = false;
+	PinnedWorldReady = false;
+}
+
+void UVulkanRenderDevice::UpdatePinnedWorld()
+{
+	PinnedWorldOffset = PinnedWorldReady ? GetUiOffsetX() : 0;
+}
+
+// PinnedUI as an aspect ratio to lay the UI out in, or 0 for the whole width.
+// Anything narrower than square is taken as a mistake rather than a request
+// for a portrait UI.
+static float UsablePinnedAspect(float aspect)
+{
+	return (aspect >= 1.0f && aspect <= 8.0f) ? aspect : 0.0f;
+}
+
+// "16:9", "4:3", "1.78" or "off", as VK PINNEDUI takes it.
+static float ParsePinnedAspect(const TCHAR* text)
+{
+	while (*text == ' ')
+		text++;
+	const TCHAR* colon = appStrchr(text, ':');
+	if (colon)
+	{
+		const float height = appAtof(colon + 1);
+		return height > 0.0f ? UsablePinnedAspect(appAtof(text) / height) : 0.0f;
+	}
+	return UsablePinnedAspect(appAtof(text));
+}
+
+#endif
+
 IMPLEMENT_CLASS(UVulkanRenderDevice);
 
 UVulkanRenderDevice::UVulkanRenderDevice()
@@ -128,6 +546,11 @@ void UVulkanRenderDevice::StaticConstructor()
 	VkTestDeviceLoss = 0;
 	VkExclusiveFullscreen = 0;
 
+#if defined(DEUSEX) && defined(WIN32)
+	UseWidescreenFOV = 1;
+	PinnedUI = 4.0f / 3.0f;
+#endif
+
 #if defined(OLDUNREAL469SDK)
 	new(GetClass(), TEXT("UseLightmapAtlas"), RF_Public) UBoolProperty(CPP_PROPERTY(UseLightmapAtlas), TEXT("Display"), CPF_Config);
 #endif
@@ -177,6 +600,10 @@ void UVulkanRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("VkDebug"), RF_Public) UBoolProperty(CPP_PROPERTY(VkDebug), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkTestDeviceLoss"), RF_Public) UIntProperty(CPP_PROPERTY(VkTestDeviceLoss), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkExclusiveFullscreen"), RF_Public) UBoolProperty(CPP_PROPERTY(VkExclusiveFullscreen), TEXT("Display"), CPF_Config);
+#if defined(DEUSEX) && defined(WIN32)
+	new(GetClass(), TEXT("WidescreenFOV"), RF_Public) UBoolProperty(CPP_PROPERTY(UseWidescreenFOV), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("PinnedUI"), RF_Public) UFloatProperty(CPP_PROPERTY(PinnedUI), TEXT("Display"), CPF_Config);
+#endif
 
 	unguard;
 }
@@ -196,6 +623,10 @@ UBOOL UVulkanRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT N
 	guard(UVulkanRenderDevice::Init);
 
 	Viewport = InViewport;
+
+#if defined(DEUSEX) && defined(WIN32)
+	StartVulkanEvents(NewX, NewY, Fullscreen);
+#endif
 
 	try
 	{
@@ -296,6 +727,18 @@ UBOOL UVulkanRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT N
 		Exit();
 		return 0;
 	}
+
+#if defined(DEUSEX) && defined(WIN32)
+	// Before SetRes: it only gives the engine a narrower mode for the UI once
+	// the world can be drawn around it.
+	WidescreenFovWanted = UseWidescreenFOV != 0;
+	PinnedAspect = UsablePinnedAspect(PinnedUI);
+	ApplyEngineHooks();
+	if (WidescreenFovActive)
+		debugf(TEXT("VulkanDrv: widescreen field of view on (Hor+)"));
+	if (PinnedWorldReady)
+		debugf(TEXT("VulkanDrv: UI pinned to %.2f:1 in fullscreen"), PinnedAspect);
+#endif
 
 	if (!SetRes(NewX, NewY, NewColorBytes, Fullscreen))
 	{
@@ -429,8 +872,36 @@ UBOOL UVulkanRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL F
 
 	EnumWindows(HideStartupSplash, (LPARAM)Viewport->GetWindow());
 
-	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), NewX, NewY, NewColorBytes))
+	// The UI pinned to a narrower box: the engine is given a mode of that
+	// shape at the height asked for, and lays its HUD, menus and
+	// conversations out in it, while the world is drawn across the mode
+	// chosen around it (see PinnedDrawWorld). Only in fullscreen, where the
+	// window is the screen whatever mode the engine has; in a window it would
+	// only shrink it.
+	INT engineX = NewX;
+#if defined(DEUSEX)
+	if (Fullscreen && PinnedWorldReady && PinnedAspect > 0.0f && NewX > NewY * PinnedAspect + 1.0f)
+		engineX = (INT)(NewY * PinnedAspect + 0.5f) & ~1;
+#endif
+
+	if (!Viewport->ResizeViewport(Fullscreen ? (BLIT_Fullscreen | BLIT_Direct3D) : (BLIT_HardwarePaint | BLIT_Direct3D), engineX, NewY, NewColorBytes))
 		return 0;
+
+#if defined(DEUSEX)
+	PinnedModeWidth = engineX != NewX ? NewX : 0;
+	PinnedModeHeight = NewY;
+
+	// The engine keeps the mode it was given as the one to start in next
+	// time. Keep the one the player chose instead, so that with the pin taken
+	// off the game comes back at the whole width rather than the narrower mode.
+	if (engineX != NewX)
+	{
+		UClient* client = Viewport->GetOuterUClient();
+		client->FullscreenViewportX = NewX;
+		client->FullscreenViewportY = NewY;
+		client->SaveConfig();
+	}
+#endif
 
 	if (enteringFullscreen)
 	{
@@ -475,7 +946,16 @@ void UVulkanRenderDevice::Exit()
 {
 	guard(UVulkanRenderDevice::Exit);
 
+#if defined(DEUSEX) && defined(WIN32)
+	RemoveEngineHooks();
+#endif
+
 	ReleaseDeviceResources();
+
+#if defined(DEUSEX) && defined(WIN32)
+	VulkanEvent("Exit");
+	StopVulkanEvents();
+#endif
 
 	Device.reset();
 	Surface.reset();
@@ -801,6 +1281,39 @@ UBOOL UVulkanRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		return 1;
 	}
 #endif
+#if defined(DEUSEX) && defined(WIN32)
+	else if (ParseCommand(&Cmd, TEXT("VK")))
+	{
+		if (ParseCommand(&Cmd, TEXT("WIDESCREEN")))
+		{
+			WidescreenFovWanted = !WidescreenFovActive;
+			ApplyEngineHooks();
+			Ar.Logf(TEXT("VulkanDrv: widescreen field of view %s"), WidescreenFovActive ? TEXT("on (Hor+)") : TEXT("off (the engine's own, cropped top and bottom)"));
+			return 1;
+		}
+		if (ParseCommand(&Cmd, TEXT("PINNEDUI")))
+		{
+			while (*Cmd == ' ')
+				Cmd++;
+			if (*Cmd)
+			{
+				PinnedAspect = ParsePinnedAspect(Cmd);
+				ApplyEngineHooks();
+				// Only a new mode gives the engine the new shape, so set the
+				// one the player has again.
+				UClient* client = Viewport ? Viewport->GetOuterUClient() : nullptr;
+				if (client && FullscreenState.Enabled)
+					SetRes(client->FullscreenViewportX, client->FullscreenViewportY, Max(client->FullscreenColorBits / 8, 2), 1);
+			}
+			if (PinnedWorldReady)
+				Ar.Logf(TEXT("VulkanDrv: UI pinned to %.2f:1 in fullscreen, the world filling the screen around it"), PinnedAspect);
+			else
+				Ar.Logf(TEXT("VulkanDrv: UI across the whole screen"));
+			return 1;
+		}
+		return 0;
+	}
+#endif
 	else
 	{
 #if !defined(UNREALGOLD)
@@ -894,6 +1407,10 @@ void UVulkanRenderDevice::BeginFrame(FPlane ScreenClear)
 				debugf(TEXT("RenderScale %.2f is outside the supported range of %.2f to %.2f; rendering at %.2f"), RenderScale, MinRenderScale, MaxRenderScale, clamped);
 		}
 
+#if defined(DEUSEX) && defined(WIN32)
+		UpdatePinnedWorld();
+#endif
+
 		// If frame textures no longer match the window or user settings, recreate them along with the swap chain
 		int sceneWidth, sceneHeight;
 		GetSceneSize(sceneWidth, sceneHeight);
@@ -917,12 +1434,12 @@ void UVulkanRenderDevice::BeginFrame(FPlane ScreenClear)
 				// A scale the device cannot find memory for should cost the
 				// setting, not the session - especially as recovering otherwise
 				// means editing the ini to launch at all.
-				if (sceneWidth == Viewport->SizeX && sceneHeight == Viewport->SizeY)
+				if (sceneWidth == GetOutputWidth() && sceneHeight == Viewport->SizeY)
 					throw;
 
 				debugf(TEXT("Could not create %dx%d scene buffers (%s); falling back to the viewport size"), sceneWidth, sceneHeight, appFromAnsi(e.what()));
 				RenderScale = 1.0f;
-				Textures->Scene.reset(new SceneTextures(this, Viewport->SizeX, Viewport->SizeY, GetSettingsMultisample()));
+				Textures->Scene.reset(new SceneTextures(this, GetOutputWidth(), Viewport->SizeY, GetSettingsMultisample()));
 			}
 			RenderPasses->CreateRenderPass();
 			RenderPasses->CreatePipelines();
@@ -931,10 +1448,17 @@ void UVulkanRenderDevice::BeginFrame(FPlane ScreenClear)
 
 			// Only on a resolution, scale or sample count change, so this says
 			// what is actually being rendered without filling the log.
-			debugf(TEXT("Scene buffers: %dx%d for a %dx%d viewport (RenderScale %.2f), %d samples per pixel"),
+			debugf(TEXT("Scene buffers: %dx%d for a %dx%d picture (RenderScale %.2f), %d samples per pixel"),
 				Textures->Scene->Width, Textures->Scene->Height,
-				(int)Viewport->SizeX, (int)Viewport->SizeY,
+				GetOutputWidth(), (int)Viewport->SizeY,
 				GetSceneScale(), GetSettingsMultisample() ? GetSettingsMultisample() : 1);
+#if defined(DEUSEX) && defined(WIN32)
+			MEMORYSTATUSEX memory = { sizeof(memory) };
+			GlobalMemoryStatusEx(&memory);
+			VulkanEvent("scene buffers %dx%d, %d samples, address space free %u MB",
+				Textures->Scene->Width, Textures->Scene->Height, GetSettingsMultisample() ? GetSettingsMultisample() : 1,
+				(unsigned)(memory.ullAvailVirtual >> 20));
+#endif
 		}
 
 		auto cmdbuffer = Commands->GetDrawCommands();
@@ -1665,6 +2189,31 @@ void UVulkanRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT 
 	float v0 = V * VMult;
 	float u1 = (U + UL) * UMult;
 	float v1 = (V + VL) * VMult;
+
+	// What spans the engine's whole width - a conversation's black bars, a
+	// fade, the darkening behind a menu - is meant to span the screen, and
+	// stopping at the edges of a pinned UI would leave the world showing past
+	// its ends. Carried on to the picture's edges at the same texel density, so
+	// a pattern continues rather than stretches. Drawn through a viewport as
+	// wide as the picture, in which the frame's own width reaches its edges.
+	const int uiOffset = GetUiOffsetX();
+	const bool acrossPicture = uiOffset > 0 && XL > 0.0f && Frame->XB == 0 && Frame->X == Viewport->SizeX &&
+		X <= 0.5f && X + XL >= Frame->FX - 0.5f;
+	if (acrossPicture)
+	{
+		const float uPerPixel = (u1 - u0) / XL;
+		u0 -= (X + uiOffset) * uPerPixel;
+		u1 += (Frame->FX + uiOffset - (X + XL)) * uPerPixel;
+		X = 0.0f;
+		XL = Frame->FX;
+
+		DrawBatch(Commands->GetDrawCommands());
+		VkViewport whole = viewportdesc;
+		whole.x = 0.0f;
+		whole.width = (float)Textures->Scene->Width;
+		Commands->GetDrawCommands()->setViewport(0, 1, &whole);
+	}
+
 	bool clamp = (u0 >= 0.0f && u1 <= 1.00001f && v0 >= 0.0f && v1 <= 1.00001f);
 
 	SetPipeline(RenderPasses->GetPipeline(PolyFlags));
@@ -1719,6 +2268,12 @@ void UVulkanRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT 
 		iptr[5] = vpos + 3;
 
 		UseVertices(4, 6);
+	}
+
+	if (acrossPicture)
+	{
+		DrawBatch(Commands->GetDrawCommands());
+		Commands->GetDrawCommands()->setViewport(0, 1, &viewportdesc);
 	}
 
 	Stats.Tiles++;
@@ -1920,7 +2475,7 @@ void UVulkanRenderDevice::GetSceneSize(int& width, int& height) const
 	float scale = Clamp(RenderScale, MinRenderScale, MaxRenderScale);
 	int maxSize = (int)Device->PhysicalDevice.Properties.Properties.limits.maxImageDimension2D;
 
-	width = Clamp((int)std::round(Viewport->SizeX * scale), 1, maxSize);
+	width = Clamp((int)std::round(GetOutputWidth() * scale), 1, maxSize);
 	height = Clamp((int)std::round(Viewport->SizeY * scale), 1, maxSize);
 }
 
@@ -1930,7 +2485,27 @@ float UVulkanRenderDevice::GetSceneScale() const
 	// rounding and any clamping above are already accounted for.
 	if (!Textures->Scene || Viewport->SizeX <= 0)
 		return 1.0f;
-	return Textures->Scene->Width / (float)Viewport->SizeX;
+	return Textures->Scene->Width / (float)GetOutputWidth();
+}
+
+int UVulkanRenderDevice::GetOutputWidth() const
+{
+	const int engineWidth = Max((int)Viewport->SizeX, 1);
+#if defined(DEUSEX) && defined(WIN32)
+	// Only while the engine has the mode it was given for the pin: a mode
+	// change in between, or leaving fullscreen, is the engine's width again.
+	if (PinnedModeWidth > engineWidth && PinnedModeHeight == Viewport->SizeY && FullscreenState.Enabled)
+	{
+		const int width = Min(PinnedModeWidth, 16384);
+		return width + ((width - engineWidth) & 1);
+	}
+#endif
+	return engineWidth;
+}
+
+int UVulkanRenderDevice::GetUiOffsetX() const
+{
+	return (GetOutputWidth() - Max((int)Viewport->SizeX, 1)) / 2;
 }
 
 void UVulkanRenderDevice::LimitFrameRate()
@@ -2094,9 +2669,15 @@ void UVulkanRenderDevice::ReadPixels(FColor* Pixels)
 		.AddImage(dstimage.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
 		.Execute(cmdbuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
+	// The engine's view, which with the UI pinned sits in the middle of a
+	// wider picture.
+	const float readScale = GetSceneScale();
+	const int readX = Clamp((int)std::round(GetUiOffsetX() * readScale), 0, srcimage->width - 1);
+	const int readWidth = Clamp((int)std::round(w * readScale), 1, srcimage->width - readX);
+
 	VkImageBlit blit = {};
-	blit.srcOffsets[0] = { 0, 0, 0 };
-	blit.srcOffsets[1] = { srcimage->width, srcimage->height, 1 };
+	blit.srcOffsets[0] = { readX, 0, 0 };
+	blit.srcOffsets[1] = { readX + readWidth, srcimage->height, 1 };
 	blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	blit.srcSubresource.mipLevel = 0;
 	blit.srcSubresource.baseArrayLayer = 0;
@@ -2155,6 +2736,15 @@ void UVulkanRenderDevice::EndFlash()
 		DrawBatch(Commands->GetDrawCommands());
 		pushconstants.objectToProjection = mat4::identity();
 		pushconstants.nearClip = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+
+		// A flash is the whole picture's, not just the pinned UI's box.
+		if (GetUiOffsetX() > 0)
+		{
+			VkViewport whole = viewportdesc;
+			whole.x = 0.0f;
+			whole.width = (float)Textures->Scene->Width;
+			Commands->GetDrawCommands()->setViewport(0, 1, &whole);
+		}
 
 		SetPipeline(RenderPasses->GetEndFlashPipeline());
 
@@ -2219,7 +2809,7 @@ void UVulkanRenderDevice::SetSceneNode(FSceneNode* Frame)
 	const float sceneScale = GetSceneScale();
 
 	viewportdesc = {};
-	viewportdesc.x = Frame->XB * sceneScale;
+	viewportdesc.x = (Frame->XB + GetUiOffsetX()) * sceneScale;
 	viewportdesc.y = Frame->YB * sceneScale;
 	viewportdesc.width = Frame->X * sceneScale;
 	viewportdesc.height = Frame->Y * sceneScale;
@@ -2379,7 +2969,7 @@ void UVulkanRenderDevice::BlitSceneToPostprocess()
 		// be scaled to match - and kept at least a pixel, since the engine asks
 		// for rectangles a fraction of a pixel wide when the scale is below one.
 		const float hitScale = GetSceneScale();
-		const int hitX = (int)(Viewport->HitX * hitScale);
+		const int hitX = (int)((Viewport->HitX + GetUiOffsetX()) * hitScale);
 		const int hitY = (int)(Viewport->HitY * hitScale);
 		const int hitW = Max((int)std::round(Viewport->HitXL * hitScale), 1);
 		const int hitH = Max((int)std::round(Viewport->HitYL * hitScale), 1);
@@ -2657,8 +3247,9 @@ void UVulkanRenderDevice::DrawPresentTexture(int width, int height)
 	if (SRGBTextures) presentShader |= 16;
 	if (ActiveHdr10) presentShader |= 32;
 
-	float scale = std::min(width / (float)Viewport->SizeX, height / (float)Viewport->SizeY);
-	int letterboxWidth = (int)std::round(Viewport->SizeX * scale);
+	const int outputWidth = GetOutputWidth();
+	float scale = std::min(width / (float)outputWidth, height / (float)Viewport->SizeY);
+	int letterboxWidth = (int)std::round(outputWidth * scale);
 	int letterboxHeight = (int)std::round(Viewport->SizeY * scale);
 	int letterboxX = (width - letterboxWidth) / 2;
 	int letterboxY = (height - letterboxHeight) / 2;
