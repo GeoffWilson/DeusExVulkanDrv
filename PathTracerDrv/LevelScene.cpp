@@ -1458,6 +1458,9 @@ void LevelScene::CollectDecals(ULevel* level)
 	SceneInstance instance;
 	instance.GeometryIndex = DecalGeometry;
 	MakeIdentity(instance.Transform);
+	// Painted on, a quarter of a unit off the surface: nothing the surface's
+	// own light should have to pass. Seen, but no shadow.
+	instance.Mask = InstanceCastsNoShadow;
 	// Flagged as changed on the frame a decal arrives or goes, so the pixels
 	// under it drop what they had accumulated of the bare wall.
 	instance.Ambient = vec4(0.0f, 0.0f, 0.0f, InstanceFlags(changed, 1.0f));

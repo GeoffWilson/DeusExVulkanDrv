@@ -684,7 +684,11 @@ static std::string TraceCommon()
 				return textured ? textureLod(sceneTextures[nonuniformEXT(index)], uv, 0.0).a > 0.5 : true;
 
 			// A mirror is solid; it reflects rather than letting anything past.
-			if (kind > 2.5)
+			// So is a window onto the sky zone (5) - but not modulated art (4),
+			// which the test once let through with the mirrors: every decal
+			// then shut out any light reaching the floor under it at a slant,
+			// a darker square round every scorch mark and bloodstain.
+			if (kind > 2.5 && (kind < 3.5 || kind > 4.5))
 				return true;
 
 			// Translucent adds and modulated multiplies; both are handled at the
