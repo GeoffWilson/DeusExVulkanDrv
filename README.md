@@ -17,7 +17,8 @@ Two render devices for Deus Ex:
   less, and can keep the HUD to a 16:9 or 4:3 box in the middle.
 - **VulkanDrv** is a conventional rasteriser, the one to play the game on. It
   adds supersampling, HDR, anisotropic filtering and a frame limiter to what the
-  game shipped with.
+  game shipped with, and on a wide screen, like the path tracer, shows more of
+  the world rather than less with the HUD kept to a box in the middle.
 
 D3D11Drv and D3D12Drv from upstream also build and run for Deus Ex. They are kept
 for comparison - D3D11 is the reference the path tracer is checked against - and
@@ -121,7 +122,7 @@ brought back at all. `PathTracerEvents.log`, beside the game's log, records the
 window's focus and size changes, mode switches, swap chain rebuilds and any
 crash, flushed as they happen.
 
-### New since 1.2
+### New in 1.3
 
 - **A real flashlight.** The light augmentation shone a round patch of light
   wherever the view landed, its shadows falling away from the patch rather
@@ -165,6 +166,10 @@ crash, flushed as they happen.
   as deep as its material allows, and the surface is lit by its slope: by the
   lights, the flashlight and what it reflects. The detail texture adds its
   grain up close. Signs, glass, paper and characters stay as they were.
+- **Fixes.** The skybox is turned by its sky zone's rotation, as the engine
+  turns it: Liberty Island's skyline sat some 28 degrees round from where the
+  other devices put it, with a purple line under it where a masked texture's
+  edge was bled from the wrong side. Save games have their picture again.
 
 ### New in 1.2
 
