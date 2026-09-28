@@ -178,6 +178,8 @@ void LevelScene::Clear()
 	ActorGeometry.clear();
 	PreviousPoses.clear();
 	HaveViewModelTransform = false;
+	ViewModelIndex = -1;
+	ViewModelItem = nullptr;
 	CurrentPoses.clear();
 	Textures.clear();
 	TextureMasked.clear();
@@ -1129,11 +1131,13 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 	mix(bits(styleKind));
 	mix((uint64_t)actor->AnimSequence.GetIndex());
 	mix(bits(actor->AnimFrame));
+#if defined(DEUSEX)
 	for (int i = 0; i < 4; i++)
 	{
 		mix((uint64_t)actor->BlendAnimSequence[i].GetIndex());
 		mix(bits(actor->BlendAnimFrame[i]));
 	}
+#endif
 	for (int i = 0; i < 8; i++)
 		mix((uint64_t)(uintptr_t)skins[i]);
 	mix((uint64_t)(uintptr_t)actor->Texture);
@@ -1676,6 +1680,26 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	skinHash ^= actorUnlit ? 2u : 0u;
 	skinHash *= 1099511628211ull;
 
+#if defined(OLDUNREAL469SDK)
+	// What 469 draws a triangle with when its slot has no texture (Render's
+	// DrawLodMesh): what it environment maps with - the actor's Texture, its
+	// zone's EnvironmentMap, the level's - and failing all three the last
+	// texture the mesh has, going through its slots as GetTexture does. UT's
+	// pylon has its triangles in slot 1 and its texture in slot 0; the
+	// toolbox, the bins, the tyre rim and the wreck are the same a slot
+	// along. Made of what the key already holds.
+	UTexture* emptySlotTexture = envMap;
+	if (!emptySlotTexture)
+	{
+		for (INT i = 0; i < mesh->Textures.Num() && i < 16; i++)
+		{
+			UTexture* t = (i < 8 && skins[i]) ? skins[i] : mesh->Textures(i);
+			if (t)
+				emptySlotTexture = t;
+		}
+	}
+#endif
+
 	// Style is part of the identity: the same mesh drawn normally and drawn
 	// translucent are two different shapes as far as the tracer is concerned.
 	const uint64_t key = ((uint64_t)(uintptr_t)mesh << 20) ^ ((uint64_t)(frameA & 0xfff) << 8)
@@ -1759,13 +1783,16 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	// engine's pose against the body's own keyframes: whatever differs is
 	// being moved by something other than the body's sequence. Only those
 	// triangles lose their history; the rest of the character keeps its own.
+	// Deus Ex's alone: other engines have no blend channels.
 	bool blendActive = false;
+#if defined(DEUSEX)
 	if (enginePose && keyframesValid)
 	{
 		for (int i = 0; i < 4; i++)
 			if (owner->BlendAnimSequence[i] != NAME_None)
 				blendActive = true;
 	}
+#endif
 
 	if (reuseIndex < 0)
 		Geometries.emplace_back();
@@ -1911,6 +1938,10 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			skin = skins[tri.TextureIndex];
 		if (!skin && tri.TextureIndex >= 0 && tri.TextureIndex < mesh->Textures.Num())
 			skin = mesh->Textures(tri.TextureIndex);
+#if defined(OLDUNREAL469SDK)
+		if (!skin)
+			skin = emptySlotTexture;
+#endif
 		// Environment mapped: the reflected picture replaces the skin, looked
 		// up by reflection direction in the shader rather than by the wedge's
 		// coordinates.
@@ -2033,6 +2064,18 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	if (MeshesLogged < 6)
 	{
 		MeshesLogged++;
+		// Each material's texture as it was resolved: slot, flags, and the
+		// texture the trace was given for it - an object drawn white is one
+		// with none, or with a format that could not be read.
+		for (int m = 0; m < materialCount; m++)
+		{
+			const MaterialResult& r = materials[m];
+			UTexture* t = (r.Texture >= 0 && r.Texture < (int)Textures.size()) ? Textures[r.Texture] : nullptr;
+			debugf(TEXT("PathTracer mesh '%s' slot %d flags 0x%x kind %.0f%s: %s (%s, format %d, %dx%d)"),
+				mesh->GetName(), (int)r.TextureIndex, (unsigned)r.PolyFlags, r.Kind, r.Environment ? TEXT(", environment mapped") : TEXT(""),
+				t ? t->GetPathName() : TEXT("no texture"), t ? t->GetClass()->GetName() : TEXT("-"),
+				t ? (int)t->Format : -1, t ? (int)t->USize : 0, t ? (int)t->VSize : 0);
+		}
 		vec3 lo = geometry.Positions[0], hi = geometry.Positions[0];
 		for (const vec3& v : geometry.Positions)
 		{
@@ -2268,7 +2311,9 @@ void LevelScene::UnshadowFittings()
 // engine's own loop: Init with the viewer, then First, IsDone, Next, and
 // CurrentItem for each - which for Deus Ex's particles moves the one proxy
 // actor to the particle and sets its size and glow, and for a dead particle
-// hands back the generator, which draws nothing.
+// hands back the generator, which draws nothing. 469's iterators are
+// initialised with the scene node rather than the viewer, and uninitialised
+// after.
 void LevelScene::PlaceIterated(AActor* actor, uint32_t mask, PlaceCounts& counts)
 {
 	URenderIterator* iterator = actor->RenderInterface;
@@ -2276,7 +2321,13 @@ void LevelScene::PlaceIterated(AActor* actor, uint32_t mask, PlaceCounts& counts
 	if (!camera)
 		return;
 
+#if defined(OLDUNREAL469SDK)
+	if (!ViewFrame)
+		return;
+	iterator->Init(ViewFrame);
+#else
 	iterator->Init(camera);
+#endif
 	int items = 0;
 	for (iterator->First(); !iterator->IsDone() && items < MaxIteratedItems; iterator->Next(), items++)
 	{
@@ -2286,6 +2337,9 @@ void LevelScene::PlaceIterated(AActor* actor, uint32_t mask, PlaceCounts& counts
 			continue;
 		PlaceActor(item, mask, true, counts);
 	}
+#if defined(OLDUNREAL469SDK)
+	iterator->UnInit();
+#endif
 }
 
 void LevelScene::CollectDynamic(ULevel* level)
@@ -2409,7 +2463,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 		// do not, the second because the light augmentation shines from inside
 		// him. What only the owner may not see is the same.
 		uint32_t mask = InstanceSeenByAll;
-		if (actor == ViewActor && !ViewFromBehind)
+		if ((actor == ViewActor || actor == ViewTarget) && !ViewFromBehind)
 			mask = InstanceSeenReflected;
 		if (actor->bOwnerNoSee && actor->Owner == ViewActor)
 			mask = InstanceSeenReflected;
@@ -2510,6 +2564,17 @@ void LevelScene::AddViewModel()
 	if (!pawn || ViewFromBehind)
 		return;
 
+#if defined(OLDUNREAL469SDK)
+	// UT draws the first person weapon in RenderOverlays, which leaves it out
+	// while it is hidden - as the hidden handedness hides it - and while a
+	// zoom narrows the view. It draws the weapon's Mesh, which the weapon
+	// swaps for its left handed one.
+	AInventory* item = pawn->Weapon;
+	APlayerPawn* player = Cast<APlayerPawn>(pawn);
+	if (!item || pawn->Weapon->bHideWeapon || (player && player->DesiredFOV != player->DefaultFOV))
+		return;
+	UMesh* mesh = item->Mesh ? item->Mesh : item->PlayerViewMesh;
+#else
 	AInventory* item = pawn->Weapon ? (AInventory*)pawn->Weapon : HeldTool(pawn);
 	if (!item)
 		return;
@@ -2518,6 +2583,7 @@ void LevelScene::AddViewModel()
 	// hides the actor, rather than filling in PlayerViewMesh - which is why the
 	// earlier log showed NanoKeyRingPOV on a hidden actor.
 	UMesh* mesh = item->PlayerViewMesh ? item->PlayerViewMesh : item->Mesh;
+#endif
 
 	if (!mesh || mesh->AnimFrames <= 0)
 		return;
@@ -2552,6 +2618,22 @@ void LevelScene::AddViewModel()
 		? AnimatedGeometryFor(item, mesh, frameA, frameB, alpha, skins, styleKind, &toLocal)
 		: GeometryForMesh(mesh, frameA, frameB, 0.0f, skins, -1, styleKind, nullptr, nullptr, item);
 
+#if defined(OLDUNREAL469SDK)
+	// UT's RenderOverlays places the weapon before drawing it - CalcDrawOffset,
+	// which 469 scales for the field of view as FOVFix and WeaponFOVScale say,
+	// the bob, and a roll for the hand it is held in - and it has not run yet
+	// this frame. Where the weapon was left meanwhile is no guide: in a
+	// network game the server's idea of where it is arrives between frames,
+	// at the body's middle. So it is placed as the frame is sent, by
+	// FinishViewModel, once RenderOverlays has put it where the engine draws
+	// it; until then it stands where it is.
+	const FCoords own = GMath.UnitCoords / item->Rotation;
+	const FVector position = item->Location;
+	const FVector axes[3] = { own.XAxis, own.YAxis, own.ZAxis };
+	const float scale = item->DrawScale != 0.0f ? item->DrawScale : 1.0f;
+	ViewModelIndex = (int)Instances.size();
+	ViewModelItem = item;
+#else
 	// PlayerViewOffset is in the view's own terms: X ahead, Y to the right,
 	// Z up. The scene node's axes are X right, Y down, Z forward, so up is
 	// minus the down axis.
@@ -2566,6 +2648,7 @@ void LevelScene::AddViewModel()
 	// A mesh faces along its own X, so that axis points down the view.
 	const FVector axes[3] = { ViewForward, ViewRight, up };
 	const float scale = item->PlayerViewScale != 0.0f ? item->PlayerViewScale : 1.0f;
+#endif
 
 	SceneInstance instance;
 	instance.GeometryIndex = geometryIndex;
@@ -2585,6 +2668,7 @@ void LevelScene::AddViewModel()
 	// Always counted as having moved: it rides the camera, and it bobs even
 	// when the camera does not.
 	instance.Ambient = vec4(ambient.x, ambient.y, ambient.z, InstanceFlags(true, item->ScaleGlow, ViewActor->Region.Zone));
+#if !defined(OLDUNREAL469SDK)
 	if (HaveViewModelTransform)
 	{
 		instance.HasPrevious = true;
@@ -2592,9 +2676,45 @@ void LevelScene::AddViewModel()
 	}
 	memcpy(ViewModelTransform, instance.Transform, sizeof(ViewModelTransform));
 	HaveViewModelTransform = true;
+#endif
 	Instances.push_back(instance);
 
 	unguard;
+}
+
+// UT's first person weapon, where RenderOverlays has just put it for this
+// frame's view (see AddViewModel), exactly as the engine draws it. One not
+// within reach of the view was not drawn this frame, and is left out.
+void LevelScene::FinishViewModel()
+{
+#if defined(OLDUNREAL469SDK)
+	guard(LevelScene::FinishViewModel);
+
+	const int index = ViewModelIndex;
+	AInventory* item = ViewModelItem;
+	ViewModelIndex = -1;
+	ViewModelItem = nullptr;
+	if (index < 0 || index >= (int)Instances.size() || !item)
+		return;
+	SceneInstance& instance = Instances[index];
+
+	if ((item->Location - ViewOrigin).SizeSquared() > 128.0f * 128.0f)
+	{
+		instance.Mask = 0;
+		HaveViewModelTransform = false;
+		return;
+	}
+
+	const float scale = item->DrawScale != 0.0f ? item->DrawScale : 1.0f;
+	MakeTransform(item->Location, item->Rotation, FVector(scale, scale, scale), item->PrePivot, instance.Transform);
+	instance.HasPrevious = HaveViewModelTransform;
+	if (HaveViewModelTransform)
+		memcpy(instance.PreviousTransform, ViewModelTransform, sizeof(instance.PreviousTransform));
+	memcpy(ViewModelTransform, instance.Transform, sizeof(ViewModelTransform));
+	HaveViewModelTransform = true;
+
+	unguard;
+#endif
 }
 
 // The weapon in a character's hands. A held weapon is a hidden actor, so

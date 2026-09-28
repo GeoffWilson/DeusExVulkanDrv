@@ -18,9 +18,9 @@ void TextureCache::Clear()
 	Textures.clear();
 }
 
-CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
+CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked, bool paletteAlpha)
 {
-	const uint64_t key = ((uint64_t)info.CacheID << 1) | (masked ? 1u : 0u);
+	const uint64_t key = ((uint64_t)info.CacheID << 2) | (masked ? 1u : 0u) | (paletteAlpha ? 2u : 0u);
 
 	auto it = Textures.find(key);
 	if (it != Textures.end())
@@ -32,7 +32,7 @@ CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
 		if (info.bRealtimeChanged && cached->ChangedFrame != Frame)
 		{
 			int width = 0, height = 0;
-			if (ConvertPixels(info, masked, cached->NewPixels, width, height) && width == cached->Width && height == cached->Height)
+			if (ConvertPixels(info, masked, cached->NewPixels, width, height, paletteAlpha) && width == cached->Width && height == cached->Height)
 			{
 				cached->ChangedFrame = Frame;
 				Changed.push_back(cached);
@@ -43,7 +43,7 @@ CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
 		return cached;
 	}
 
-	auto cached = Upload(info, masked);
+	auto cached = Upload(info, masked, paletteAlpha);
 	CachedTexture* result = cached.get();
 	Textures[key] = std::move(cached);
 	return result;
@@ -54,7 +54,7 @@ CachedTexture* TextureCache::Get(const FTextureInfo& info, bool masked)
 // Separated from the upload so that a texture which regenerates itself - fire,
 // water, a computer screen - can be converted again into the image it already
 // has, rather than being cached once at whatever frame it was first seen on.
-bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height)
+bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height, bool paletteAlpha)
 {
 	guard(TextureCache::ConvertPixels);
 
@@ -81,9 +81,13 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 			const BYTE index = src[i];
 			const FColor& c = info.Palette[index];
 			// Masked art uses palette entry zero as the hole. Everything else
-			// is opaque; the engine's own alpha channel is not meaningful here.
-			const uint32_t alpha = (masked && index == 0) ? 0u : 255u;
-			pixels[i] = (alpha << 24) | ((uint32_t)c.B << 16) | ((uint32_t)c.G << 8) | (uint32_t)c.R;
+			// is opaque; the engine's own alpha channel is not meaningful here -
+			// except for 469's PF_Highlighted art, whose palette carries its
+			// coverage, with the colour premultiplied by it.
+			if (masked && index == 0)
+				pixels[i] = paletteAlpha ? 0u : ((uint32_t)c.B << 16) | ((uint32_t)c.G << 8) | (uint32_t)c.R;
+			else
+				pixels[i] = ((paletteAlpha ? (uint32_t)c.A : 255u) << 24) | ((uint32_t)c.B << 16) | ((uint32_t)c.G << 8) | (uint32_t)c.R;
 		}
 
 		break;
@@ -160,8 +164,14 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 	default:
 		// Compressed and 16 bit formats are not handled yet. White rather than
 		// nothing, so a tile that uses one is visible and obviously wrong
-		// instead of silently missing.
+		// instead of silently missing - and named, so it can be found.
+	{
+		static int unreadLogged = 0;
+		if (unreadLogged++ < 24)
+			debugf(TEXT("PathTracer: texture %s is in format %d, which is not decoded yet: drawn white"),
+				info.Texture ? info.Texture->GetPathName() : TEXT("?"), (int)info.Format);
 		break;
+	}
 	}
 
 	// Masked art keeps the palette's colour in its transparent texels, and that
@@ -176,7 +186,10 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 	// one. Liberty Island's skyline is opaque down to its bottom row and a
 	// hole along its top, and that row blended with the top's magenta key
 	// drew a purple line under the city.
-	if (masked)
+	//
+	// Not for premultiplied art, where a transparent texel's colour is added
+	// rather than blended towards.
+	if (masked && !paletteAlpha)
 	{
 		std::vector<uint32_t> bled = pixels;
 		for (int y = 0; y < height; y++)
@@ -223,7 +236,7 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 	//
 	// Only when nothing in the image is already transparent, so a texture that
 	// carries a real alpha channel keeps it.
-	if (masked && info.Format != TEXF_P8)
+	if (masked && !paletteAlpha && info.Format != TEXF_P8)
 	{
 		bool anyTransparent = false;
 		for (uint32_t px : pixels)
@@ -249,16 +262,17 @@ bool TextureCache::ConvertPixels(const FTextureInfo& info, bool masked, std::vec
 	unguard;
 }
 
-std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked)
+std::unique_ptr<CachedTexture> TextureCache::Upload(const FTextureInfo& info, bool masked, bool paletteAlpha)
 {
 	guard(TextureCache::Upload);
 
 	std::vector<uint32_t> pixels;
 	int width = 0, height = 0;
-	if (!ConvertPixels(info, masked, pixels, width, height))
+	if (!ConvertPixels(info, masked, pixels, width, height, paletteAlpha))
 		return nullptr;
 
 	auto cached = std::make_unique<CachedTexture>();
+	cached->PaletteAlpha = paletteAlpha;
 	cached->Width = width;
 	cached->Height = height;
 	if (info.Texture)

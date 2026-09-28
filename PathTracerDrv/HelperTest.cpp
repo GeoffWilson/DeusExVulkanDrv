@@ -11,6 +11,7 @@
 //                            [--lightsize radius] [--reference] [--backlight]
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
+//                            [--decal] [--decal-lift units]
 //                            [--bump percent]
 //   (helper beside it)
 //
@@ -99,6 +100,22 @@ void VulkanError(const char* text)
 	throw std::runtime_error(text);
 }
 
+#ifdef PATHTRACER_LOCAL
+// Built with the tracing in it (PathTracerLocalTest), as a 64-bit game's
+// device is: its log comes here.
+#include "RayReconstruction.h"
+#include <cstdarg>
+void HelperLog(const char* format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	printf("  tracer: ");
+	vprintf(format, args);
+	printf("\n");
+	va_end(args);
+}
+#endif
+
 static float HalfToFloat(uint16_t h)
 {
 	const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
@@ -173,6 +190,8 @@ int main(int argc, char** argv)
 	bool fog = false, flashlight = false, dark = false, fogUnshadowed = false, glowStrip = false, glowUnsampled = false;
 	float photoAperture = -1.0f;
 	bool glass = false;
+	bool decal = false;
+	float decalLift = 0.25f;
 	int wetness = 0;
 	uint32_t view = 0;
 	int bump = 0;
@@ -212,6 +231,10 @@ int main(int argc, char** argv)
 			glowStrip = glowUnsampled = true;
 		else if (!strcmp(argv[i], "--glass"))
 			glass = true;
+		else if (!strcmp(argv[i], "--decal"))
+			decal = true;
+		else if (!strcmp(argv[i], "--decal-lift") && i + 1 < argc)
+			decalLift = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "--wet") && i + 1 < argc)
 			wetness = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--view") && i + 1 < argc)
@@ -234,10 +257,25 @@ int main(int argc, char** argv)
 
 	try
 	{
+#ifdef PATHTRACER_LOCAL
+		// A device that traces itself, as a 64-bit game's render device makes.
+		std::vector<std::string> ngxInstance, ngxDevice;
+		RayReconstruction::RequiredExtensions(ngxInstance, ngxDevice);
+		VulkanInstanceBuilder instanceBuilder;
+		for (const std::string& name : ngxInstance)
+			instanceBuilder.OptionalExtension(name);
+		auto instance = instanceBuilder.Create();
+		VulkanDeviceBuilder builder;
+		builder.OptionalRayQuery();
+		builder.OptionalDescriptorIndexing();
+		for (const std::string& name : ngxDevice)
+			builder.OptionalExtension(name);
+#else
 		auto instance = VulkanInstanceBuilder().Create();
 		VulkanDeviceBuilder builder;
 		builder.RequireExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
 		builder.RequireExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#endif
 		auto device = builder.Create(instance);
 		printf("this side: %s\n", device->PhysicalDevice.Properties.Properties.deviceName);
 
@@ -247,7 +285,11 @@ int main(int argc, char** argv)
 		dir = dir.substr(0, dir.find_last_of('\\'));
 
 		TraceClient client;
+#ifdef PATHTRACER_LOCAL
+		if (!client.StartLocal(device.get()))
+#else
 		if (!client.Start(device.get(), dir + "\\PathTracerHelper.exe", dir, false))
+#endif
 		{
 			printf("FAIL %s\n", client.Error().c_str());
 			return 1;
@@ -309,6 +351,24 @@ int main(int argc, char** argv)
 			AddQuad(world, vec3(-260, -310, 200), vec3(-140, -310, 200), vec3(-140, -190, 200), vec3(-260, -190, 200), vec3(0.8f, 0.1f, 0.1f), -1, 1);
 			for (size_t t = first; t < world.Attributes.size(); t++)
 				world.Attributes[t].UV2Tex.w = 2.0f;
+			world.HasMasked = true;
+		}
+		// A scorch mark, as the device lays a decal: a modulated quad
+		// (UV2Tex.w 4) a quarter of a unit off the floor, mid grey - which
+		// modulate-2x leaves alone - but for a dark blot in the middle. Only
+		// the blot should show; the square it is drawn on should not.
+		if (decal)
+		{
+			const size_t first = world.Attributes.size();
+			// As UT attaches one: to each of the surfaces it lies across, the
+			// same quad each time.
+			for (int copy = 0; copy < 3; copy++)
+				AddQuad(world, vec3(80, -420, decalLift), vec3(280, -420, decalLift), vec3(280, -220, decalLift), vec3(80, -220, decalLift), vec3(0.4f, 0.4f, 0.4f), 2, 1);
+			for (size_t t = first; t < world.Attributes.size(); t++)
+			{
+				world.Attributes[t].UV2Tex.w = 4.0f;
+				world.Attributes[t].Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+			}
 			world.HasMasked = true;
 		}
 		std::vector<uint32_t> emitterWords;
@@ -508,6 +568,36 @@ int main(int argc, char** argv)
 			client.Texture(0, 64, 64, checker.data(), checkerMaterial, false, checkerLevels);
 		if (detail)
 			client.Texture(1, 64, 64, stripes.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false);
+		if (decal)
+		{
+			std::vector<uint32_t> mark(64 * 64);
+			for (int y = 0; y < 64; y++)
+				for (int x = 0; x < 64; x++)
+				{
+					const float d = std::sqrt((x - 31.5f) * (x - 31.5f) + (y - 31.5f) * (y - 31.5f)) / 20.0f;
+					const uint32_t v = d >= 1.0f ? 128u : (uint32_t)(128.0f * d * d);
+					mark[y * 64 + x] = 0xff000000u | (v << 16) | (v << 8) | v;
+				}
+			// With its mips, as the device sends a texture from its package:
+			// each level the average of four texels of the one above, the
+			// last few averaging the blot into the grey.
+			uint32_t markLevels = 1;
+			for (int size = 64, above = 0; size > 1; size /= 2, markLevels++)
+			{
+				const int half = size / 2;
+				for (int y = 0; y < half; y++)
+					for (int x = 0; x < half; x++)
+					{
+						uint32_t sum = 0;
+						for (int k = 0; k < 4; k++)
+							sum += mark[above + (y * 2 + k / 2) * size + x * 2 + k % 2] & 255u;
+						const uint32_t v = sum / 4;
+						mark.push_back(0xff000000u | (v << 16) | (v << 8) | v);
+					}
+				above += size * size;
+			}
+			client.Texture(2, 64, 64, mark.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false, markLevels);
+		}
 		client.Geometry(0, world);
 		client.Lightmaps(lightmaps);
 		client.Emitters(emitterWords);
@@ -664,8 +754,10 @@ int main(int argc, char** argv)
 			barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 			barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
 			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-			barrier.dstQueueFamilyIndex = (uint32_t)device->GraphicsFamily;
+			// Traced here, on this queue, it has no hands to change.
+			const bool handOver = !client.IsLocal();
+			barrier.srcQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = handOver ? (uint32_t)device->GraphicsFamily : VK_QUEUE_FAMILY_IGNORED;
 			barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 			VkBufferImageCopy region = {};
@@ -674,8 +766,8 @@ int main(int argc, char** argv)
 			vkCmdCopyImageToBuffer(commands->buffer, client.Output(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &region);
 			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-			barrier.srcQueueFamilyIndex = (uint32_t)device->GraphicsFamily;
-			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+			barrier.srcQueueFamilyIndex = handOver ? (uint32_t)device->GraphicsFamily : VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 			barrier.dstAccessMask = 0;
 			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);

@@ -227,6 +227,13 @@ public:
 	// Whose eyes this is being traced from. Set each frame from the scene node's
 	// viewport, and used to apply the engine's owner visibility rules.
 	AActor* ViewActor = nullptr;
+	// Whose eyes the view is from when they are not the viewer's own: a
+	// spectator watching someone in first person, whose body the camera is
+	// then inside. Null otherwise.
+	AActor* ViewTarget = nullptr;
+	// The scene node being drawn while the actors are gathered, which 469's
+	// render iterators are started with. Only valid during CollectDynamic.
+	FSceneNode* ViewFrame = nullptr;
 	// The view is from behind the viewer rather than from its eyes - a third
 	// person conversation - so its own body is drawn like anyone else's and
 	// its first person weapon is not.
@@ -246,6 +253,12 @@ public:
 	FVector ViewRight = FVector(1, 0, 0);
 	FVector ViewDown = FVector(0, 1, 0);
 	FVector ViewForward = FVector(0, 0, 1);
+	// UT's first person weapon, placed only as the frame is sent: see
+	// AddViewModel. Its instance, and the weapon, meanwhile.
+	int ViewModelIndex = -1;
+	AInventory* ViewModelItem = nullptr;
+	void FinishViewModel();
+
 
 	// The sky zone's viewpoint, if the level has one, and which way it faces:
 	// the engine turns the view by the SkyZoneInfo's rotation before looking
@@ -284,6 +297,7 @@ public:
 	// that plays once picks its frame from how far through its life it is - so
 	// must not be advanced the way a looping animation is.
 	std::unordered_set<UTexture*> FixedFrames;
+
 	// Masked by the texture's own flags, or by the caller's when the polygon
 	// asks for it: the engine honours either. The owner is the actor a mesh
 	// skin is being worn by, which can say what the skin is made of.

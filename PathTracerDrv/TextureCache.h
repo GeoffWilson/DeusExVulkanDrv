@@ -18,6 +18,7 @@ struct CachedTexture
 	int Width = 0;
 	int Height = 0;
 	bool Masked = false;
+	bool PaletteAlpha = false;
 	// Which link of an animation chain is currently in the image.
 	UTexture* LastFrame = nullptr;
 	// A texture that draws itself - fire, the static the vision augmentation
@@ -46,10 +47,12 @@ public:
 	~TextureCache();
 
 	// Returns null if the texture could not be represented.
-	CachedTexture* Get(const FTextureInfo& info, bool masked);
+	// PaletteAlpha, for 469's PF_Highlighted art, keeps a palette's own alpha
+	// and leaves the colour as the engine premultiplied it.
+	CachedTexture* Get(const FTextureInfo& info, bool masked, bool paletteAlpha = false);
 
 	// Expand a texture's top mip into RGBA8.
-	static bool ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height);
+	static bool ConvertPixels(const FTextureInfo& info, bool masked, std::vector<uint32_t>& pixels, int& width, int& height, bool paletteAlpha = false);
 
 	// A texture the trace references, as RGBA8 pixels for the helper that
 	// traces. Takes a UTexture rather than an FTextureInfo because the scene
@@ -87,13 +90,14 @@ public:
 private:
 	uint32_t Frame = 1;
 	std::vector<CachedTexture*> Changed;
-	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked);
+	std::unique_ptr<CachedTexture> Upload(const FTextureInfo& info, bool masked, bool paletteAlpha);
 
 
 	UPathTracerRenderDevice* renderer = nullptr;
 
-	// Keyed on the engine's cache id and whether it was wanted masked: the same
-	// texture can be drawn both ways in one frame and the alpha differs.
+	// Keyed on the engine's cache id and whether it was wanted masked or with
+	// the palette's alpha: the same texture can be drawn more than one way in
+	// a frame and the alpha differs.
 	std::unordered_map<uint64_t, std::unique_ptr<CachedTexture>> Textures;
 
 };

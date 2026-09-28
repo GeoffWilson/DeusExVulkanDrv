@@ -35,9 +35,12 @@
 #define UTGLR_NO_APP_MALLOC
 #include <stdlib.h>
 
-// The engine's ABI is 4 byte packed. Stated here rather than with a global /Zp,
-// which clang-cl treats as a cap a pragma cannot widen past.
+// Deus Ex's engine ABI is 4 byte packed. Stated here rather than with a global
+// /Zp, which clang-cl treats as a cap a pragma cannot widen past. The 469
+// headers state their own packing, and are built without /Zp4 for 64-bit.
+#if defined(DEUSEX) || defined(UNREALGOLD)
 #pragma pack(push, 4)
+#endif
 
 // Portable stand-ins for the SDK's MASM blocks. Must precede any SDK header.
 #include "UE1AsmShims.h"
@@ -53,4 +56,19 @@
 #include "Render.h"
 #endif
 
+#if defined(DEUSEX) || defined(UNREALGOLD)
 #pragma pack(pop)
+#endif
+
+#if defined(OLDUNREAL469SDK)
+// 469 names Deus Ex's TEXF_RGBA8 for the order its bytes are in.
+#define TEXF_RGBA8 TEXF_BGRA8
+#endif
+
+// The engine's clocks - appSeconds and a viewport's CurrentTime - in seconds:
+// a double in Deus Ex's headers, 469's fixed point FTime in its own.
+#if defined(OLDUNREAL469SDK)
+inline double EngineSeconds(FTime time) { return time.GetDouble(); }
+#else
+inline double EngineSeconds(double time) { return time; }
+#endif

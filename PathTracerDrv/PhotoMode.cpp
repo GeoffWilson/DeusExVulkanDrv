@@ -148,6 +148,13 @@ bool UPathTracerRenderDevice::StartPhoto(FOutputDevice& Ar)
 		Ar.Logf(TEXT("PT: photo mode needs a level being traced"));
 		return false;
 	}
+	// Holding the world and flying the player are the local game's to do: in
+	// a network game the server has the world, and the player, its own way.
+	if (pawn->Level->NetMode != NM_Standalone)
+	{
+		Ar.Logf(TEXT("PT: photo mode is for a game played alone, not a network one"));
+		return false;
+	}
 	if (pawn->Level->Pauser.Len() || pawn->bShowMenu)
 	{
 		Ar.Logf(TEXT("PT: photo mode cannot start while the game is paused"));

@@ -3,6 +3,10 @@
 #include "Shaders.h"
 #include "Materials.h"
 #include "TraceProtocol.h"
+#ifdef PATHTRACER_LOCAL
+#include "RayReconstruction.h"
+#include <cstdarg>
+#endif
 #include <stdexcept>
 #include <chrono>
 #include <thread>
@@ -24,6 +28,24 @@ void VulkanError(const char* text)
 {
 	throw std::runtime_error(text);
 }
+
+#ifdef PATHTRACER_LOCAL
+// The tracer's log. In the helper it is a file of its own; traced in this
+// process, it is the engine's. printf formatted, with the engine's %S - a
+// narrow string inside a wide format - read as %s.
+void HelperLog(const char* format, ...)
+{
+	std::string fixed = format;
+	for (size_t i = 0; (i = fixed.find("%S", i)) != std::string::npos; i += 2)
+		fixed[i + 1] = 's';
+	char line[2048];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(line, sizeof(line), fixed.c_str(), args);
+	va_end(args);
+	debugf(TEXT("PathTracer: %s"), appFromAnsi(line));
+}
+#endif
 
 UPathTracerRenderDevice::UPathTracerRenderDevice()
 {
@@ -178,20 +200,28 @@ static LONG CALLBACK PathTracerExceptionLogger(EXCEPTION_POINTERS* info)
 	PathTracerDescribeAddress(record->ExceptionAddress, where, sizeof(where));
 
 	// An MSVC C++ exception: the thrown type's name is in its throw info, as
-	// a decorated name such as .?AVruntime_error@std@@. x86 keeps pointers
-	// there directly.
+	// a decorated name such as .?AVruntime_error@std@@, after the type
+	// descriptor's two pointers. x86 keeps pointers there directly; x64 keeps
+	// offsets from the image base of the module that threw, which is the
+	// fourth parameter.
 	if (code == 0xE06D7363 && record->NumberParameters >= 3)
 	{
 		const char* type = "?";
+#ifdef _WIN64
+		const uintptr_t base = record->NumberParameters >= 4 ? (uintptr_t)record->ExceptionInformation[3] : 0;
+#else
+		const uintptr_t base = 0;
+#endif
+		auto at = [base](DWORD offset) { return (const void*)(base + offset); };
 		const DWORD* throwInfo = (const DWORD*)record->ExceptionInformation[2];
-		if (throwInfo && throwInfo[3])
+		if (throwInfo && throwInfo[3] && (base || sizeof(void*) == 4))
 		{
-			const DWORD* catchables = (const DWORD*)throwInfo[3];
+			const DWORD* catchables = (const DWORD*)at(throwInfo[3]);
 			if (catchables[0] >= 1 && catchables[1])
 			{
-				const DWORD* catchable = (const DWORD*)catchables[1];
+				const DWORD* catchable = (const DWORD*)at(catchables[1]);
 				if (catchable[1])
-					type = (const char*)catchable[1] + 8;
+					type = (const char*)at(catchable[1]) + 2 * sizeof(void*);
 			}
 		}
 		// The object itself, if it is a std::exception: its what().
@@ -295,6 +325,16 @@ void UPathTracerRenderDevice::StaticConstructor()
 	SupportsTC = 0;
 	PrecacheOnFlip = 0;
 	SupportsLazyTextures = 0;
+#if defined(OLDUNREAL469SDK)
+	// 469's extensions, which the trace has no use for: the level is read
+	// from UModel rather than drawn. Its text comes with PF_Highlighted, which
+	// DrawTile blends premultiplied, as 469's own devices do.
+	UseLightmapAtlas = 0;
+	NeedsMaskedFonts = 0;
+	SupportsUpdateTextureRect = 0;
+	SupportsStaticBsp = 0;
+	SupportsDrawTileList = 0;
+#endif
 
 	Bounces = 3;
 	Exposure = 90;
@@ -307,11 +347,24 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseVSync = 1;
 	LogTimings = 0;
 	UseDenoiser = 1;
+#if defined(OLDUNREAL469SDK)
+	// Deus Ex needs a limit to keep its conversations whole; UT has its own.
+	FPSLimit = 0;
+#else
 	FPSLimit = 120;
+#endif
 	GlossBounces = 1;
 	UseMaterials = 0;
+#if defined(OLDUNREAL469SDK)
+	// 469 widens the view for a wide screen itself (Hor+); the trace follows
+	// the engine's projection, so widening it again here would widen it
+	// twice. The HUD is pinned to 4:3 as in Deus Ex.
+	UseWidescreenFOV = 0;
+	PinnedUI = 4.0f / 3.0f;
+#else
 	UseWidescreenFOV = 1;
 	PinnedUI = 4.0f / 3.0f;
+#endif
 	LightSize = 4;
 	UseDLSS = 1;
 	DLSSQuality = 1;
@@ -402,22 +455,44 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 
 	try
 	{
+#ifdef PATHTRACER_LOCAL
+		// This device traces as well as presents, as the helper's does
+		// elsewhere: ray queries, acceleration structures and an indexed
+		// texture array, and DLSS Ray Reconstruction's extensions, which have
+		// to be asked for now, before there is a device, or not at all.
+		std::vector<std::string> ngxInstance, ngxDevice;
+		RayReconstruction::RequiredExtensions(ngxInstance, ngxDevice);
+		VulkanInstanceBuilder instanceBuilder;
+		instanceBuilder.RequireSurfaceExtensions();
+		instanceBuilder.DebugLayer(VkDebug);
+		for (const std::string& name : ngxInstance)
+			instanceBuilder.OptionalExtension(name);
+		Instance = instanceBuilder.Create();
+#else
 		Instance = VulkanInstanceBuilder()
 			.RequireSurfaceExtensions()
 			.DebugLayer(VkDebug)
 			.Create();
+#endif
 
 		Surface = VulkanSurfaceBuilder()
 			.Win32Window((HWND)Viewport->GetWindow())
 			.Create(Instance);
 
+		auto deviceBuilder = VulkanDeviceBuilder();
+		deviceBuilder.Surface(Surface);
+#ifdef PATHTRACER_LOCAL
+		deviceBuilder.OptionalRayQuery();
+		deviceBuilder.OptionalDescriptorIndexing();
+		for (const std::string& name : ngxDevice)
+			deviceBuilder.OptionalExtension(name);
+#else
 		// This device only presents: the tracing is the helper's. What it does
 		// need is to take the helper's frame over on the GPU, which is two
 		// extensions every driver tested offers a 32-bit client.
-		auto deviceBuilder = VulkanDeviceBuilder();
-		deviceBuilder.Surface(Surface);
 		deviceBuilder.RequireExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
 		deviceBuilder.RequireExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#endif
 		deviceBuilder.SelectDevice(VkDeviceIndex);
 		Device = deviceBuilder.Create(Instance);
 
@@ -779,7 +854,7 @@ void UPathTracerRenderDevice::CreateTilePipeline()
 		.DebugName("PathTracerTileFragment")
 		.Create("PathTracerTileFragment", Device.get());
 
-	for (int mode = 0; mode < 3; mode++)
+	for (int mode = 0; mode < 4; mode++)
 	{
 		GraphicsPipelineBuilder builder;
 		builder.AddVertexShader(TileVertexShader.get());
@@ -796,7 +871,9 @@ void UPathTracerRenderDevice::CreateTilePipeline()
 		builder.Cull(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE);
 		builder.DepthStencilEnable(false, false, false);
 
-		// The three ways this engine composites 2D art.
+		// The ways this engine composites 2D art: alpha blended (masked
+		// art's holes being alpha), translucent, modulated, and 469's
+		// PF_Highlighted, premultiplied.
 		VkPipelineColorBlendAttachmentState blend = {};
 		blend.blendEnable = VK_TRUE;
 		blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -808,6 +885,11 @@ void UPathTracerRenderDevice::CreateTilePipeline()
 		{
 			blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
 			blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		}
+		else if (mode == 3)
+		{
+			blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+			blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 		}
 		else if (mode == 2)
 		{
@@ -1504,7 +1586,7 @@ void UPathTracerRenderDevice::EnsureSceneBuilt(ULevel* level)
 	// sent to the helper when the frame is.
 	const size_t geometriesBefore = Scene.Geometries.size();
 	Scene.LightScale = Max(LightScale, 1) / 100.0f;
-	Scene.ViewportTime = Viewport->CurrentTime;
+	Scene.ViewportTime = EngineSeconds(Viewport->CurrentTime);
 	Scene.HighlightSpecialLights = (DisableBits & 16u) != 0;
 	Scene.UseFlashlight = (DisableBits & 131072u) == 0;
 	Scene.FlashlightBrightness = Max(FlashlightBrightness, 0) / 100.0f;
@@ -1556,7 +1638,11 @@ void UPathTracerRenderDevice::AddInsetView(FSceneNode* Frame)
 	// player's view - still wants the scene where things are now. Either
 	// way, the camera the window is seen from is hidden now, while it draws.
 	if (!CollectedThisFrame)
+	{
+		Scene.ViewFrame = Frame;
 		EnsureSceneBuilt(Frame->Level);
+		Scene.ViewFrame = nullptr;
+	}
 	Scene.HideFromWindows();
 
 	InsetView view;
@@ -1616,11 +1702,17 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// mirror's and the sky's are its whole width.
 	// A child of one - the sky zone or a mirror seen in it, the same window
 	// again - is its own business, as the player's view's children are.
+	//
+	// UT has no such windows: its narrower nodes are the menus' previews of
+	// a model, drawn by DrawClippedActor from an actor in the entry level,
+	// which the trace of this level has nothing to show for.
 	if (Viewport && Frame->X > 0 && Frame->Y > 0 && Frame->X < Viewport->SizeX)
 	{
+#if defined(DEUSEX)
 		// Photo mode leaves the HUD, and the views in its windows, out.
 		if (!Frame->Parent && !Photo.Active)
 			AddInsetView(Frame);
+#endif
 		return;
 	}
 
@@ -1635,6 +1727,9 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	Scene.ViewActor = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
 	APlayerPawn* viewer = Cast<APlayerPawn>(Scene.ViewActor);
 	Scene.ViewFromBehind = viewer && viewer->bBehindView;
+#if defined(OLDUNREAL469SDK)
+	Scene.ViewTarget = (viewer && viewer->ViewTarget != viewer) ? viewer->ViewTarget : nullptr;
+#endif
 
 	// The view's basis, kept for placing the first person weapon.
 	Scene.ViewOrigin = Frame->Coords.Origin;
@@ -1648,7 +1743,9 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 		Scene.ViewOrigin = Photo.Position;
 	}
 
+	Scene.ViewFrame = Frame;
 	EnsureSceneBuilt(Frame->Level);
+	Scene.ViewFrame = nullptr;
 
 	// The engine projects a point as X * Proj.Z / Z: Proj.Z is the focal
 	// length in pixels, and carries the field of view this node is actually
@@ -1768,6 +1865,34 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 // Starts the helper that traces, from beside this DLL, on this device's GPU.
 bool UPathTracerRenderDevice::StartTracer()
 {
+#ifdef PATHTRACER_LOCAL
+	// A 64-bit game traces in its own process, on this device.
+	Tracer.reset(new TraceClient());
+	if (!Tracer->StartLocal(Device.get()))
+	{
+		const std::string why = Tracer->Error();
+		PathTracerEvent("tracer did not start: %s", why.c_str());
+		debugf(TEXT("PathTracerDrv could not start tracing: %s"), *Widen(why.c_str()));
+		debugf(TEXT("The GPU must offer ray tracing to Vulkan: VK_KHR_ray_query and VK_KHR_acceleration_structure."));
+		Tracer.reset();
+		return false;
+	}
+	{
+		const TraceProtocol::Header& status = Tracer->Status();
+		debugf(TEXT("PathTracer: tracing on %s%s"), *Widen(status.DeviceName),
+			status.CanSampleTextures ? TEXT("") : TEXT(", which cannot index textures: surfaces will use one averaged colour each"));
+		PathTracerEvent("tracing on %s", status.DeviceName);
+		if (LogTimings)
+		{
+			char line[256];
+			snprintf(line, sizeof(line), "PathTracer session: device built %s %s, tracing on %s", __DATE__, __TIME__, status.DeviceName);
+			WriteTimingLine(line);
+		}
+	}
+	SceneReset = true;
+	TracerLost = false;
+	return true;
+#else
 	HMODULE module = nullptr;
 	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&PathTracerEvent, &module);
 	char path[MAX_PATH] = {};
@@ -1801,6 +1926,7 @@ bool UPathTracerRenderDevice::StartTracer()
 	SceneReset = true;
 	TracerLost = false;
 	return true;
+#endif
 }
 
 // Whatever of the scene the helper does not have yet, and what changes every
@@ -1922,7 +2048,7 @@ bool UPathTracerRenderDevice::SendScene()
 	// where the other devices keep them going.
 	if (Viewport && !Photo.Active)
 	{
-		const double time = Viewport->CurrentTime;
+		const double time = EngineSeconds(Viewport->CurrentTime);
 		for (size_t i = 0; i < SentTextures.size(); i++)
 		{
 			SentTexture& sent = SentTextures[i];
@@ -2067,6 +2193,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// is what the engine expects behind a menu or a conversation.
 		if ((HaveCamera || !InsetViews.empty()) && Tracer && Tracer->Alive() && !Scene.IsEmpty())
 		{
+			// UT's weapon, now that RenderOverlays has placed it.
+			Scene.FinishViewModel();
 			const double sendStart = NowMs();
 			if (SendScene())
 			{
@@ -2210,8 +2338,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 			{
 				TracerLost = true;
 				PathTracerEvent("helper lost: %s", Tracer->Error().c_str());
-				debugf(TEXT("PathTracer: the helper has stopped (%s); PathTracerHelper.log says more. The world will not be traced again this session."),
-					*Widen(Tracer->Error().c_str()));
+				if (Tracer->IsLocal())
+					debugf(TEXT("PathTracer: tracing has stopped (%s). The world will not be traced again this session."),
+						*Widen(Tracer->Error().c_str()));
+				else
+					debugf(TEXT("PathTracer: the helper has stopped (%s); PathTracerHelper.log says more. The world will not be traced again this session."),
+						*Widen(Tracer->Error().c_str()));
 			}
 		}
 
@@ -2254,11 +2386,13 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 				b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 			}
+			// Traced in this process, on this queue, it has no hands to change.
+			const bool handOver = !Tracer->IsLocal();
 			barriers[0].image = Tracer->Output();
 			barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
 			barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-			barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-			barriers[0].dstQueueFamilyIndex = family;
+			barriers[0].srcQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+			barriers[0].dstQueueFamilyIndex = handOver ? family : VK_QUEUE_FAMILY_IGNORED;
 			barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 			barriers[1].image = OutputImage->image;
 			barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2275,8 +2409,8 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 
 			barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 			barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-			barriers[0].srcQueueFamilyIndex = family;
-			barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+			barriers[0].srcQueueFamilyIndex = handOver ? family : VK_QUEUE_FAMILY_IGNORED;
+			barriers[0].dstQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
 			barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 			barriers[0].dstAccessMask = 0;
 			barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2659,7 +2793,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 						int chain = 1;
 						for (UTexture* t = texture->AnimNext; t && t != texture && chain < 1000; t = t->AnimNext)
 							chain++;
-						const double now = appSeconds();
+						const double now = EngineSeconds(appSeconds());
 						for (SentTexture& sent : SentTextures)
 							if (sent.Source == texture)
 								debugf(TEXT("PT: animation: %d frames, MaxFrameRate %.2f MinFrameRate %.2f, realtime %d; the trace took %d new frames in the last %.2f seconds"),
@@ -3493,7 +3627,14 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	// gaps where the texture happens to use index zero as a real colour.
 	const DWORD flags = PolyFlags | (Info.Texture ? Info.Texture->PolyFlags : 0);
 	const bool masked = (flags & PF_Masked) != 0 && (flags & PF_Modulated) == 0;
-	CachedTexture* texture = Textures->Get(Info, masked);
+#if defined(OLDUNREAL469SDK)
+	// 469's own 2D, its text above all, asks for PF_Highlighted: premultiplied
+	// alpha, the palette's alpha taken as it is.
+	const bool highlighted = (flags & PF_Highlighted) != 0 && (flags & (PF_Translucent | PF_Modulated)) == 0;
+#else
+	const bool highlighted = false;
+#endif
+	CachedTexture* texture = Textures->Get(Info, masked, highlighted);
 	if (!texture)
 		return;
 
@@ -3502,6 +3643,8 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 		blendMode = 1;
 	else if (flags & PF_Modulated)
 		blendMode = 2;
+	else if (highlighted)
+		blendMode = 3;
 
 	// What each piece of 2D art actually asks for. The crosshair of a scope
 	// arrives as a black square, which means it is not asking for the additive
@@ -3595,6 +3738,15 @@ void UPathTracerRenderDevice::ClearZ(FSceneNode* Frame)
 	if (LogDraws && LoggedDraws++ < 400)
 		debugf(TEXT("PT TILES: clear depth"));
 }
+#if defined(OLDUNREAL469SDK)
+// What the 2D's textures can come as: what TextureCache decodes. The engine
+// converts anything else before handing it over.
+UBOOL UPathTracerRenderDevice::SupportsTextureFormat(ETextureFormat Format)
+{
+	return Format == TEXF_P8 || Format == TEXF_BGRA8 || Format == TEXF_RGB8 || Format == TEXF_BC1 || Format == TEXF_BC1_PA;
+}
+#endif
+
 void UPathTracerRenderDevice::PushHit(const BYTE* Data, INT Count) {}
 void UPathTracerRenderDevice::PopHit(INT Count, UBOOL bForce) {}
 void UPathTracerRenderDevice::GetStats(TCHAR* Result) { Result[0] = 0; }

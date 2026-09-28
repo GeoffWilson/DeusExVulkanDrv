@@ -52,10 +52,21 @@ struct TraceCamera
 // image the two share (TraceProtocol.h). What stays here is everything that
 // reads the engine - the level, the actors, the textures - and the engine's
 // 2D, drawn over the traced picture, with the window and the swap chain.
+//
+// On 469 it is one of OldUnreal's own render devices rather than an old one:
+// the engine wraps an old device in a URenderDeviceProxy, whose Exit, as 469f
+// shuts down, calls through to a device that is already gone.
+#if defined(OLDUNREAL469SDK)
+class UPathTracerRenderDevice : public URenderDeviceOldUnreal469
+{
+public:
+	DECLARE_CLASS(UPathTracerRenderDevice, URenderDeviceOldUnreal469, CLASS_Config, PathTracerDrv)
+#else
 class UPathTracerRenderDevice : public URenderDevice
 {
 public:
 	DECLARE_CLASS(UPathTracerRenderDevice, URenderDevice, CLASS_Config)
+#endif
 
 	UPathTracerRenderDevice();
 	void StaticConstructor();
@@ -81,6 +92,9 @@ public:
 	void PopHit(INT Count, UBOOL bForce) override;
 	void GetStats(TCHAR* Result) override;
 	void ReadPixels(FColor* Pixels) override;
+#if defined(OLDUNREAL469SDK)
+	UBOOL SupportsTextureFormat(ETextureFormat Format) override;
+#endif
 
 	// The set binding a cached texture with one of the tile samplers, made the
 	// first time a tile asks for it. mode is TileSamplers' index.
@@ -350,7 +364,7 @@ private:
 	std::unique_ptr<VulkanSampler> TileSamplers[4];
 	std::unique_ptr<VulkanPipelineLayout> TilePipelineLayout;
 	std::unique_ptr<VulkanRenderPass> TileRenderPass;
-	std::unique_ptr<VulkanPipeline> TilePipelines[3];
+	std::unique_ptr<VulkanPipeline> TilePipelines[4];
 	std::unique_ptr<VulkanShader> TileVertexShader;
 	std::unique_ptr<VulkanShader> TileFragmentShader;
 	std::unique_ptr<VulkanFramebuffer> TileFramebuffer;

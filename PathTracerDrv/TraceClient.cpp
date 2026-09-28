@@ -8,6 +8,10 @@
 #include "TraceClient.h"
 #include <cstdio>
 #include <cstring>
+#ifdef PATHTRACER_LOCAL
+#include "TraceHost.h"
+#include <stdexcept>
+#endif
 
 // Room for a batch, in the game's 32-bit address space as well as the
 // helper's. The static world has to fit in one command - 132 bytes a triangle,
@@ -113,8 +117,48 @@ bool TraceClient::Start(VulkanDevice* device, const std::string& helperPath, con
 	return true;
 }
 
+#ifdef PATHTRACER_LOCAL
+bool TraceClient::StartLocal(VulkanDevice* device)
+{
+	Device = device;
+	LocalMemory.assign(sizeof(TraceProtocol::Header) + CommandCapacity, 0);
+	Shared = (TraceProtocol::Header*)LocalMemory.data();
+	Shared->Magic = TraceProtocol::Magic;
+	Shared->Version = TraceProtocol::Version;
+	Shared->CommandCapacity = CommandCapacity;
+	Commands = (uint8_t*)(Shared + 1);
+	try
+	{
+		Local = new TraceHost(device, Shared, nullptr);
+	}
+	catch (const std::exception& e)
+	{
+		return Die(std::string("the tracer could not start: ") + e.what());
+	}
+	ReadySemaphore = Local->ReadySemaphoreHandle();
+	ReleasedSemaphore = Local->ReleasedSemaphoreHandle();
+	return true;
+}
+#endif
+
 void TraceClient::Stop()
 {
+#ifdef PATHTRACER_LOCAL
+	if (Local)
+	{
+		// The host's image and semaphores are its own, and go with it.
+		delete Local;
+		Local = nullptr;
+		OutputImage = VK_NULL_HANDLE;
+		ReadySemaphore = ReleasedSemaphore = VK_NULL_HANDLE;
+		ImportedWidth = ImportedHeight = 0;
+		Shared = nullptr;
+		Commands = nullptr;
+		LocalMemory.clear();
+		LocalMemory.shrink_to_fit();
+		return;
+	}
+#endif
 	if (Shared && HelperProcess && !Dead)
 	{
 		// Asked to go; the job would see to it anyway once this process does.
@@ -175,6 +219,24 @@ bool TraceClient::Send()
 	Shared->CommandBytes = Used;
 	Shared->BatchSerial++;
 	Used = 0;
+#ifdef PATHTRACER_LOCAL
+	if (Local)
+	{
+		try
+		{
+			Local->Batch(Commands, Shared->CommandBytes);
+		}
+		catch (const std::exception& e)
+		{
+			Shared->Status = 1;
+			snprintf(Shared->Error, sizeof(Shared->Error), "%s", e.what());
+		}
+		Shared->ReplySerial = Shared->BatchSerial;
+		if (Shared->Status != 0)
+			return Die(std::string("the tracer failed: ") + Shared->Error);
+		return true;
+	}
+#endif
 	SetEvent(RequestEvent);
 
 	HANDLE waits[2] = { ReplyEvent, HelperProcess };
@@ -373,6 +435,17 @@ void TraceClient::ReleaseOutput()
 // device's is waited for before it goes. A resize, not a per frame cost.
 bool TraceClient::ImportOutput()
 {
+#ifdef PATHTRACER_LOCAL
+	// Here already, and the host's to make and destroy.
+	if (Local)
+	{
+		OutputImage = Local->OutputImage();
+		ImportedGeneration = Shared->OutputGeneration;
+		ImportedWidth = Shared->OutputWidth;
+		ImportedHeight = Shared->OutputHeight;
+		return OutputImage != VK_NULL_HANDLE;
+	}
+#endif
 	vkDeviceWaitIdle(Device->device);
 	ReleaseOutput();
 
