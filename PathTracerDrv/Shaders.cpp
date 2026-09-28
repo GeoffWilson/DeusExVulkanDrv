@@ -116,9 +116,9 @@ static std::string TraceCommon()
 		// fixed jitter in xy (see Disable bit 256), GlowLighting in z and
 		// Wetness in w, the flashlight (see
 		// flashlightAt), which way the sky zone faces (TraceCommand's
-		// SkyAxes), photo mode's lens (PhotoLens), then each instance's last
-		// placement as three rows.
-		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 skyAxes[3]; vec4 photoLens; vec4 previousRows[]; };
+		// SkyAxes), photo mode's lens (PhotoLens), the relief's depth in x
+		// (BumpMapping), then each instance's last placement as three rows.
+		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 skyAxes[3]; vec4 photoLens; vec4 surfaceRelief; vec4 previousRows[]; };
 		// Each fog light's shadow cube, written by the pass before the trace
 		// (Shaders::FogShadows) and read by volumetricFog.
 		layout(binding = 26, std430) buffer FogShadows { float fogShadow[]; };
@@ -154,6 +154,7 @@ static std::string TraceCommon()
 		// How much a glowing surface gives what it lights: GlowLighting.
 		#define GlowScale frameJitter.z
 		#define Wetness frameJitter.w
+		#define BumpStrength surfaceRelief.x
 		#define LightRadius float((Counts.z >> 16u) & 255u)
 		#define MipBias (float(int(Counts.z) >> 24) / 16.0)
 		// Whether the level's surfaces take their lights as the engine's
@@ -515,7 +516,8 @@ static std::string TraceCommon()
 			vec4 v = materials[index];
 			m.roughness = clamp(v.x, 0.02, 1.0);
 			m.metalness = clamp(v.y, 0.0, 1.0);
-			m.reflectance = clamp(v.z, 0.0, 1.0);
+			// The fraction: the whole part is the relief (reliefNormal).
+			m.reflectance = fract(max(v.z, 0.0));
 			// Past this, a surface's sheen is too broad and too faint to be
 			// worth a ray of its own; it is shaded matte, as it always was.
 			m.glossy = m.roughness < 0.8 || m.metalness > 0.0;
@@ -2026,6 +2028,91 @@ static std::string TraceCommon()
 			m.glossy = m.glossy || m.roughness < 0.8;
 			m.traced = m.roughness < 0.5 && GlossBounces > 0u;
 		}
+
+		// A texel's height, for the relief: its brightness as displayed.
+		// Deus Ex has no height or normal maps, but in what is built of
+		// pieces the gaps between them are dark - the mortar between bricks,
+		// the grout between tiles, a crack in concrete - and the faces
+		// lighter, which is the shape near enough.
+		float reliefHeight(uint index, vec2 uv, float lod)
+		{
+			return dot(textureLod(sceneTextures[nonuniformEXT(index)], uv, lod).rgb, vec3(0.2126, 0.7152, 0.0722));
+		}
+
+		// How much a texture's height rises across the surface, in world
+		// units per unit: measured a texel apart at the level of the mip the
+		// footprint's longer axis calls for, so a wall far off or seen along
+		// its length flattens rather than sparkling. tu and tv are the
+		// world's gradients of the texture's coordinates, scale how much
+		// finer this texture is laid on.
+		vec3 reliefSlope(uint index, vec2 uv, vec2 scale, Footprint footprint, vec3 tu, vec3 tv, float depth)
+		{
+			vec2 size = vec2(textureSize(sceneTextures[nonuniformEXT(index)], 0));
+			float lod = max(log2(max(length(footprint.dx * scale * size), length(footprint.dy * scale * size))), 0.0);
+			vec2 texel = exp2(lod) / size;
+			float h = reliefHeight(index, uv, lod);
+			float du = (reliefHeight(index, uv + vec2(texel.x, 0.0), lod) - h) / texel.x;
+			float dv = (reliefHeight(index, uv + vec2(0.0, texel.y), lod) - h) / texel.y;
+			return depth * (du * scale.x * tu + dv * scale.y * tv);
+		}
+
+		// Bump mapping (the device's BumpMapping): a flat surface's normal
+		// tilted by the slope of its texture's height, as deep as its
+		// material says (Materials.h), and by its detail texture's up close,
+		// where the engine lays that on (detailFactor) - so a wall of bricks
+		// or a paved floor is lit as the rough thing it is, by the lights,
+		// the flashlight and what it reflects, rather than as one plane.
+		// Only a flat surface carries the gradients of its texture across
+		// it; a character's mesh keeps its own smooth normals. depth is how
+		// far in front of the eye it is, 0 for no detail texture; flatten
+		// how much of it standing water has smoothed over.
+		vec3 reliefNormal(TriangleAttributes attr, vec2 bary, vec3 dir, vec3 normal, vec3 faceNormal, Footprint footprint,
+			mat3 worldToObject, float depth, float flatten)
+		{
+			if (BumpStrength <= 0.0 || flatten >= 1.0 || !footprint.graded || attr.Normal.w > 0.5 || attr.Emission.w > 0.5 || attr.UV2Tex.w > 1.5)
+				return normal;
+			int index = int(attr.UV2Tex.z);
+			if (index < 0 || uint(index) >= TextureCount)
+				return normal;
+			float relief = floor(max(materials[index].z, 0.0)) / 8.0 * BumpStrength * (1.0 - flatten);
+			if (relief <= 0.0)
+				return normal;
+
+			vec2 lengths = unpackHalf2x16(attr.CornerNormals.z);
+			mat3 toWorld = transpose(worldToObject);
+			vec3 tu = toWorld * (unpackUnitVector(attr.CornerNormals.x) * lengths.x);
+			vec3 tv = toWorld * (unpackUnitVector(attr.CornerNormals.y) * lengths.y);
+			vec2 uv = surfaceUV(attr, bary, dir, normal);
+			vec3 slope = reliefSlope(uint(index), uv, vec2(1.0), footprint, tu, tv, relief);
+
+			// The detail texture's grain, a quarter unit deep, fading out
+			// with its first pass: the finer passes are finer than its
+			// relief would show.
+			if (depth > 0.0 && attr.CornerOffsets.x != 0u && (Disable & 2048u) == 0u)
+			{
+				uint detail = attr.CornerOffsets.x - 1u;
+				float fade = clamp(100.0 / 255.0 * (380.0 / max(depth, 1.0) - 1.0), 0.0, 1.0);
+				if (detail < TextureCount && fade > 0.0)
+				{
+					vec2 scale = uintBitsToFloat(attr.CornerOffsets.yz);
+					slope += reliefSlope(detail, uv * scale, scale, footprint, tu, tv, 0.25 * BumpStrength * (1.0 - flatten) * fade);
+				}
+			}
+
+			// The height stands out along the surface's own front, and the
+			// normal here faces whichever way the ray came from.
+			if (dot(toWorld * attr.Normal.xyz, faceNormal) < 0.0)
+				slope = -slope;
+			vec3 tilted = normalize(normal - (slope - dot(slope, normal) * normal));
+			// Never turned past the surface itself, or away from the eye.
+			float facing = dot(tilted, faceNormal);
+			if (facing < 0.2)
+				tilted = normalize(tilted + faceNormal * (0.2 - facing));
+			float seen = dot(tilted, -dir);
+			if (seen < 0.02)
+				tilted = normalize(tilted - dir * (0.02 - seen));
+			return tilted;
+		}
 	)";
 
 	return source;
@@ -2502,6 +2589,13 @@ std::string Shaders::Trace()
 						if (wet > 0.0)
 							wetness = wetPatches(position, normal, wet);
 					}
+					// The relief, on what the view meets first, in a mirror
+					// too: past that it is lit as flat. Standing water
+					// smooths it over.
+					if (bounce == firstBounce && !inSky && BumpStrength > 0.0)
+						normal = reliefNormal(attr, bary, direction, normal, faceNormal, footprint,
+							mat3(rayQueryGetIntersectionWorldToObjectEXT(rq, true)),
+							lobePass == 0 ? dot(position - CameraOrigin.xyz, CameraForward.xyz) : 0.0, wetness.y);
 					// Likewise the first lit surface seen in a mirror. A mirror
 					// seen in a mirror gives only its own half here: its
 					// reflection would need a third pass.

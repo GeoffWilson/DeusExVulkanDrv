@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 16;
+	static const uint32_t Version = 17;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -332,6 +332,10 @@ namespace TraceProtocol
 		// it is focused, 0 for whatever the middle of the view meets (the
 		// shader's photoFocus). Read only while Disable bit 524288 is set.
 		vec4 PhotoLens;
+		// How deep the textures' relief is drawn, 1 as the materials give
+		// it and 0 for none: the device's BumpMapping.
+		float BumpMapping;
+		uint32_t Pad;
 		TraceInset Insets[MaxInsets];
 	};
 

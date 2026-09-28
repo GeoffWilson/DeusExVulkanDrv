@@ -7,6 +7,9 @@ namespace
 	{
 		const TCHAR* Name;
 		float Roughness, Metalness, Reflectance;
+		// How deep its texture's relief runs, in world units from its darkest
+		// texel to its brightest: see Materials.h.
+		float Relief;
 	};
 
 	// One row per group the game's texture packages use, and a few that only
@@ -17,24 +20,29 @@ namespace
 	// Metal is only partly metallic. Deus Ex's metal textures are mostly
 	// painted panels, grates and pipes, and at full metalness they read as
 	// chrome, reflecting their own texture's dark colour.
+	//
+	// The relief is deepest in what is built of pieces - the mortar between
+	// bricks and stones, the grout between tiles - and none where the
+	// texture's light and dark are paint, print or a reflection: glass,
+	// water, paper, skin.
 	const Kind Kinds[] = {
-		{ TEXT("Metal"),    0.40f, 0.70f, 0.04f },
-		{ TEXT("Glass"),    0.05f, 0.00f, 0.04f },
-		{ TEXT("Ceramic"),  0.25f, 0.00f, 0.04f },
-		{ TEXT("Tiles"),    0.30f, 0.00f, 0.04f },
-		{ TEXT("Stone"),    0.55f, 0.00f, 0.04f },
-		{ TEXT("Wood"),     0.55f, 0.00f, 0.04f },
-		{ TEXT("Water"),    0.05f, 0.00f, 0.02f },
-		{ TEXT("Plastic"),  0.40f, 0.00f, 0.04f },
-		{ TEXT("Leather"),  0.50f, 0.00f, 0.04f },
-		{ TEXT("Flesh"),    0.65f, 0.00f, 0.03f },
-		{ TEXT("Concrete"), 0.85f, 0.00f, 0.04f },
-		{ TEXT("Brick"),    0.90f, 0.00f, 0.04f },
-		{ TEXT("Stucco"),   0.90f, 0.00f, 0.04f },
-		{ TEXT("Earth"),    1.00f, 0.00f, 0.04f },
-		{ TEXT("Foliage"),  0.80f, 0.00f, 0.04f },
-		{ TEXT("Textile"),  1.00f, 0.00f, 0.04f },
-		{ TEXT("Paper"),    0.90f, 0.00f, 0.04f },
+		{ TEXT("Metal"),    0.40f, 0.70f, 0.04f, 1.0f },
+		{ TEXT("Glass"),    0.05f, 0.00f, 0.04f, 0.0f },
+		{ TEXT("Ceramic"),  0.25f, 0.00f, 0.04f, 0.5f },
+		{ TEXT("Tiles"),    0.30f, 0.00f, 0.04f, 1.5f },
+		{ TEXT("Stone"),    0.55f, 0.00f, 0.04f, 3.0f },
+		{ TEXT("Wood"),     0.55f, 0.00f, 0.04f, 1.0f },
+		{ TEXT("Water"),    0.05f, 0.00f, 0.02f, 0.0f },
+		{ TEXT("Plastic"),  0.40f, 0.00f, 0.04f, 0.25f },
+		{ TEXT("Leather"),  0.50f, 0.00f, 0.04f, 0.5f },
+		{ TEXT("Flesh"),    0.65f, 0.00f, 0.03f, 0.0f },
+		{ TEXT("Concrete"), 0.85f, 0.00f, 0.04f, 1.5f },
+		{ TEXT("Brick"),    0.90f, 0.00f, 0.04f, 3.0f },
+		{ TEXT("Stucco"),   0.90f, 0.00f, 0.04f, 1.25f },
+		{ TEXT("Earth"),    1.00f, 0.00f, 0.04f, 2.0f },
+		{ TEXT("Foliage"),  0.80f, 0.00f, 0.04f, 1.5f },
+		{ TEXT("Textile"),  1.00f, 0.00f, 0.04f, 0.5f },
+		{ TEXT("Paper"),    0.90f, 0.00f, 0.04f, 0.0f },
 	};
 
 	const Kind* FindKind(const TCHAR* name)
@@ -86,19 +94,19 @@ namespace
 
 	vec4 FromKind(const Kind& kind)
 	{
-		return vec4(kind.Roughness, kind.Metalness, kind.Reflectance, 0.0f);
+		return vec4(kind.Roughness, kind.Metalness, Materials::PackReflectance(kind.Reflectance, kind.Relief), 0.0f);
 	}
 
-	// "roughness, metalness[, reflectance]" from the ini, over what the
-	// material already was. False when the key is not there.
+	// "roughness, metalness[, reflectance[, relief]]" from the ini, over what
+	// the material already was. False when the key is not there.
 	bool FromIni(const TCHAR* key, vec4& material)
 	{
 		TCHAR value[256] = {};
 		if (!GConfig || !GConfig->GetString(Section, key, value, ARRAY_COUNT(value)))
 			return false;
-		float parts[3] = { material.x, material.y, material.z };
+		float parts[4] = { material.x, material.y, Materials::Reflectance(material), Materials::Relief(material) };
 		const TCHAR* p = value;
-		for (int i = 0; i < 3 && *p; i++)
+		for (int i = 0; i < 4 && *p; i++)
 		{
 			parts[i] = appAtof(p);
 			while (*p && *p != ',')
@@ -106,7 +114,7 @@ namespace
 			if (*p == ',')
 				p++;
 		}
-		material = vec4(Clamp(parts[0], 0.0f, 1.0f), Clamp(parts[1], 0.0f, 1.0f), Clamp(parts[2], 0.0f, 1.0f), 0.0f);
+		material = vec4(Clamp(parts[0], 0.0f, 1.0f), Clamp(parts[1], 0.0f, 1.0f), Materials::PackReflectance(parts[2], parts[3]), 0.0f);
 		return true;
 	}
 
@@ -147,6 +155,21 @@ namespace
 vec4 Materials::Matte()
 {
 	return vec4(1.0f, 0.0f, 0.04f, 0.0f);
+}
+
+float Materials::PackReflectance(float reflectance, float relief)
+{
+	return Clamp(reflectance, 0.0f, 0.999f) + (float)Clamp(appRound(relief * 8.0f), 0, 255);
+}
+
+float Materials::Reflectance(const vec4& material)
+{
+	return material.z - appFloor(material.z);
+}
+
+float Materials::Relief(const vec4& material)
+{
+	return appFloor(material.z) / 8.0f;
 }
 
 vec4 Materials::For(UTexture* texture, AActor* owner, const TCHAR** name)

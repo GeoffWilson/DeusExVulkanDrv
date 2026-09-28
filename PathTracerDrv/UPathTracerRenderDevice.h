@@ -216,6 +216,13 @@ public:
 	// original, where it never rains, so off unless asked for. PT WET n
 	// sets it for the session.
 	INT Wetness;
+	// Bump mapping, in percent of the relief the materials give each
+	// texture (Materials.h): walls and floors lit by the slope of their
+	// texture's brightness, the mortar and the grout sunk between bricks and
+	// tiles (reliefNormal in Shaders.cpp). A look the original never had, so
+	// 0 - flat, as the engine draws them - unless asked for: 100 is the
+	// materials' relief as given. PT BUMP n sets it for the session.
+	INT BumpMapping;
 
 private:
 	// The switches in DisableBits the ini sets rather than PT alone: the
@@ -440,6 +447,7 @@ private:
 		int LightSize = 0;
 		INT Bounces = 1;
 		INT Wetness = 0;
+		INT BumpMapping = 0;
 		// This step's sums, from when it has settled.
 		double Gpu = 0, Trace = 0, Collect = 0, FrameSum = 0;
 		int GpuFrames = 0, Frames = 0;

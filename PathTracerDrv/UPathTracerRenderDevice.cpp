@@ -327,6 +327,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	GlowLighting = 1000;
 	UseColouredGlass = 1;
 	Wetness = 0;
+	BumpMapping = 0;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -361,6 +362,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("GlowLighting"), RF_Public) UIntProperty(CPP_PROPERTY(GlowLighting), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("ColouredGlass"), RF_Public) UBoolProperty(CPP_PROPERTY(UseColouredGlass), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Wetness"), RF_Public) UIntProperty(CPP_PROPERTY(Wetness), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("BumpMapping"), RF_Public) UIntProperty(CPP_PROPERTY(BumpMapping), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -520,8 +522,8 @@ static void DescribeActor(AActor* actor, UMesh* mesh)
 		{
 			const TCHAR* kind = nullptr;
 			const vec4 m = Materials::For(texture, actor, &kind);
-			debugf(TEXT("    material %s: roughness %.2f metalness %.2f reflectance %.2f (group %s)"),
-				kind, m.x, m.y, m.z, texture->GetOuter() ? texture->GetOuter()->GetName() : TEXT("none"));
+			debugf(TEXT("    material %s: roughness %.2f metalness %.2f reflectance %.2f relief %.2f (group %s)"),
+				kind, m.x, m.y, Materials::Reflectance(m), Materials::Relief(m), texture->GetOuter() ? texture->GetOuter()->GetName() : TEXT("none"));
 		}
 		for (TFieldIterator<UObjectProperty> it(texture->GetClass()); it; ++it)
 			if (!appStricmp(it->GetName(), TEXT("SourceTexture")))
@@ -1309,6 +1311,7 @@ static const TCHAR* const BenchSteps[] = {
 	TEXT("the game's light augmentation"),
 	TEXT("light untinted by glass"),
 	TEXT("dry streets"),
+	TEXT("no bump mapping"),
 	TEXT("one bounce"),
 	TEXT("no shadows"),
 	TEXT("as set, again"),
@@ -1324,6 +1327,7 @@ void UPathTracerRenderDevice::StartBench()
 	Bench.LightSize = LightSizeNow;
 	Bench.Bounces = Bounces;
 	Bench.Wetness = Wetness;
+	Bench.BumpMapping = BumpMapping;
 	// Off meanwhile, as the frame limit is, so the frame times are the
 	// frame's own; the swap chain is made again for it.
 	Bench.Vsync = UseVSync != 0;
@@ -1345,6 +1349,7 @@ bool UPathTracerRenderDevice::ApplyBenchStep(int step)
 	LightSizeNow = Bench.LightSize;
 	Bounces = Bench.Bounces;
 	Wetness = Bench.Wetness;
+	BumpMapping = Bench.BumpMapping;
 	AccumulatedFrames = 0;
 	DenoiseRestart = true;
 
@@ -1372,8 +1377,9 @@ bool UPathTracerRenderDevice::ApplyBenchStep(int step)
 	case 11: return Scene.Flashlight[0].w > 0.0f && setBit(131072u);
 	case 12: return setBit(1048576u);
 	case 13: if (Wetness <= 0) return false; Wetness = 0; return true;
-	case 14: if (Bounces <= 1) return false; Bounces = 1; return true;
-	case 15: return setBit(2u);
+	case 14: if (BumpMapping <= 0) return false; BumpMapping = 0; return true;
+	case 15: if (Bounces <= 1) return false; Bounces = 1; return true;
+	case 16: return setBit(2u);
 	default: return true;
 	}
 }
@@ -2141,6 +2147,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 					frame.Flashlight[i] = Scene.Flashlight[i];
 				frame.GlowLighting = Max(GlowLighting, 0) / 100.0f;
 				frame.Wetness = Clamp(Wetness, 0, 100) / 100.0f;
+				frame.BumpMapping = Clamp(BumpMapping, 0, 1000) / 100.0f;
 				frame.PhotoLens = vec4(Photo.Aperture, Photo.Focus, 0.0f, 0.0f);
 				// The windows' views, each averaging its samples while it and
 				// the scene hold still, as the player's does.
@@ -2628,10 +2635,10 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				UTexture* texture = node.iSurf < model->Surfs.Num() ? model->Surfs(node.iSurf).Texture : nullptr;
 				const TCHAR* kind = nullptr;
 				const vec4 m = Materials::For(texture, nullptr, &kind);
-				Ar.Logf(TEXT("PT: surface %s (group %s): %s, roughness %.2f metalness %.2f reflectance %.2f, detail texture %s"),
+				Ar.Logf(TEXT("PT: surface %s (group %s): %s, roughness %.2f metalness %.2f reflectance %.2f relief %.2f, detail texture %s"),
 					texture ? texture->GetName() : TEXT("none"),
 					(texture && texture->GetOuter()) ? texture->GetOuter()->GetName() : TEXT("none"),
-					kind, m.x, m.y, m.z,
+					kind, m.x, m.y, Materials::Reflectance(m), Materials::Relief(m),
 					(texture && texture->DetailTexture) ? texture->DetailTexture->GetName() : TEXT("none"));
 				// Which file its package came from - the first of Paths to
 				// have it, as the engine looks - and whether it carries an
@@ -2931,6 +2938,16 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				: TEXT("tinted by the glass"));
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("BUMP")))
+		{
+			BumpMapping = Clamp(appAtoi(Cmd), 0, 1000);
+			AccumulatedFrames = 0;
+			if (BumpMapping > 0)
+				Ar.Logf(TEXT("PT: bump mapping at %d%% of the materials' relief"), (int)BumpMapping);
+			else
+				Ar.Logf(TEXT("PT: bump mapping off, every surface flat"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("WET")))
 		{
 			Wetness = Clamp(appAtoi(Cmd), 0, 100);
@@ -3141,7 +3158,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | BUMP n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

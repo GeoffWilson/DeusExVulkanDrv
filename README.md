@@ -157,6 +157,14 @@ crash, flushed as they happen.
   open to the sky darkened and shining as after rain, with puddles standing
   on the flat, reflecting the neon across the street. What an awning, a
   balcony or a glass roof covers stays dry (`Wetness`, `PT WET n`).
+- **Bump mapping.** Optional, and off unless asked for (`BumpMapping=100`,
+  `PT BUMP 100`): walls and floors are otherwise lit as flat planes, as the
+  engine draws them. Deus Ex has no height maps, but in what is built of
+  pieces the gaps are dark - mortar between bricks, grout between tiles,
+  cracks in concrete - so each texture's brightness is taken as its height,
+  as deep as its material allows, and the surface is lit by its slope: by the
+  lights, the flashlight and what it reflects. The detail texture adds its
+  grain up close. Signs, glass, paper and characters stay as they were.
 
 ### New in 1.2
 
@@ -397,12 +405,14 @@ half in proportion to what each reflects.
 The built in choices can be overridden in the game's ini, in a
 `[PathTracerDrv.Materials]` section: a texture's own name, or `Group.<name>` for
 a whole group, set to `roughness, metalness` with an optional third value for
-the reflectance face on. `PT LOOK` names the texture under the crosshair and
-what it counts as.
+the reflectance face on and a fourth for the relief in world units (see
+`BumpMapping`). `PT LOOK` names the texture under the crosshair and what it
+counts as.
 
 	[PathTracerDrv.Materials]
 	Group.Metal=0.3,1
 	ChairLeatherTex1=0.35,0
+	Group.Stone=0.55,0,0.04,4
 
 **Noise.** One of two denoisers takes it out:
 
@@ -519,6 +529,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 	GlowLighting=1000
 	ColouredGlass=True
 	Wetness=0
+	BumpMapping=0
 
 - `Bounces`: how many times a path may bounce. Where most of the cost is.
 - `Lighting`: `Engine`, the default, lights the level's surfaces as the engine
@@ -641,6 +652,21 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   dry; a grate's holes let the rain through. 100 is soaked. Only the first
   surface the view meets is wet: what it reflects is shaded dry. `PT WET n`
   sets it for the session.
+- `BumpMapping`: how deep walls' and floors' relief is drawn, in percent of
+  what their materials give: 0, the default, for flat surfaces as the engine
+  draws them, and 100 for the materials' relief as given. A texture's
+  brightness is taken as its height - the dark gaps between bricks, stones
+  and tiles sunk, their faces standing out - and the surface lit by its
+  slope, measured a texel apart at the mip its footprint calls for, so it
+  flattens with distance rather than sparkling. The materials give it by
+  what a surface is made of: 3 world units for brick and stone, 1.5 for
+  concrete, tiles and foliage, about 1 for metal and wood, none for glass,
+  water, paper or skin, and none for anything the materials cannot place,
+  so signs and posters stay flat. A fourth value in a material override
+  sets a texture's own (see Materials). The detail texture adds a quarter
+  unit of grain up close. Only flat surfaces, which carry their texture's
+  direction across them: characters keep their own smooth normals. Standing
+  water smooths it over. `PT BUMP n` sets it for the session.
 - `FPSLimit`: frames per second to hold the game to, 120 by default and 0 for
   no limit. Deus Ex cuts conversation audio short when left to run at a few
   hundred frames a second, the intro included. Unlike VulkanDrv's it does not wait
@@ -708,8 +734,9 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   flashlight on or off or at a brightness, its beam's haze, the fog's
   shadows, and how much glowing surfaces light, as the settings of the same
   names.
-- `PT GLASS`, `PT WET n`: light through glass tinted or not, and how wet the
-  streets are, as `ColouredGlass` and `Wetness`.
+- `PT GLASS`, `PT WET n`, `PT BUMP n`: light through glass tinted or not, how
+  wet the streets are, and how deep the bump mapping, as `ColouredGlass`,
+  `Wetness` and `BumpMapping`.
 - `PT GLOWSAMPLING`: glowing surfaces found only by the bounces that reach
   them, as before, or sampled as lights as well, to compare. The two should
   settle to the same picture.
@@ -742,7 +769,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   shadow masks, mipmaps, anisotropic filtering, detail textures, the engine's
   mesh lighting, soft shadows, glowing surfaces lighting the room and being
   sampled as lights, the fog's shadows, the flashlight (against the game's own light augmentation),
-  glass's colour, wet streets, the extra bounces, shadows - with the frame limit and VSync off, then logs a table to
+  glass's colour, wet streets, bump mapping, the extra bounces, shadows - with the frame limit and VSync off, then logs a table to
   `PathTracerTimings.log`: the GPU's time, the scene gathering and the frame
   with each, and how each compares with the settings as they are. `PT BENCH`
   again stops it.

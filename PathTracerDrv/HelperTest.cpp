@@ -11,6 +11,7 @@
 //                            [--lightsize radius] [--reference] [--backlight]
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
+//                            [--bump percent]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -46,6 +47,10 @@
 // makes the scene ground open to the sky and that wet, darker and shining
 // with puddles on the floor - but for the patch under the glass, which the
 // rain does not reach.
+//
+// --bump gives the checkered floor stone's relief (Materials.h), drawn at
+// that percent: the light squares standing a few units proud of the dark,
+// lit along their edges on the side facing the light.
 //
 // --view shows one part of the picture in its place, numbered as PT VIEW
 // numbers them: 12 is each surface's material, red its roughness.
@@ -170,6 +175,7 @@ int main(int argc, char** argv)
 	bool glass = false;
 	int wetness = 0;
 	uint32_t view = 0;
+	int bump = 0;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -210,6 +216,8 @@ int main(int argc, char** argv)
 			wetness = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--view") && i + 1 < argc)
 			view = (uint32_t)atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--bump") && i + 1 < argc)
+			bump = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--photo") && i + 1 < argc)
 		{
 			photoAperture = (float)atof(argv[++i]);
@@ -469,6 +477,10 @@ int main(int argc, char** argv)
 		// each block one colour, the average of its texels, which the
 		// checker's squares are at the top levels.
 		std::vector<uint32_t> blocks;
+		// The floor's material: glossy, and with --bump stone's relief of 3
+		// units, packed as Materials.h packs it - in eighths of a unit, in
+		// the whole part of the reflectance.
+		const vec4 checkerMaterial(0.3f, 0.0f, 0.04f + (bump > 0 ? 24.0f : 0.0f), 0.0f);
 		if (bc1)
 		{
 			size_t level = 0;
@@ -490,10 +502,10 @@ int main(int argc, char** argv)
 					}
 				level += (size_t)size * size;
 			}
-			client.Texture(0, 64, 64, blocks.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false, checkerLevels, 1);
+			client.Texture(0, 64, 64, blocks.data(), checkerMaterial, false, checkerLevels, 1);
 		}
 		else
-			client.Texture(0, 64, 64, checker.data(), vec4(0.3f, 0.0f, 0.04f, 0.0f), false, checkerLevels);
+			client.Texture(0, 64, 64, checker.data(), checkerMaterial, false, checkerLevels);
 		if (detail)
 			client.Texture(1, 64, 64, stripes.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false);
 		client.Geometry(0, world);
@@ -530,6 +542,7 @@ int main(int argc, char** argv)
 		frame.GlowLighting = 1.0f;
 		frame.Wetness = wetness / 100.0f;
 		frame.ViewMode = view;
+		frame.BumpMapping = bump / 100.0f;
 		frame.Timing = 1;
 		frame.Exposure = 0.2f + 128 * (2.0f / 255.0f);
 		frame.SkyIntensity = dark ? 0.0f : 128 * (2.0f / 255.0f);
