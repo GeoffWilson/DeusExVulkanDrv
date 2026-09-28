@@ -70,7 +70,11 @@ otherwise keeps to the linear lighting its scene was made for; with it,
 `--baked-mask` bakes the light into the floor's lightmap with a shadow mask
 covering only the floor's left half, which the right half should go without.
 `--inset` adds a second view, as a security camera's in a window of the HUD,
-traced from the right of the box into the picture's top right corner. The Windows SDK that `xwin` fetches carries the Direct3D
+traced from the right of the box into the picture's top right corner.
+`--decal` lays a scorch mark on the floor as the device lays a decal - a
+modulated quad a quarter of a unit off it, mid grey round a dark blot - of
+which only the blot should show; `--decal-lift n` raises it, so that the
+light's shadow rays have to cross it. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 
@@ -108,6 +112,36 @@ build copies `nvngx_dlssd.dll` beside `PathTracerHelper.exe` and
 `deploy-deusex.sh` installs it with the helper, since NGX looks for it there.
 `cmake --build build-x64 --target ngxcheck` builds the spike that asks whether
 it runs at all on a given setup; see `spike/README.md`.
+
+### Unreal Tournament 469
+
+`PATHTRACER_GAME=UT469` builds PathTracerDrv for Unreal Tournament with
+OldUnreal's 469 patch instead, against the patch's SDK
+(`OldUnreal-UTPatch469f-SDK-Windows.zip`, from the
+[release](https://github.com/OldUnreal/UnrealTournamentPatches/releases)),
+unpacked beside this repository or wherever `UT469_SDK` points. It is not
+in this repository: its headers are Epic's, under the Unreal licence.
+
+```sh
+cmake -S . -B build-ut469-x64 -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/xwin-clang-cl-x64.cmake \
+      -DCMAKE_BUILD_TYPE=Release -DPATHTRACER_GAME=UT469 \
+      -DUT469_SDK=../UT469fSDK
+cmake --build build-ut469-x64 --target PathTracerDrv
+```
+
+The 64-bit game needs no helper: this builds the tracing, NRD and NGX into
+`PathTracerDrv.dll` itself, and copies `nvngx_dlssd.dll` beside it.
+`cmake/deploy-ut.sh "" pathtracer` installs both, and the `.int`, into the
+Steam install and selects the device (`none` leaves the ini alone).
+`--target PathTracerLocalTest` builds the harness above traced the same way,
+in its own process on its own device, with the same options.
+
+Two things clang-cl needs that MSVC does not: `__XNAMATHVECTOR_INL__`, the
+guard 469's `UnX86.h` skips its operators on SSE vectors for, which clang
+already has; and an `/alternatename` for the static that holds the name of
+`UObject::operator delete`'s guard block, whose scope clang numbers one higher
+than MSVC did when it built `Core.dll`.
 
 ## Installing
 

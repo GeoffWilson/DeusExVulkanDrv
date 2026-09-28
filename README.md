@@ -20,6 +20,10 @@ Two render devices for Deus Ex:
   game shipped with, and on a wide screen, like the path tracer, shows more of
   the world rather than less with the HUD kept to a box in the middle.
 
+PathTracerDrv also runs in **Unreal Tournament** with OldUnreal's 469f patch,
+for single player and your own servers: see
+[PathTracerDrv in Unreal Tournament](#pathtracerdrv-in-unreal-tournament).
+
 D3D11Drv and D3D12Drv from upstream also build and run for Deus Ex. They are kept
 for comparison - D3D11 is the reference the path tracer is checked against - and
 are not described further here.
@@ -836,6 +840,70 @@ which goes beside it. Without either the path tracer still builds and runs,
 just without that denoiser. See
 [cmake/README-crossbuild.md](cmake/README-crossbuild.md).
 
+## PathTracerDrv in Unreal Tournament
+
+The same device, built for Unreal Tournament with OldUnreal's
+[469 patch](https://github.com/OldUnreal/UnrealTournamentPatches), and played
+from Steam under Proton on the patch's 64 bit build of 469f, its fifth release
+candidate.
+
+> **Single player, and your own servers, only.** Joining a server that runs
+> ACE, the anti-cheat most public servers use, with this device gets you
+> kicked, and on some servers banned. Play against bots, or on a server you
+> run without ACE.
+
+### Installing it in UT
+
+Copy `PathTracerDrv.dll`, `PathTracerDrv.int` and `nvngx_dlssd.dll` into the
+game's `System` folder and choose PathTracer as the renderer in the game's
+video preferences, or set `GameRenderDevice=PathTracerDrv.PathTracerRenderDevice`
+in the `[Engine.Engine]` section of `UnrealTournament.ini`. On Linux,
+`cmake/deploy-ut.sh "" pathtracer` copies them into the Steam install and sets
+it. There is no `PathTracerHelper.exe` to copy: the game is 64 bit, which is
+offered ray tracing everywhere, so the tracing runs in its own process, on the
+device's own Vulkan device - the helper's work, done in place
+(`TraceHost`). It needs the same GPU as in Deus Ex, and DLSS Ray
+Reconstruction and NRD denoise as they do there.
+
+### What is different from Deus Ex
+
+- **The view.** 469 widens the view for a wide screen itself, and the trace
+  follows the engine's projection, so `WidescreenFOV` is off by default here
+  rather than widening it twice. The HUD is pinned to 4:3 as in Deus Ex;
+  `PT PINNEDUI OFF` gives 469's own HUD, which is laid out for any width.
+- **No frame limiter.** Deus Ex needs one to keep its conversations whole; UT
+  does not, and `FPSLimit` is 0.
+- **The weapon in your hands** is put where UT's `RenderOverlays` puts it -
+  469's `CalcDrawOffset`, with its field of view corrections, the bob and the
+  hand it is held in - and only once the engine has placed it for the frame
+  being traced. Taken earlier, a client of a server has the server's idea of
+  where it is, at the body's middle, which put it out of sight below the view.
+- **Meshes with an empty skin slot** are drawn as 469 draws them, with what it
+  would environment map them with or else the mesh's last texture. UT's traffic
+  cones, toolboxes, bins and tyres need it; they came out white without it.
+- **469's own render device interface.** The device is one of OldUnreal's
+  `URenderDeviceOldUnreal469` devices rather than an old one: the engine wraps
+  an old device in a proxy, whose `Exit` called on into a device already gone
+  as the game shut down. Its text comes premultiplied (`PF_Highlighted`), and is
+  drawn so.
+- **Photo mode** is for a game played alone: in a network game the server has
+  the world, and the player, its own way.
+- What is Deus Ex's alone does nothing: the light augmentation's flashlight,
+  the vision augmentation, and views in windows of the HUD.
+
+### What it does not do yet in UT
+
+- The menus' model previews - the player setup's turning character - draw
+  nothing. The engine draws them from an actor in its entry level, which the
+  trace of the level being played does not have.
+- A texture in one of 469's newer formats (BC2 to BC7, 16 bit) is drawn white,
+  and the log names it; the stock game's are palettised, BGRA or BC1.
+- It has not been benchmarked yet, nor tried on 32 bit 469, where it would
+  start the helper as Deus Ex does.
+
+It is built by the Unreal Tournament configuration in
+[cmake/README-crossbuild.md](cmake/README-crossbuild.md).
+
 ## VulkanDrv
 
 The rasteriser the game is best played on. Upstream had Deus Ex project files
@@ -968,7 +1036,9 @@ textures while leaving the paths alone.
 On Linux, the CMake cross build in [cmake/README-crossbuild.md](cmake/README-crossbuild.md)
 builds every device with clang-cl against Microsoft's CRT and SDK, and documents
 the Deus Ex specific behaviour worth knowing before filing a bug against a
-renderer. It is the only build of PathTracerDrv.
+renderer. It is the only build of PathTracerDrv, for Unreal Tournament as well
+(`PATHTRACER_GAME=UT469`, against OldUnreal's 469 SDK, which is not included
+here).
 
 On Windows, the Visual Studio solution builds VulkanDrv, D3D11Drv and D3D12Drv
 from their `DeusExRelease` configurations. It does not include PathTracerDrv
