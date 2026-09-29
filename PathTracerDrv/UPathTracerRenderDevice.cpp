@@ -381,6 +381,9 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseColouredGlass = 1;
 	Wetness = 0;
 	BumpMapping = 0;
+	Hdr = 0;
+	HdrPeakNits = 1000;
+	HdrPaperWhite = 200;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -416,6 +419,9 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("ColouredGlass"), RF_Public) UBoolProperty(CPP_PROPERTY(UseColouredGlass), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Wetness"), RF_Public) UIntProperty(CPP_PROPERTY(Wetness), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("BumpMapping"), RF_Public) UIntProperty(CPP_PROPERTY(BumpMapping), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("HDR"), RF_Public) UBoolProperty(CPP_PROPERTY(Hdr), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("HDRPeakNits"), RF_Public) UIntProperty(CPP_PROPERTY(HdrPeakNits), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("HDRPaperWhite"), RF_Public) UIntProperty(CPP_PROPERTY(HdrPaperWhite), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -467,10 +473,15 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 		instanceBuilder.DebugLayer(VkDebug);
 		for (const std::string& name : ngxInstance)
 			instanceBuilder.OptionalExtension(name);
+		// Without it no surface can say it takes an HDR colour space.
+		instanceBuilder.OptionalExtension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
 		Instance = instanceBuilder.Create();
 #else
+		// Without the colour space extension no surface can say it takes an
+		// HDR colour space.
 		Instance = VulkanInstanceBuilder()
 			.RequireSurfaceExtensions()
+			.OptionalExtension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)
 			.DebugLayer(VkDebug)
 			.Create();
 #endif
@@ -513,6 +524,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 		Textures.reset(new TextureCache(this));
 		CreateTilePipeline();
 		CreateBrightnessPipeline();
+		CreateEncodePipeline();
 
 		if (!StartTracer())
 		{
@@ -1051,6 +1063,103 @@ void UPathTracerRenderDevice::ApplyBrightness(VulkanCommandBuffer* commands)
 		.Execute(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 }
 
+void UPathTracerRenderDevice::CreateEncodePipeline()
+{
+	EncodeShader = ShaderBuilder()
+		.Type(ShaderType::Compute)
+		.AddSource("shaders/Encode.comp", Shaders::Encode())
+		.DebugName("PathTracerEncode")
+		.Create("PathTracerEncode", Device.get());
+
+	EncodeSetLayout = DescriptorSetLayoutBuilder()
+		.AddBinding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.DebugName("PathTracerEncodeSetLayout")
+		.Create(Device.get());
+	EncodeDescriptorPool = DescriptorPoolBuilder()
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4)
+		.MaxSets(2)
+		.DebugName("PathTracerEncodeDescriptorPool")
+		.Create(Device.get());
+	PresentSet = EncodeDescriptorPool->allocate(EncodeSetLayout.get());
+	SdrSet = EncodeDescriptorPool->allocate(EncodeSetLayout.get());
+
+	EncodePipelineLayout = PipelineLayoutBuilder()
+		.AddSetLayout(EncodeSetLayout.get())
+		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 4 + sizeof(int32_t) * 4)
+		.DebugName("PathTracerEncodePipelineLayout")
+		.Create(Device.get());
+	EncodePipeline = ComputePipelineBuilder()
+		.Layout(EncodePipelineLayout.get())
+		.ComputeShader(EncodeShader.get())
+		.DebugName("PathTracerEncodePipeline")
+		.Create(Device.get());
+}
+
+float UPathTracerRenderDevice::ToneCeiling() const
+{
+	if (!HdrMode)
+		return 1.0f;
+	return Max(Clamp(HdrPeakNits, 100, 10000) / (float)Clamp(HdrPaperWhite, 80, 1000), 1.0f);
+}
+
+// Made with the output image's size the first time they are wanted after it
+// changes, which drops them.
+void UPathTracerRenderDevice::EnsureEncodeImages()
+{
+	if (PresentImage || !OutputImage)
+		return;
+	auto makeImage = [&](std::unique_ptr<VulkanImage>& image, std::unique_ptr<VulkanImageView>& view, const char* name)
+	{
+		image = ImageBuilder()
+			.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
+			.Size(TraceWidth, TraceHeight)
+			.Usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+			.DebugName(name)
+			.Create(Device.get());
+		view = ImageViewBuilder().Image(image.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName(name).Create(Device.get());
+	};
+	makeImage(PresentImage, PresentView, "PathTracerPresent");
+	makeImage(SdrImage, SdrView, "PathTracerSdr");
+	WriteDescriptors()
+		.AddStorageImage(PresentSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(PresentSet.get(), 1, PresentView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(SdrSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(SdrSet.get(), 1, SdrView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.Execute(Device.get());
+}
+
+// The finished picture, the 2D over it and the Brightness applied, encoded
+// for the HDR swap chain - or, for a picture saved while HDR is on, brought
+// back to what SDR would have shown. Left ready to be blitted from. The
+// output image itself is left as it is: a frame the helper has not replaced
+// is drawn again from it, and would otherwise be encoded twice.
+void UPathTracerRenderDevice::EncodeFrame(VulkanCommandBuffer* commands, bool forSaving)
+{
+	EnsureEncodeImages();
+	if (!PresentImage || !EncodePipeline)
+		return;
+	VulkanImage* target = forSaving ? SdrImage.get() : PresentImage.get();
+	PipelineBarrier()
+		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+		.AddImage(target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+	struct { float Params[4]; int32_t Size[4]; } constants = {
+		{ forSaving ? 3.0f : (float)HdrMode, (float)Clamp(HdrPaperWhite, 80, 1000), ToneCeiling(), 0.0f },
+		{ TraceWidth, TraceHeight, 0, 0 } };
+	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, EncodePipeline.get());
+	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, EncodePipelineLayout.get(), 0, forSaving ? SdrSet.get() : PresentSet.get());
+	commands->pushConstants(EncodePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+	commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+
+	PipelineBarrier()
+		.AddImage(target, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+}
+
 // Keep the engine's cursor clip on the window we actually have.
 //
 // The engine clips the pointer to the window as it stands when ResizeViewport
@@ -1256,6 +1365,10 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	vkDeviceWaitIdle(Device->device);
 
 	TileFramebuffer.reset();
+	PresentView.reset();
+	PresentImage.reset();
+	SdrView.reset();
+	SdrImage.reset();
 	OutputView.reset();
 	OutputImage.reset();
 
@@ -2312,6 +2425,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.GlowLighting = Max(GlowLighting, 0) / 100.0f;
 				frame.Wetness = Clamp(Wetness, 0, 100) / 100.0f;
 				frame.BumpMapping = Clamp(BumpMapping, 0, 1000) / 100.0f;
+				frame.ToneCeiling = ToneCeiling();
 				frame.PhotoLens = vec4(Photo.Aperture, Photo.Focus, 0.0f, 0.0f);
 				// The windows' views, each averaging its samples while it and
 				// the scene hold still, as the player's does.
@@ -2387,12 +2501,54 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// with its semaphore.
 		WaitForPreviousFrame();
 
-		if (SwapChain->Lost() || SwapChain->Width() != windowWidth || SwapChain->Height() != windowHeight || UsingVsync != UseVSync)
+		if (SwapChain->Lost() || SwapChain->Width() != windowWidth || SwapChain->Height() != windowHeight || UsingVsync != UseVSync || UsingHdr != Hdr)
 		{
 			PathTracerEvent("swap chain %dx%d -> %dx%d%s", SwapChain->Width(), SwapChain->Height(), windowWidth, windowHeight,
 				SwapChain->Lost() ? " (lost)" : "");
 			UsingVsync = UseVSync;
-			SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, false, false);
+			const bool hdrAsked = Hdr != 0, hdrChanged = UsingHdr != Hdr;
+			UsingHdr = Hdr;
+			SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, hdrAsked, false);
+
+			// What it took: scRGB where the compositor offers it (Windows),
+			// HDR10 where it does not (a Wayland compositor). The picture is
+			// blitted to it from a float image, which the format has to allow;
+			// one that does not is made again as SDR.
+			const VkSurfaceFormatKHR format = SwapChain->Format();
+			int mode = !hdrAsked ? 0 : format.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT ? 1 : format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT ? 2 : 0;
+			if (mode)
+			{
+				VkFormatProperties properties = {};
+				vkGetPhysicalDeviceFormatProperties(Device->PhysicalDevice.Device, format.format, &properties);
+				if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT))
+				{
+					debugf(TEXT("PathTracer HDR: the swap chain's format %d cannot be blitted to; staying SDR"), (int)format.format);
+					mode = 0;
+					SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, false, false);
+				}
+			}
+			if (mode != HdrMode || (hdrChanged && hdrAsked))
+			{
+				if (mode == 1)
+					debugf(TEXT("PathTracer HDR: scRGB, the SDR white at %d nits and the peak at %d"), (int)Clamp(HdrPaperWhite, 80, 1000), (int)Clamp(HdrPeakNits, 100, 10000));
+				else if (mode == 2)
+					debugf(TEXT("PathTracer HDR: HDR10 (Rec.2020, PQ), the SDR white at %d nits and the peak at %d"), (int)Clamp(HdrPaperWhite, 80, 1000), (int)Clamp(HdrPeakNits, 100, 10000));
+				else if (hdrAsked)
+				{
+					// Said with what was on offer: a compositor that does not
+					// do HDR looks just like a pairing this does not look for.
+					const std::set<std::string>& enabled = Instance->EnabledExtensions;
+					debugf(TEXT("PathTracer HDR: the surface offers neither scRGB nor HDR10; staying SDR (%s)"),
+						enabled.count(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) ? TEXT("the colour space extension is on")
+							: TEXT("without the colour space extension no HDR colour space can be offered"));
+					for (const VkSurfaceFormatKHR& f : SwapChain->AvailableFormats())
+						debugf(TEXT("  surface offers format %d, colour space %d"), (int)f.format, (int)f.colorSpace);
+				}
+				else
+					debugf(TEXT("PathTracer HDR: off"));
+				PathTracerEvent("HDR mode %d", mode);
+			}
+			HdrMode = mode;
 		}
 
 		const double acquireStart = NowMs();
@@ -2493,6 +2649,15 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		RenderTiles(commands.get());
 		ApplyBrightness(commands.get());
 
+		// In HDR, the picture encoded for the swap chain, and a photo being
+		// taken brought back to SDR for its PNG.
+		if (HdrMode)
+		{
+			EncodeFrame(commands.get(), false);
+			if (Photo.SavePending)
+				EncodeFrame(commands.get(), true);
+		}
+
 		// The copy and the tiles write the output image; the blit reads it.
 		PipelineBarrier()
 			.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
@@ -2501,7 +2666,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 
 		// The photo asked for, copied out as it is about to be shown.
 		if (Photo.SavePending)
-			RecordPhotoSave(commands.get());
+			RecordPhotoSave(commands.get(), HdrMode && SdrImage ? SdrImage.get() : OutputImage.get());
 
 		// Letterbox: keep the traced image's aspect inside the window rather
 		// than stretching it, the same as the other devices here.
@@ -2535,7 +2700,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		blit.dstOffsets[1] = { dstX + dstWidth, dstY + dstHeight, 1 };
 
 		commands->blitImage(
-			OutputImage->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			(HdrMode && PresentImage ? PresentImage : OutputImage)->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			SwapChain->GetImage(imageIndex)->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			1, &blit, VK_FILTER_LINEAR);
 
@@ -3048,6 +3213,26 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			MaterialsEnabled = !MaterialsEnabled;
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("HDR")))
+		{
+			Hdr = !Hdr;
+			Ar.Logf(TEXT("PT: HDR %s"), Hdr
+				? TEXT("asked for: the log says what the display took (HDRPEAK n, HDRWHITE n set its levels)")
+				: TEXT("off"));
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("HDRPEAK")))
+		{
+			HdrPeakNits = Clamp(appAtoi(Cmd), 100, 10000);
+			Ar.Logf(TEXT("PT: HDR peak %d nits%s"), (int)HdrPeakNits, HdrMode ? TEXT("") : TEXT(" (HDR is not on)"));
+			handled = true;
+		}
+		if (ParseCommand(&Cmd, TEXT("HDRWHITE")))
+		{
+			HdrPaperWhite = Clamp(appAtoi(Cmd), 80, 1000);
+			Ar.Logf(TEXT("PT: HDR's SDR white at %d nits%s"), (int)HdrPaperWhite, HdrMode ? TEXT("") : TEXT(" (HDR is not on)"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("ALLLIGHTS")))
 		{
 			DisableBits ^= 2097152u;
@@ -3337,7 +3522,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | ALLLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | BUMP n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | ALLLIGHTS | HDR | HDRPEAK n | HDRWHITE n | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | BUMP n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 
@@ -3395,6 +3580,10 @@ void UPathTracerRenderDevice::Exit()
 	SentTextures.clear();
 	NextFrameTime = {};
 
+	PresentView.reset();
+	PresentImage.reset();
+	SdrView.reset();
+	SdrImage.reset();
 	OutputView.reset();
 	OutputImage.reset();
 	InsetSource.reset();
@@ -3415,6 +3604,13 @@ void UPathTracerRenderDevice::Exit()
 	BrightnessDescriptorPool.reset();
 	BrightnessSetLayout.reset();
 	BrightnessShader.reset();
+	EncodePipeline.reset();
+	EncodePipelineLayout.reset();
+	PresentSet.reset();
+	SdrSet.reset();
+	EncodeDescriptorPool.reset();
+	EncodeSetLayout.reset();
+	EncodeShader.reset();
 	// Released here with everything else. Left to the member destructors
 	// they outlive the device and destroy themselves against a dead handle,
 	// which crashed on exit - and when the engine replaces the device on
@@ -3842,6 +4038,16 @@ void UPathTracerRenderDevice::ReadPixels(FColor* Pixels)
 	VulkanBuffer* download = staging.get();
 	ExecuteImmediate([&](VulkanCommandBuffer* cmd)
 	{
+		// In HDR, brought back to what SDR would have shown, the save game's
+		// picture and the screenshot being SDR.
+		VulkanImage* from = source;
+		if (HdrMode)
+		{
+			EncodeFrame(cmd, true);
+			if (SdrImage)
+				from = SdrImage.get();
+		}
+
 		// After the last frame's blit to the window, which is on the same
 		// queue ahead of this.
 		PipelineBarrier()
@@ -3858,7 +4064,7 @@ void UPathTracerRenderDevice::ReadPixels(FColor* Pixels)
 		blit.dstSubresource = blit.srcSubresource;
 		blit.dstOffsets[1] = { width, height, 1 };
 		const bool sameSize = sourceWidth == width && sourceHeight == height;
-		cmd->blitImage(source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		cmd->blitImage(from->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			1, &blit, sameSize ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
 
 		PipelineBarrier()

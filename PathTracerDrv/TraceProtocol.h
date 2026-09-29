@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 18;
+	static const uint32_t Version = 19;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -335,7 +335,12 @@ namespace TraceProtocol
 		// How deep the textures' relief is drawn, 1 as the materials give
 		// it and 0 for none: the device's BumpMapping.
 		float BumpMapping;
-		uint32_t Pad;
+		// Where the tone curve levels off, in the white the picture's SDR
+		// range is drawn at: 1 for an SDR display, and for an HDR one its
+		// peak over that white - 1000 nits over 200 is 5 - so what the SDR
+		// curve squeezed into the last fifth below white spreads out above
+		// it. 0 is taken as 1.
+		float ToneCeiling;
 		TraceInset Insets[MaxInsets];
 	};
 

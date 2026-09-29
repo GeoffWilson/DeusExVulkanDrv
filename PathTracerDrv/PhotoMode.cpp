@@ -369,11 +369,11 @@ bool UPathTracerRenderDevice::PhotoConsoleOpen()
 // The finished picture, Brightness and all, copied out of the frame being
 // recorded - its output image already waiting to be blitted to the window -
 // for WritePhoto once the frame is done.
-void UPathTracerRenderDevice::RecordPhotoSave(VulkanCommandBuffer* commands)
+void UPathTracerRenderDevice::RecordPhotoSave(VulkanCommandBuffer* commands, VulkanImage* source)
 {
 	Photo.SavePending = false;
 	const int width = TraceWidth, height = TraceHeight;
-	if (width <= 0 || height <= 0 || !OutputImage)
+	if (width <= 0 || height <= 0 || !source)
 		return;
 
 	Photo.SaveImage = ImageBuilder()
@@ -396,7 +396,7 @@ void UPathTracerRenderDevice::RecordPhotoSave(VulkanCommandBuffer* commands)
 	blit.srcOffsets[1] = { width, height, 1 };
 	blit.dstSubresource = blit.srcSubresource;
 	blit.dstOffsets[1] = { width, height, 1 };
-	commands->blitImage(OutputImage->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Photo.SaveImage->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	commands->blitImage(source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Photo.SaveImage->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		1, &blit, VK_FILTER_NEAREST);
 	PipelineBarrier()
 		.AddImage(Photo.SaveImage.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)

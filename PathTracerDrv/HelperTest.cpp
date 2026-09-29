@@ -13,6 +13,7 @@
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
 //                            [--decal] [--decal-lift units]
 //                            [--bump percent] [--lights n] [--every-light]
+//                            [--hdr ceiling] [--neutral]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -22,6 +23,13 @@
 // every cell of the light grid holds them all, and the trace draws from a
 // cell's lights rather than weighing each; --every-light weighs each, as PT
 // ALLLIGHTS does. With --reference the two should come to the same picture.
+//
+// --hdr finishes the picture for an HDR display whose peak is that many times
+// the SDR white (the device's HDRPeakNits over HDRPaperWhite), and says how
+// much of it went above that white; everything below the tone curve's
+// shoulder should come out as it does without. HDR takes the device's
+// default neutral curve, which --neutral gives SDR too, to compare them;
+// without it the harness's SDR is Reinhard's, as it has always been.
 //
 // --still holds everything still instead - no animation, nothing arriving, no
 // change of size - and reports how much the picture changes from one frame
@@ -202,6 +210,8 @@ int main(int argc, char** argv)
 	int bump = 0;
 	int crowd = 0;
 	bool everyLight = false;
+	float toneCeiling = 1.0f;
+	bool neutral = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -252,6 +262,10 @@ int main(int argc, char** argv)
 			crowd = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--every-light"))
 			everyLight = true;
+		else if (!strcmp(argv[i], "--hdr") && i + 1 < argc)
+			toneCeiling = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--neutral"))
+			neutral = true;
 		else if (!strcmp(argv[i], "--photo") && i + 1 < argc)
 		{
 			photoAperture = (float)atof(argv[++i]);
@@ -647,7 +661,8 @@ int main(int argc, char** argv)
 		frame.Lighting = engineLighting;
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
-		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u) | (everyLight ? 2097152u : 0u);
+		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u) | (everyLight ? 2097152u : 0u) | (neutral ? 8192u : 0u);
+		frame.ToneCeiling = toneCeiling;
 		if (photoAperture >= 0.0f)
 		{
 			frame.DisableBits |= 524288u;
@@ -858,8 +873,17 @@ int main(int argc, char** argv)
 		FILE* out = fopen("helper-test.ppm", "wb");
 		fprintf(out, "P6\n%u %u\n255\n", outWidth, outHeight);
 		double sum = 0.0;
+		uint32_t aboveWhite = 0;
+		float brightest = 0.0f;
 		for (uint32_t i = 0; i < outWidth * outHeight; i++)
 		{
+			float peak = 0.0f;
+			for (int c = 0; c < 3; c++)
+				peak = std::max(peak, HalfToFloat(half[i * 4 + c]));
+			// Gamma encoded, as the display's picture is: 1 is the SDR white.
+			brightest = std::max(brightest, std::pow(std::max(peak, 0.0f), 2.2f));
+			if (peak > 1.0f)
+				aboveWhite++;
 			for (int c = 0; c < 3; c++)
 			{
 				float v = HalfToFloat(half[i * 4 + c]);
@@ -872,6 +896,9 @@ int main(int argc, char** argv)
 		readback->Unmap();
 		const double mean = sum / (outWidth * outHeight * 3.0);
 		printf("mean brightness %.3f, written to helper-test.ppm\n", mean);
+		if (toneCeiling > 1.0f)
+			printf("hdr: %.2f%% of the picture above the SDR white, the brightest %.2f times it (ceiling %.2f)\n",
+				100.0 * aboveWhite / (outWidth * outHeight), brightest, toneCeiling);
 		if (still && changeCount > 0)
 			printf("still: frame to frame change %.5f on average over the last %d frames\n",
 				changeSum / changeCount, changeCount);

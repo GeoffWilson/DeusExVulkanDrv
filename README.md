@@ -495,6 +495,21 @@ A flickering light keeps its place in the light list while it is dark, where
 it used to drop out of it: the helper built its grid again whenever the list
 changed, which with the canal's neon was every frame, 2 ms of it.
 
+**HDR.** The trace works out real brightnesses, and SDR has to squeeze every
+one above its white into the last fifth below it: a lamp, a neon tube and the
+sunlit wall beside them come out nearly the same white. With `HDR` on, the
+tone curve - the neutral one, whose part below its shoulder draws the scene
+exactly as SDR does - levels off at the display's peak instead of at white,
+so what was squeezed spreads out above white, with the SDR range and the HUD
+at `HDRPaperWhite` nits. The fog, the screen flash, the HUD and the Brightness
+setting are all put over the picture as they are in SDR, and only then is it
+encoded for the display: linear light for scRGB, or Rec.2020 and the PQ curve
+for HDR10, which is what a Wayland compositor offers. Photos, save games'
+pictures and screenshots stay SDR: the HDR shoulder is undone and SDR's put
+back, which the harness measured within a fifth of a level of the SDR curve.
+In HDR the tone curve is always the neutral one; Reinhard's has no part that
+SDR and HDR could share.
+
 **2D.** The HUD, menus and console are rasterised over the traced picture, so
 the game is fully playable. Each piece is sampled as the other devices sample
 it - nearest where its art asks for no smoothing, clamped at the edges of art
@@ -700,6 +715,19 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   unit of grain up close. Only flat surfaces, which carry their texture's
   direction across them: characters keep their own smooth normals. Standing
   water smooths it over. `PT BUMP n` sets it for the session.
+- `HDR`: HDR output, False by default. On a display and a compositor that take
+  it - scRGB on Windows with HDR switched on in its display settings, HDR10
+  under a Wayland compositor; under Proton that needs
+  `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` in the game's launch options -
+  the picture is drawn as SDR draws it up to the tone curve's shoulder, the
+  HUD and menus with it, at `HDRPaperWhite` nits, and what SDR had to squeeze
+  in below white spreads out above it towards `HDRPeakNits` (see HDR). Where
+  neither is offered it stays SDR, and the log says what the surface did
+  offer. `PT HDR` switches it for the session.
+- `HDRPeakNits`: the display's peak brightness, 1000 by default: where the
+  tone curve levels off. `PT HDRPEAK n`.
+- `HDRPaperWhite`: how bright the SDR picture's white is drawn in HDR, 200
+  nits by default - the HUD, a white wall in daylight. `PT HDRWHITE n`.
 - `FPSLimit`: frames per second to hold the game to, 120 by default and 0 for
   no limit. Deus Ex cuts conversation audio short when left to run at a few
   hundred frames a second, the intro included. Unlike VulkanDrv's it does not wait
@@ -798,6 +826,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).
+- `PT HDR`, `PT HDRPEAK n`, `PT HDRWHITE n`: HDR output on or off, and its
+  peak and its white in nits, for the session (see `HDR`).
 - `PT ALLLIGHTS`: weighs every light in reach at every point, as it used to,
   rather than drawing from a crowded cell's lights (see Crowded lights), to
   compare the two by eye or by frame rate.

@@ -6,20 +6,29 @@
 // darks least; the neutral one leaves all but the brightest fifth as it is,
 // as the engine's own devices draw it, and bends only that fifth towards white
 // - a shoulder rather than the devices' hard clip.
+//
+// ceiling is where the neutral curve levels off, in the white the SDR picture
+// is drawn at: 1 for SDR, and on an HDR display its peak over that white. The
+// part below the shoulder is the same either way, so HDR changes nothing but
+// what SDR had to squeeze in below white - the lamps, the neon, the sun on a
+// wall - which spreads out above it towards the display's peak. Reinhard's
+// has no such part, compressing the darks as well, so HDR takes the neutral
+// curve whichever is chosen.
 static std::string ToneMapGlsl()
 {
 	return R"(
-		vec3 toneMap(vec3 c, bool neutral)
+		vec3 toneMap(vec3 c, bool neutral, float ceiling)
 		{
 			c = max(c, vec3(0.0));
-			if (!neutral)
+			if (!neutral && ceiling <= 1.0)
 				return c / (c + vec3(1.0));
+			ceiling = max(ceiling, 1.0);
 			const float start = 0.8;
 			float peak = max(c.r, max(c.g, c.b));
 			if (peak < start)
 				return c;
-			const float d = 1.0 - start;
-			float newPeak = 1.0 - d * d / (peak + d - start);
+			float d = ceiling - start;
+			float newPeak = ceiling - d * d / (peak + d - start);
 			c *= newPeak / peak;
 			float g = 1.0 - 1.0 / (0.15 * (peak - newPeak) + 1.0);
 			return mix(c, vec3(newPeak), g);
@@ -156,6 +165,9 @@ static std::string TraceCommon()
 		#define GlowScale frameJitter.z
 		#define Wetness frameJitter.w
 		#define BumpStrength surfaceRelief.x
+		// Where the tone curve levels off: 1, or an HDR display's peak over
+		// the SDR picture's white (toneMap).
+		#define ToneCeiling surfaceRelief.y
 		#define LightRadius float((Counts.z >> 16u) & 255u)
 		#define MipBias (float(int(Counts.z) >> 24) / 16.0)
 		// Whether the level's surfaces take their lights as the engine's
@@ -3245,7 +3257,7 @@ std::string Shaders::Trace()
 			// Tonemap and encode here rather than in a present pass: the result
 			// is blitted straight to the swap chain, so this is the last thing
 			// that happens to the pixel.
-			vec3 mapped = toneMap(result * Params.x, (Disable & 8192u) != 0u);
+			vec3 mapped = toneMap(result * Params.x, (Disable & 8192u) != 0u, ToneCeiling);
 			mapped = pow(mapped, vec3(1.0 / 2.2));
 			if (Params.w > 2.5)
 			{
@@ -3362,7 +3374,7 @@ std::string Shaders::Composite()
 		layout(push_constant) uniform PushConstants
 		{
 			vec4 Flash;      // x the picture's scale, yzw the flash colour
-			vec4 Finish;     // x exposure, y 1 when there are glossy reflections to add, z 1 for the neutral tone curve
+			vec4 Finish;     // x exposure, y 1 when there are glossy reflections to add, z 1 for the neutral tone curve, w its ceiling (toneMap)
 		};
 	)" + ToneMapGlsl() + R"(
 
@@ -3382,7 +3394,7 @@ std::string Shaders::Composite()
 			if (Finish.y > 0.5)
 				result += imageLoad(glossAlbedoImage, pixel).rgb * max(imageLoad(glossImage, pixel).rgb, vec3(0.0));
 
-			vec3 mapped = toneMap(result * Finish.x, Finish.z > 0.5);
+			vec3 mapped = toneMap(result * Finish.x, Finish.z > 0.5, Finish.w);
 			mapped = pow(mapped, vec3(1.0 / 2.2));
 
 			// A tent over the pixel and its neighbours: the fog's shadows
@@ -3423,7 +3435,7 @@ std::string Shaders::Finish()
 		layout(push_constant) uniform PushConstants
 		{
 			vec4 Flash;      // x the picture's scale, yzw the flash colour
-			vec4 Mode;       // x 1 for the neutral tone curve
+			vec4 Mode;       // x 1 for the neutral tone curve, y its ceiling (toneMap)
 		};
 	)" + ToneMapGlsl() + R"(
 
@@ -3435,7 +3447,7 @@ std::string Shaders::Finish()
 				return;
 
 			vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
-			vec3 mapped = toneMap(imageLoad(reconstructedImage, pixel).rgb + texture(beamTexture, uv).rgb, Mode.x > 0.5);
+			vec3 mapped = toneMap(imageLoad(reconstructedImage, pixel).rgb + texture(beamTexture, uv).rgb, Mode.x > 0.5, Mode.y);
 			mapped = pow(mapped, vec3(1.0 / 2.2));
 
 			// Four filtered reads half a traced pixel apart, which make a
@@ -3522,6 +3534,110 @@ std::string Shaders::Brightness()
 				return;
 			vec4 c = imageLoad(picture, pixel);
 			imageStore(picture, pixel, vec4(pow(max(c.rgb, vec3(0.0)), vec3(InvGamma.x)), c.a));
+		}
+	)";
+}
+
+// The finished picture - the trace, the fog and flash, the HUD and menus -
+// encoded for an HDR display, or brought back to SDR for a picture saved.
+// The picture stays in the display's terms throughout, as it is for SDR:
+// gamma encoded, 1 the white the SDR picture and the HUD are drawn at, and
+// above that only what the tone curve's ceiling let through (toneMap). So
+// everything drawn over it blends exactly as it does in SDR.
+//
+// scRGB takes linear light with 1 meaning 80 nits, and the compositor does
+// the rest. HDR10 is ours to encode: Rec.2020 primaries and the ST.2084 (PQ)
+// curve, in which a code value is a luminance. A saved picture - a photo, a
+// save game's, a screenshot - has the HDR shoulder undone and the SDR one put
+// back, so it comes out as it would have without HDR.
+std::string Shaders::Encode()
+{
+	return R"(
+		#version 460
+
+		layout(local_size_x = 8, local_size_y = 8) in;
+		layout(binding = 0, rgba16f) uniform readonly image2D picture;
+		layout(binding = 1, rgba16f) uniform writeonly image2D encoded;
+		layout(push_constant) uniform EncodeConstants
+		{
+			vec4 Params;    // x 1 scRGB, 2 HDR10, 3 SDR; y the SDR white in nits; z the tone curve's ceiling
+			ivec4 Size;     // xy the picture's size
+		};
+
+		// Rec.709 to Rec.2020. Both are D65, so it is a pure rotation of the
+		// gamut; left out, the display reads narrow gamut numbers as wide gamut
+		// ones and every colour comes back oversaturated.
+		vec3 rec709ToRec2020(vec3 c)
+		{
+			const mat3 M = mat3(
+				0.6274040, 0.0690970, 0.0163916,
+				0.3292820, 0.9195400, 0.0880132,
+				0.0433136, 0.0113612, 0.8955950);
+			return M * c;
+		}
+
+		// ST.2084's inverse EOTF: luminance, 1 being PQ's 10000 nits, to the
+		// code value the display decodes.
+		vec3 pqEncode(vec3 L)
+		{
+			const float m1 = 0.1593017578125;
+			const float m2 = 78.84375;
+			const float c1 = 0.8359375;
+			const float c2 = 18.8515625;
+			const float c3 = 18.6875;
+			vec3 y = pow(clamp(L, 0.0, 1.0), vec3(m1));
+			return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
+		}
+
+		// toneMap's neutral curve with its ceiling at top: what a peak of p
+		// comes out as, and how far it is drawn towards white.
+		const float shoulder = 0.8;
+		float shoulderPeak(float p, float top)
+		{
+			float d = top - shoulder;
+			return top - d * d / (p + d - shoulder);
+		}
+		float whitening(float p, float newPeak)
+		{
+			return 1.0 - 1.0 / (0.15 * (p - newPeak) + 1.0);
+		}
+
+		// A picture made with the neutral curve at ceiling, as the SDR one
+		// would have made it: linear, in the SDR white. HDR always takes the
+		// neutral curve (toneMap).
+		vec3 toSdr(vec3 c, float ceiling)
+		{
+			float m = max(c.r, max(c.g, c.b));
+			if (m < shoulder)
+				return c;
+			// The scene's peak that came out as m, and what the SDR shoulder
+			// makes of it. The HDR curve drew the colour towards white as far
+			// as its own shoulder asked; the rest of the SDR one's is added.
+			float d = ceiling - shoulder;
+			float p = d * d / max(ceiling - min(m, ceiling - 1.0e-4), 1.0e-4) - d + shoulder;
+			float sdrPeak = shoulderPeak(p, 1.0);
+			float hdrWhite = whitening(p, m);
+			float sdrWhite = whitening(p, sdrPeak);
+			c *= sdrPeak / m;
+			float more = 1.0 - (1.0 - sdrWhite) / max(1.0 - hdrWhite, 1.0e-4);
+			return mix(c, vec3(sdrPeak), clamp(more, 0.0, 1.0));
+		}
+
+		void main()
+		{
+			ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+			if (pixel.x >= Size.x || pixel.y >= Size.y)
+				return;
+			vec3 shown = max(imageLoad(picture, pixel).rgb, vec3(0.0));
+			vec3 linear = pow(shown, vec3(2.2));
+			vec3 result;
+			if (Params.x < 1.5)
+				result = linear * (Params.y / 80.0);
+			else if (Params.x < 2.5)
+				result = pqEncode(max(rec709ToRec2020(linear * Params.y), vec3(0.0)) / 10000.0);
+			else
+				result = pow(clamp(toSdr(linear, max(Params.z, 1.0)), 0.0, 1.0), vec3(1.0 / 2.2));
+			imageStore(encoded, pixel, vec4(result, 1.0));
 		}
 	)";
 }

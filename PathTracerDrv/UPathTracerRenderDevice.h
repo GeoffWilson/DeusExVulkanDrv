@@ -237,6 +237,15 @@ public:
 	// 0 - flat, as the engine draws them - unless asked for: 100 is the
 	// materials' relief as given. PT BUMP n sets it for the session.
 	INT BumpMapping;
+	// HDR output, where the display and its compositor take it - scRGB on
+	// Windows, HDR10 under a Wayland compositor. The picture's SDR range and
+	// the HUD are drawn at HDRPaperWhite nits, and what the tone curve had
+	// to squeeze in below white spreads out above it up to HDRPeakNits: the
+	// lamps, the neon, the light off a wall (toneMap, and EncodeFrame). Off,
+	// the default, is SDR as before; PT HDR switches it for the session.
+	BITFIELD Hdr;
+	INT HdrPeakNits;
+	INT HdrPaperWhite;
 
 private:
 	// The switches in DisableBits the ini sets rather than PT alone: the
@@ -255,6 +264,13 @@ private:
 	void DescribeLightingOf(AActor* target);
 	void DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar);
 	void ApplyBrightness(VulkanCommandBuffer* commands);
+	void CreateEncodePipeline();
+	void EnsureEncodeImages();
+	// The picture encoded for the swap chain in HDR, or back to SDR for a
+	// picture saved: see Shaders::Encode.
+	void EncodeFrame(VulkanCommandBuffer* commands, bool forSaving);
+	// Where the tone curve levels off, as the helper is told it: 1 in SDR.
+	float ToneCeiling() const;
 	void EnsureSceneBuilt(ULevel* level);
 	// Whether the engine has collected garbage since last asked, told by a
 	// transient object nothing refers to, which every collection destroys.
@@ -383,6 +399,16 @@ private:
 	std::unique_ptr<VulkanDescriptorSet> BrightnessSet;
 	std::unique_ptr<VulkanPipelineLayout> BrightnessPipelineLayout;
 	std::unique_ptr<VulkanPipeline> BrightnessPipeline;
+	// The picture as the HDR swap chain takes it, and as SDR for a picture
+	// saved while HDR is on: the output image's size, made when first wanted.
+	std::unique_ptr<VulkanShader> EncodeShader;
+	std::unique_ptr<VulkanDescriptorSetLayout> EncodeSetLayout;
+	std::unique_ptr<VulkanDescriptorPool> EncodeDescriptorPool;
+	std::unique_ptr<VulkanDescriptorSet> PresentSet, SdrSet;
+	std::unique_ptr<VulkanPipelineLayout> EncodePipelineLayout;
+	std::unique_ptr<VulkanPipeline> EncodePipeline;
+	std::unique_ptr<VulkanImage> PresentImage, SdrImage;
+	std::unique_ptr<VulkanImageView> PresentView, SdrView;
 
 	// The last frame's submission, not yet known to be finished. Unlock does
 	// not wait for the GPU: the next frame's game logic and scene gathering
@@ -549,7 +575,7 @@ private:
 	void MovePhotoCamera();
 	void SwapPhotoPose();
 	bool PhotoConsoleOpen();
-	void RecordPhotoSave(VulkanCommandBuffer* commands);
+	void RecordPhotoSave(VulkanCommandBuffer* commands, VulkanImage* source);
 	void WritePhoto();
 	// Whether the 2D is left out of this frame: in photo mode, unless the
 	// console is open to type into, and never in the frame a photo is taken
@@ -566,6 +592,10 @@ private:
 
 	bool HaveCamera = false;
 	UBOOL UsingVsync = 0;
+	// What the swap chain was made for, and what it took: 0 SDR, 1 scRGB,
+	// 2 HDR10.
+	UBOOL UsingHdr = 0;
+	int HdrMode = 0;
 
 	// The windowed style and rectangle to return to. Fullscreen here is a
 	// borderless window rather than a display mode change.

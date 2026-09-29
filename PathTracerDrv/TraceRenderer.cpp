@@ -750,7 +750,7 @@ void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 j
 	for (int i = 0; i < 3; i++)
 		mapped[8 + i] = frame.SkyAxes[i];
 	mapped[11] = frame.PhotoLens;
-	mapped[12] = vec4(frame.BumpMapping, 0.0f, 0.0f, 0.0f);
+	mapped[12] = vec4(frame.BumpMapping, std::max(frame.ToneCeiling, 1.0f), 0.0f, 0.0f);
 	for (size_t i = 0; i < count; i++)
 	{
 		const SceneInstance& instance = Scene.Instances[i];
@@ -998,7 +998,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 
 		struct { vec4 Flash; vec4 Exposure; } finish;
 		finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
-		finish.Exposure = vec4(frame.Exposure, Denoise->HasSpecular() ? 1.0f : 0.0f, (frame.DisableBits & 8192u) ? 1.0f : 0.0f, 0.0f);
+		finish.Exposure = vec4(frame.Exposure, Denoise->HasSpecular() ? 1.0f : 0.0f, (frame.DisableBits & 8192u) ? 1.0f : 0.0f, std::max(frame.ToneCeiling, 1.0f));
 		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
 		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, CompositeSet.get());
 		commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
@@ -1041,7 +1041,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		{
 			struct { vec4 Flash; vec4 Mode; } finish;
 			finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
-			finish.Mode = vec4((frame.DisableBits & 8192u) ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+			finish.Mode = vec4((frame.DisableBits & 8192u) ? 1.0f : 0.0f, std::max(frame.ToneCeiling, 1.0f), 0.0f, 0.0f);
 			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipeline.get());
 			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipelineLayout.get(), 0, FinishSet.get());
 			commands->pushConstants(FinishPipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);

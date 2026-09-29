@@ -81,7 +81,11 @@ them rather than drawing from them (`PT ALLLIGHTS`): with `--reference`, the
 two converge on the same picture, and at 3440x1440 the difference in the
 trace's time is what the drawing saves. The harness's own GPU times swing
 with the GPU's clocks, which drop while it waits on wine: take the fastest of
-many frames, not any one. The Windows SDK that `xwin` fetches carries the Direct3D
+many frames, not any one. `--hdr n` finishes the picture for an HDR display
+whose peak is n times the SDR white and says how much went above it, and
+`--neutral` takes the device's neutral tone curve rather than Reinhard's: with
+both, everything below the curve's shoulder should come out exactly as
+`--neutral` alone gives it. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 

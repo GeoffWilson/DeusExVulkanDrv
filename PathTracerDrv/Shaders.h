@@ -25,4 +25,5 @@ namespace Shaders
 	// The game's Brightness setting, applied over the finished picture - the
 	// 2D and all - as a gamma curve.
 	std::string Brightness();
+	std::string Encode();
 }
