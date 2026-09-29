@@ -12,11 +12,16 @@
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
 //                            [--decal] [--decal-lift units]
-//                            [--bump percent]
+//                            [--bump percent] [--lights n] [--every-light]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
 // 4 ultra performance) rather than NRD, where it can run.
+//
+// --lights crowds the scene with n more lights, each reaching all of it, so
+// every cell of the light grid holds them all, and the trace draws from a
+// cell's lights rather than weighing each; --every-light weighs each, as PT
+// ALLLIGHTS does. With --reference the two should come to the same picture.
 //
 // --still holds everything still instead - no animation, nothing arriving, no
 // change of size - and reports how much the picture changes from one frame
@@ -195,6 +200,8 @@ int main(int argc, char** argv)
 	int wetness = 0;
 	uint32_t view = 0;
 	int bump = 0;
+	int crowd = 0;
+	bool everyLight = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -241,6 +248,10 @@ int main(int argc, char** argv)
 			view = (uint32_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--bump") && i + 1 < argc)
 			bump = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--lights") && i + 1 < argc)
+			crowd = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--every-light"))
+			everyLight = true;
 		else if (!strcmp(argv[i], "--photo") && i + 1 < argc)
 		{
 			photoAperture = (float)atof(argv[++i]);
@@ -470,6 +481,20 @@ int main(int argc, char** argv)
 		if (dark)
 			light.ColorBrightness.w *= 0.02f;
 		std::vector<SceneLight> lights = { light };
+		// --lights n: n more round the box, each reaching the whole scene,
+		// sharing the main light's brightness - a cell as crowded as the Wan
+		// Chai canal's, whose lights the trace draws from rather than weighs
+		// in full. Their brightnesses fall away one after another, as a real
+		// crowd's do, so the ranking has something to rank.
+		for (int k = 0; k < crowd; k++)
+		{
+			SceneLight l = light;
+			const float a = k * 2.399963f;
+			l.PositionRadius = vec4(400.0f * std::cos(a), 400.0f * std::sin(a), 150.0f + (k % 5) * 40.0f, 3000.0f);
+			l.ColorBrightness.w = 2.5f * 2.0f / (crowd + 1) * (1.0f - 0.9f * k / crowd);
+			l.Peak.x = l.ColorBrightness.w;
+			lights.push_back(l);
+		}
 
 		// A fog light's glow, as AddFogLight describes one: its colour in
 		// display terms, its strength in w, hiding nothing behind it.
@@ -622,7 +647,7 @@ int main(int argc, char** argv)
 		frame.Lighting = engineLighting;
 		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
 		frame.Materials = 1;
-		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u);
+		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u) | (everyLight ? 2097152u : 0u);
 		if (photoAperture >= 0.0f)
 		{
 			frame.DisableBits |= 524288u;

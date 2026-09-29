@@ -200,6 +200,11 @@ struct SceneLight
 	// disco, 1 searchlight (its sweep offset in DirectionCone.x), 2 rotor
 	// (which way it turns, 1 or -1, in DirectionCone.x), -1 none.
 	vec4 Flags;
+	// x the most ColorBrightness.w ever is: the brightness a pulsing or
+	// flickering light peaks at, which the light grid ranks it by, so its
+	// order does not change as it flickers - and a light that is dark this
+	// frame is still ranked for when it is not. yzw unused.
+	vec4 Peak = vec4(0.0f, 0.0f, 0.0f, 0.0f);
 };
 
 // Triangles that share a bottom level acceleration structure.

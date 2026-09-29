@@ -74,7 +74,14 @@ traced from the right of the box into the picture's top right corner.
 `--decal` lays a scorch mark on the floor as the device lays a decal - a
 modulated quad a quarter of a unit off it, mid grey round a dark blot - of
 which only the blot should show; `--decal-lift n` raises it, so that the
-light's shadow rays have to cross it. The Windows SDK that `xwin` fetches carries the Direct3D
+light's shadow rays have to cross it. `--lights n` crowds the scene with n
+more lights, each reaching all of it, as the Wan Chai canal's neon crowds a
+cell of the light grid, and `--every-light` has the trace weigh every one of
+them rather than drawing from them (`PT ALLLIGHTS`): with `--reference`, the
+two converge on the same picture, and at 3440x1440 the difference in the
+trace's time is what the drawing saves. The harness's own GPU times swing
+with the GPU's clocks, which drop while it waits on wine: take the fastest of
+many frames, not any one. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 

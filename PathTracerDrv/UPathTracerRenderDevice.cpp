@@ -1396,6 +1396,14 @@ static const TCHAR* const BenchSteps[] = {
 	TEXT("no bump mapping"),
 	TEXT("one bounce"),
 	TEXT("no shadows"),
+	// Bounds rather than features: what judging the see-through surfaces
+	// a triangle at a time costs every ray, and what the lights cost
+	// altogether - the most any work on either could give back.
+	TEXT("see-through surfaces solid"),
+	TEXT("no lights"),
+	// The other way: what drawing from a crowded cell's lights saves, as
+	// against weighing every one.
+	TEXT("every light weighed"),
 	TEXT("as set, again"),
 };
 static const int BenchStepCount = (int)(sizeof(BenchSteps) / sizeof(BenchSteps[0]));
@@ -1462,6 +1470,9 @@ bool UPathTracerRenderDevice::ApplyBenchStep(int step)
 	case 14: if (BumpMapping <= 0) return false; BumpMapping = 0; return true;
 	case 15: if (Bounces <= 1) return false; Bounces = 1; return true;
 	case 16: return setBit(2u);
+	case 17: return setBit(8u);
+	case 18: return setBit(1u);
+	case 19: return setBit(2097152u);
 	default: return true;
 	}
 }
@@ -3037,6 +3048,15 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			MaterialsEnabled = !MaterialsEnabled;
 			handled = true;
 		}
+		if (ParseCommand(&Cmd, TEXT("ALLLIGHTS")))
+		{
+			DisableBits ^= 2097152u;
+			AccumulatedFrames = 0;
+			Ar.Logf(TEXT("PT: %s"), (DisableBits & 2097152u)
+				? TEXT("every light in a point's cell weighed, however many")
+				: TEXT("a crowded cell's heaviest lights weighed, and a few drawn from the rest to stand for them"));
+			handled = true;
+		}
 		if (ParseCommand(&Cmd, TEXT("MESHLIGHT")))
 		{
 			DisableBits ^= 1024u;
@@ -3317,7 +3337,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | BUMP n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | ALLLIGHTS | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | BUMP n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 

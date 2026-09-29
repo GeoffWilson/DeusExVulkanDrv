@@ -299,8 +299,9 @@ source and was read by disassembly:
   of light and its saturation come from: overlapping lights come out brighter
   together than light adds up. The trace takes that sum of the lights that
   actually reach the point - a shadow ray at each of the four strongest in
-  reach and at one picked from the rest - so shadows are traced ones, and a
-  light behind a wall adds nothing. Each light baked into a surface is also
+  reach and at one picked from the rest (among many lights, see Crowded
+  lights) - so shadows are traced ones, and a light behind a wall adds
+  nothing. Each light baked into a surface is also
   held to its shadow mask there, filtered as the engine filters it: the masks
   are coarse - a texel can be most of a metre across - and blurred, and on a
   small wall most of them can lie in shadow where the light in fact reaches
@@ -469,6 +470,30 @@ in flight is never written under. Measured against v1.1, which recorded a
 frame only once the last was done, in the Hong Kong market: 106 frames a
 second became 146 and the 1% low 78 became 118, and a frame now takes as long
 as the GPU does.
+
+**Crowded lights.** Which lights a point weighs comes from a grid over the
+level, each cell listing the lights that reach it. Weighing all of them, at
+the first surface and at every bounce, was most of the frame where a level
+crowds them: the Wan Chai canal's neon puts up to 78 in a cell, and with the
+lights off the trace there took a quarter of the time. So the helper ranks
+each cell's lights by what they could give it - how bright each gets at its
+peak, by a falloff like the engine's across the cell - and a point weighs
+only the heaviest few exactly, eight where the view meets the world and four
+at a bounce, and draws a few more from the rest in proportion to their rank.
+Each draw is weighed exactly too, and counted for the lights it stands for,
+so the pick of what to trace stands for the whole cell (resampled importance
+sampling), and the picture comes out on average as it did. In the canal at
+3440x1440 with NRD, on an RTX 4090, a frame's GPU time went from 25.0 ms to
+17.2 - 40 frames a second to 58 - by `PT BENCH`'s "every light weighed". In
+the test harness, with 80 lights reaching everywhere at 3440x1440, the trace
+took 3.9 ms rather than 12.2, and the converged pictures of the two agree to
+within 0.1% (`--lights`, `--every-light`, `--reference`). A cell with no more lights
+than that is weighed in full, as before, and so are glass and water, whose
+light must not change from frame to frame. `PT ALLLIGHTS` weighs every one.
+
+A flickering light keeps its place in the light list while it is dark, where
+it used to drop out of it: the helper built its grid again whenever the list
+changed, which with the canal's neon was every frame, 2 ms of it.
 
 **2D.** The HUD, menus and console are rasterised over the traced picture, so
 the game is fully playable. Each piece is sampled as the other devices sample
@@ -771,13 +796,21 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT NOLIGHTS`, `PT NOSHADOWS`, `PT NOSKY`, `PT NOFOG`, `PT OPAQUE`: switch
   one thing off to see what it costs or what it is doing. `PT MATERIALS`
   switches materials on or off (`PT NOMATERIALS` still works).
+- `PT ALLLIGHTS`: weighs every light in reach at every point, as it used to,
+  rather than drawing from a crowded cell's lights (see Crowded lights), to
+  compare the two by eye or by frame rate.
 - `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
 - `PT BENCH`: hold still for about half a minute while it switches the
   costlier features off one at a time - the engine's lighting, the baked
   shadow masks, mipmaps, anisotropic filtering, detail textures, the engine's
   mesh lighting, soft shadows, glowing surfaces lighting the room and being
-  sampled as lights, the fog's shadows, the flashlight (against the game's own light augmentation),
-  glass's colour, wet streets, bump mapping, the extra bounces, shadows - with the frame limit and VSync off, then logs a table to
+  sampled as lights, the fog's shadows, the flashlight (against the game's
+  own light augmentation), glass's colour, wet streets, bump mapping, the
+  extra bounces, shadows - and then two that are there as bounds rather than
+  features: every see-through surface made solid (`PT OPAQUE`) and no lights
+  at all (`PT NOLIGHTS`), the most that making either cheaper could give
+  back - and last every light weighed (`PT ALLLIGHTS`), what drawing from
+  crowded cells saves. The frame limit and VSync are off meanwhile. It then logs a table to
   `PathTracerTimings.log`: the GPU's time, the scene gathering and the frame
   with each, and how each compares with the settings as they are. `PT BENCH`
   again stops it.

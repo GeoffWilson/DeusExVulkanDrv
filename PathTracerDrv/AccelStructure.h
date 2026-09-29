@@ -2,6 +2,7 @@
 
 #include "SceneData.h"
 #include <memory>
+#include <utility>
 #include <vector>
 
 class GpuContext;
@@ -122,14 +123,25 @@ private:
 	size_t LightCapacity = 0;
 
 	// Which lights can reach which part of the level, so a shaded point only
-	// considers those. Built again when a light moves, changes its reach or
-	// comes or goes; GridInputs is what it was last built from.
+	// considers those, ranked by what each could give there. Built again when
+	// a light moves, changes its reach or how bright it gets, or comes or
+	// goes; GridInputs, Cylinders and Powers are what it was last built from.
 	void WriteLightGrid(const SceneData& scene, FrameUploads& uploads);
 	std::unique_ptr<VulkanBuffer> LightGridBuffer;
 	size_t LightGridCapacity = 0;
 	std::vector<uint32_t> LightGrid;
 	std::vector<vec4> GridInputs, LastGridInputs;
 	std::vector<uint8_t> Cylinders, LastCylinders;
+	std::vector<float> Powers, LastPowers;
+	// The most lights at the head of a cell the shader weighs exactly
+	// (directLight's exactCount): as many are kept in order, heaviest first.
+	static const uint32_t ExactLights = 8;
+	// Kept from one build to the next, so a light moving every frame does
+	// not allocate the grid's worth again every frame.
+	struct GridEntry { uint32_t Cell; float Rank; uint32_t Light; };
+	std::vector<GridEntry> GridEntries;
+	std::vector<uint32_t> GridCounts, GridFill;
+	std::vector<std::pair<float, uint32_t>> GridRanked;
 	uint32_t LoggedGridCells = 0;
 
 	// The engine's shadow masks (SceneData's Lightmaps), written when a level

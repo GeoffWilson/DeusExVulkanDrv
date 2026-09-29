@@ -3,6 +3,7 @@
 #include "EmitterGrid.h"
 #include "GpuContext.h"
 #include "FrameUploads.h"
+#include <algorithm>
 #include <chrono>
 
 // The driver strides through the instance array by its own idea of this
@@ -46,6 +47,8 @@ void AccelStructure::Reset()
 	LoggedInstances = false;
 	LastGridInputs.clear();
 	LastCylinders.clear();
+	LastPowers.clear();
+	LightGrid.clear();
 }
 
 // A shape that never changes: its vertices uploaded with the frame, and its
@@ -306,9 +309,23 @@ void AccelStructure::WriteLights(const SceneData& scene, FrameUploads& uploads)
 // shadow rays, not the geometry - was nearly the whole frame: with lighting
 // switched off the frame rate went from 56 to the cap.
 //
+// And then weighing every light in the cell was. The Wan Chai canal's neon
+// puts up to 78 lights in a cell, and a point weighed each of them at every
+// bounce: with them all off the trace took a quarter of the time. So each
+// cell's lights are ranked here by what they could give it - how bright the
+// light gets, times a falloff like the engine's, taken between the cell's
+// nearest point and its middle - heaviest first, and the shader weighs only
+// the first few exactly and draws a few more from the rest in proportion to
+// their rank (directLight). A cell with no more lights than that is weighed
+// in full, as before.
+//
 // Laid out as one array of words: the grid's origin and cell size as floats,
-// its dimensions, then a start and count per cell, then the light indices the
-// starts point into.
+// its dimensions and the fog lights' count, then a start and count per cell,
+// then the entries the starts point into, two words each: a light's index,
+// and the rank of that light and every one after it in its cell added up (a
+// float), which a draw from any tail of the list searches. The heaviest
+// ExactLights come first, in order; the rest in no order, since they are
+// only ever drawn from.
 void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& uploads)
 {
 	guard(AccelStructure::WriteLightGrid);
@@ -316,26 +333,52 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 	const size_t lightCount = scene.Lights.size();
 	auto reachOf = [&](size_t i) { return std::abs(scene.Lights[i].PositionRadius.w); };
 
-	// What the grid is made from: where each light is, how far it reaches and
-	// whether it is a cylinder, in the list's order, and how many fog lights
-	// follow. Most of a level's lights never move, so most frames it is the
-	// same as the last, and the buffer already holds it.
-	GridInputs.resize(lightCount + 1);
+	// What the grid is made from: where each light is, how far it reaches,
+	// whether it is a cylinder and how bright it gets, in the list's order.
+	// Most of a level's lights never move, so most frames it is the same as
+	// the last, and the buffer already holds it.
+	GridInputs.resize(lightCount);
 	Cylinders.resize(lightCount);
+	Powers.resize(lightCount);
 	for (size_t i = 0; i < lightCount; i++)
 	{
-		GridInputs[i] = scene.Lights[i].PositionRadius;
+		const SceneLight& light = scene.Lights[i];
+		GridInputs[i] = light.PositionRadius;
 		// Worked out once a light: the test below runs for every cell a
 		// light's box covers, twice, and an fmod there - a slow library
 		// call - cost 6.5 ms a frame in the Hong Kong market.
-		Cylinders[i] = ((int)scene.Lights[i].Flags.y & 1) != 0;
+		Cylinders[i] = ((int)light.Flags.y & 1) != 0;
+		// As the shader weighs it with the engine's lighting: its colour as
+		// displayed, at its brightest, twice over when it is baked into the
+		// lightmaps. A light that says nothing of its peak - the harness's -
+		// is taken at what it is now.
+		auto shown = [](float c) { return std::pow(std::max(c, 0.0f), 1.0f / 2.2f); };
+		const float colour = 0.2126f * shown(light.ColorBrightness.x) + 0.7152f * shown(light.ColorBrightness.y) + 0.0722f * shown(light.ColorBrightness.z);
+		Powers[i] = std::max(light.Peak.x, light.ColorBrightness.w) * colour * (light.Flags.y > 1.5f ? 2.0f : 1.0f);
 	}
-	GridInputs[lightCount] = vec4((float)scene.FogLights.size(), 0.0f, 0.0f, 0.0f);
-	if (LightGridBuffer && GridInputs.size() == LastGridInputs.size() && Cylinders == LastCylinders &&
-		memcmp(GridInputs.data(), LastGridInputs.data(), GridInputs.size() * sizeof(vec4)) == 0)
+	// How many fog lights follow is in the header, but no cell depends on
+	// it: a fog light flickering in and out changes that word alone.
+	const uint32_t fogCount = (uint32_t)scene.FogLights.size();
+	bool same = LightGridBuffer && !LightGrid.empty() && GridInputs.size() == LastGridInputs.size() && Cylinders == LastCylinders &&
+		memcmp(GridInputs.data(), LastGridInputs.data(), GridInputs.size() * sizeof(vec4)) == 0;
+	// A rank out of date only guides the draws less well - what they add up
+	// to comes out the same - so a light fading, as an explosion's does, is
+	// left as it was ranked. One grown much brighter than that would be
+	// drawn too seldom for what it gives, and is ranked again.
+	for (size_t i = 0; same && i < lightCount; i++)
+		same = Powers[i] <= LastPowers[i] * 2.0f;
+	if (same)
+	{
+		if (LightGrid[7] != fogCount)
+		{
+			LightGrid[7] = fogCount;
+			uploads.Upload(LightGridBuffer.get(), 7 * sizeof(uint32_t), &LightGrid[7], sizeof(uint32_t));
+		}
 		return;
+	}
 	LastGridInputs.swap(GridInputs);
 	LastCylinders = Cylinders;
+	LastPowers = Powers;
 
 	// The box around every light's reach.
 	vec3 lo(0.0f), hi(0.0f);
@@ -368,53 +411,72 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 		last = std::min((int)dims[axis] - 1, (int)std::floor((centre + r - lo[axis]) / cellSize));
 	};
 
-	// Does this light's reach touch that cell? A sphere against a box, or for
-	// a cylinder light - whose reach is measured across the floor only - a
-	// circle against the box's footprint.
-	auto touches = [&](size_t i, int x, int y, int z)
-	{
-		const vec4& p = scene.Lights[i].PositionRadius;
-		const float r = reachOf(i);
-		const bool cylinder = Cylinders[i] != 0;
-		float d2 = 0.0f;
-		const float centre[3] = { p.x, p.y, p.z };
-		const int cell[3] = { x, y, z };
-		for (int a = 0; a < (cylinder ? 2 : 3); a++)
-		{
-			const float c0 = lo[a] + cell[a] * cellSize, c1 = c0 + cellSize;
-			const float d = centre[a] < c0 ? c0 - centre[a] : (centre[a] > c1 ? centre[a] - c1 : 0.0f);
-			d2 += d * d;
-		}
-		return d2 < r * r;
-	};
-
-	// Two passes: count, then fill behind a running total.
-	const uint32_t header = 8;
-	std::vector<uint32_t> counts(cells, 0u);
-	auto forEachCell = [&](size_t i, auto&& fn)
-	{
-		const vec4& p = scene.Lights[i].PositionRadius;
-		const float r = reachOf(i);
-		const bool cylinder = Cylinders[i] != 0;
-		int x0, x1, y0, y1, z0, z1;
-		cellRange(p.x, r, 0, x0, x1);
-		cellRange(p.y, r, 1, y0, y1);
-		if (cylinder) { z0 = 0; z1 = (int)dims[2] - 1; }
-		else cellRange(p.z, r, 2, z0, z1);
-		for (int z = z0; z <= z1; z++)
-			for (int y = y0; y <= y1; y++)
-				for (int x = x0; x <= x1; x++)
-					if (touches(i, x, y, z))
-						fn((uint32_t)((z * (int)dims[1] + y) * (int)dims[0] + x));
-	};
+	// Every cell each light's reach touches, and its rank there, in one pass
+	// over the cells of the box around its reach. Touching is a sphere
+	// against the cell's box - for a cylinder light, whose reach is measured
+	// across the floor only, a circle against its footprint. The rank is how
+	// bright it gets by a falloff out to its reach, taken half at the cell's
+	// nearest point and half at its middle, which may be out of reach: (1 -
+	// x^2)^2 of the way x out, within a few hundredths of the engine's
+	// 1 - 3x^2 + 2x^3 and needing no square root. Never quite nothing, for a
+	// light listed can reach some of the cell, and a draw has to be able to
+	// find it.
+	GridEntries.clear();
 	for (size_t i = 0; i < lightCount; i++)
-		forEachCell(i, [&](uint32_t c) { counts[c]++; });
-
-	uint32_t total = 0, busiest = 0;
-	for (uint32_t c : counts)
 	{
-		total += c;
-		busiest = std::max(busiest, c);
+		const vec4& p = scene.Lights[i].PositionRadius;
+		const float r = reachOf(i), r2 = r * r, inverse2 = 1.0f / std::max(r2, 1.0f);
+		const bool cylinder = Cylinders[i] != 0;
+		int first[3], last[3];
+		cellRange(p.x, r, 0, first[0], last[0]);
+		cellRange(p.y, r, 1, first[1], last[1]);
+		if (cylinder) { first[2] = 0; last[2] = (int)dims[2] - 1; }
+		else cellRange(p.z, r, 2, first[2], last[2]);
+		auto along = [&](int axis, int cell, float centre, float& nearest2, float& middle2)
+		{
+			const float c0 = lo[axis] + cell * cellSize, c1 = c0 + cellSize;
+			const float d = centre < c0 ? c0 - centre : (centre > c1 ? centre - c1 : 0.0f);
+			const float m = centre - (c0 + c1) * 0.5f;
+			nearest2 = d * d;
+			middle2 = m * m;
+		};
+		auto falloff = [](float x2) { x2 = std::min(x2, 1.0f); return (1.0f - x2) * (1.0f - x2); };
+		for (int z = first[2]; z <= last[2]; z++)
+		{
+			float zn = 0.0f, zm = 0.0f;
+			if (!cylinder)
+				along(2, z, p.z, zn, zm);
+			for (int y = first[1]; y <= last[1]; y++)
+			{
+				float yn, ym;
+				along(1, y, p.y, yn, ym);
+				if (zn + yn >= r2)
+					continue;
+				for (int x = first[0]; x <= last[0]; x++)
+				{
+					float xn, xm;
+					along(0, x, p.x, xn, xm);
+					const float nearest2 = xn + yn + zn;
+					if (nearest2 >= r2)
+						continue;
+					const float middle2 = xm + ym + zm;
+					const float rank = Powers[i] * 0.5f * (falloff(nearest2 * inverse2) + falloff(middle2 * inverse2));
+					GridEntries.push_back({ (uint32_t)((z * (int)dims[1] + y) * (int)dims[0] + x), std::max(rank, 1.0e-30f), (uint32_t)i });
+				}
+			}
+		}
+	}
+	const uint32_t total = (uint32_t)GridEntries.size();
+
+	// Counted by cell, then placed by cell behind a running total.
+	GridCounts.assign(cells + 1, 0u);
+	for (const GridEntry& e : GridEntries)
+		GridCounts[e.Cell + 1]++;
+	uint32_t busiest = 0;
+	for (uint32_t c = 0; c < cells; c++)
+	{
+		busiest = std::max(busiest, GridCounts[c + 1]);
+		GridCounts[c + 1] += GridCounts[c];
 	}
 	if (cells != LoggedGridCells)
 	{
@@ -423,8 +485,13 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 			(int)lightCount, (int)dims[0], (int)dims[1], (int)dims[2], cellSize, (int)total, (int)busiest,
 			cells ? total / (float)cells : 0.0f);
 	}
+	GridRanked.resize(total);
+	GridFill.assign(GridCounts.begin(), GridCounts.end() - 1);
+	for (const GridEntry& e : GridEntries)
+		GridRanked[GridFill[e.Cell]++] = { e.Rank, e.Light };
 
-	LightGrid.assign(header + (size_t)cells * 2 + total, 0u);
+	const uint32_t header = 8;
+	LightGrid.assign(header + (size_t)cells * 2 + (size_t)total * 2, 0u);
 	auto floatBits = [](float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return u; };
 	LightGrid[0] = floatBits(lo.x);
 	LightGrid[1] = floatBits(lo.y);
@@ -433,23 +500,30 @@ void AccelStructure::WriteLightGrid(const SceneData& scene, FrameUploads& upload
 	LightGrid[4] = dims[0];
 	LightGrid[5] = dims[1];
 	LightGrid[6] = dims[2];
-	LightGrid[7] = (uint32_t)scene.FogLights.size();
+	LightGrid[7] = fogCount;
 
-	uint32_t next = header + cells * 2;
+	// Each cell's heaviest first, with the sums behind them.
+	const uint32_t entries = header + cells * 2;
 	for (uint32_t c = 0; c < cells; c++)
 	{
-		LightGrid[header + c * 2] = next;
-		LightGrid[header + c * 2 + 1] = 0;
-		next += counts[c];
-	}
-	for (size_t i = 0; i < lightCount; i++)
-	{
-		forEachCell(i, [&](uint32_t c)
+		const uint32_t first = GridCounts[c], count = GridCounts[c + 1] - first;
+		LightGrid[header + c * 2] = entries + first * 2;
+		LightGrid[header + c * 2 + 1] = count;
+		// Only the head has to be in order - the lights the shader weighs
+		// exactly, heaviest first - and the rest only summed: sorting whole
+		// cells was most of the build.
+		auto begin = GridRanked.begin() + first, end = begin + count;
+		std::partial_sort(begin, begin + std::min(count, ExactLights), end, [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& b)
 		{
-			uint32_t& filled = LightGrid[header + c * 2 + 1];
-			LightGrid[LightGrid[header + c * 2] + filled] = (uint32_t)i;
-			filled++;
+			return a.first > b.first || (a.first == b.first && a.second < b.second);
 		});
+		float after = 0.0f;
+		for (uint32_t k = count; k-- > 0;)
+		{
+			after += GridRanked[first + k].first;
+			LightGrid[entries + (first + k) * 2] = GridRanked[first + k].second;
+			LightGrid[entries + (first + k) * 2 + 1] = floatBits(after);
+		}
 	}
 
 	if (!LightGridBuffer || LightGrid.size() > LightGridCapacity)

@@ -31,7 +31,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 17;
+	static const uint32_t Version = 18;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -342,7 +342,7 @@ namespace TraceProtocol
 	inline uint32_t Rounded(size_t bytes) { return (uint32_t)((bytes + 7) & ~size_t(7)); }
 
 	static_assert(sizeof(vec4) == 16 && sizeof(vec3) == 12, "vector types must be plain floats");
-	static_assert(sizeof(TriangleAttributes) == 128 && sizeof(SceneLight) == 64, "scene records must match in both builds");
+	static_assert(sizeof(TriangleAttributes) == 128 && sizeof(SceneLight) == 80, "scene records must match in both builds");
 	static_assert(offsetof(Header, ReadySemaphore) % 8 == 0 && offsetof(Header, OutputMemory) % 8 == 0, "64-bit fields must be aligned alike");
 	static_assert(sizeof(Header) % 8 == 0, "header must keep the command area aligned");
 	static_assert(sizeof(WireInstance) == 128, "instance record must match in both builds");

@@ -72,6 +72,7 @@ static std::string TraceCommon()
 			vec4 ColorBrightness;
 			vec4 DirectionCone;   // xyz spot direction, w cosine of its edge or -1
 			vec4 Flags;           // x no incidence, y cylinder, z brightness changes, w pattern: 0 disco 1 searchlight 2 rotor, -1 none
+			vec4 Peak;            // x the most its brightness gets, which the light grid ranks it by
 		};
 
 		layout(binding = 3, std430) readonly buffer Attributes { TriangleAttributes tris[]; };
@@ -146,7 +147,7 @@ static std::string TraceCommon()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass
+			uint Disable;         // diagnostic switches: 2097152 every light in a cell weighed, 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 
@@ -977,6 +978,10 @@ static std::string TraceCommon()
 			distance = 0.0;
 			behind = false;
 			SceneLight light = lights[i];
+			// A flickering light on a frame it is dark: still in the list, so
+			// the list does not change length as it flickers.
+			if (light.ColorBrightness.a <= 0.0)
+				return false;
 
 			bool lightSpecial = light.PositionRadius.w < 0.0;
 			if (lightSpecial != specialLit)
@@ -1168,16 +1173,20 @@ static std::string TraceCommon()
 				return vec3(1.0);
 			return occluded(position, shadowDir, shadowDistance - RayEpsilon * 2.0) ? vec3(0.0) : shadowTint;
 		}
+	)";
 
+	source += R"(
 		// The light a point takes from the lights.
 		//
 		// Pick one light in proportion to what it would contribute if nothing
 		// were in the way, then trace a single shadow ray at it. Choosing
 		// uniformly instead is what made this scene look black: a Deus Ex
 		// level holds hundreds of lights and a given surface is in range of
-		// perhaps two, so a uniform pick misses almost every time. The loop is
-		// over every light in the point's cell, but only to weigh them - a
-		// distance and a dot product each, no rays.
+		// perhaps two, so a uniform pick misses almost every time. The
+		// weighing is of the lights in the point's cell - no rays - and in a
+		// crowded one of the heaviest few and a few drawn from the rest, the
+		// draws counted for the lights they stand for (see the grid's
+		// ranking, AccelStructure::WriteLightGrid).
 		//
 		// With the engine's lighting the strongest few are each traced
 		// instead, and one pick stands for the rest: the engine's curve is
@@ -1224,6 +1233,14 @@ static std::string TraceCommon()
 			uint count = Counts.y;
 			if (count == 0u)
 				return vec3(0.0);
+			// How many lights at the head of the cell's list - the heaviest,
+			// by the grid's ranking - are weighed exactly, and how many are
+			// drawn from the rest to stand for them: more where the view
+			// meets the world than at a bounce. Every one, as it has to be
+			// for everyLight, where the answer must not change from frame to
+			// frame; and every one under PT ALLLIGHTS, for comparison.
+			uint exactCount = strongest >= 4u ? 8u : 4u;
+			uint drawCount = strongest >= 4u ? 4u : 2u;
 			if (!engineSum || everyLight)
 				strongest = 0u;
 			strongest = min(strongest, 4u);
@@ -1231,13 +1248,14 @@ static std::string TraceCommon()
 			vec3 total = vec3(0.0);
 			bool anyChanging = false;
 			// The strongest lights, heaviest first, and one pick from the rest
-			// in proportion to its weight.
+			// in proportion to its weight. restWeight is what the pick stands
+			// for, chosenTarget what the light picked gives unshadowed.
 			uint strongIndex[4];
 			float strongWeight[4];
 			uint strongCount = 0u;
 			float restWeight = 0.0;
 			int chosen = -1;
-			float chosenWeight = 0.0;
+			float chosenTarget = 0.0;
 
 			// Only the lights listed for the cell this point is in. A point
 			// outside the grid is beyond every light's reach.
@@ -1250,10 +1268,11 @@ static std::string TraceCommon()
 			uint cellIndex = uint((cell.z * dims.y + cell.y) * dims.x + cell.x);
 			uint listStart = lightGrid[8u + cellIndex * 2u];
 			uint listCount = lightGrid[9u + cellIndex * 2u];
+			uint weighed = (everyLight || (Disable & 2097152u) != 0u) ? listCount : min(listCount, exactCount);
 
-			for (uint k = 0u; k < listCount; k++)
+			for (uint k = 0u; k < weighed; k++)
 			{
-				uint i = lightGrid[listStart + k];
+				uint i = lightGrid[listStart + 2u * k];
 				vec3 value, base, dir;
 				float distance;
 				bool behind;
@@ -1296,7 +1315,56 @@ static std::string TraceCommon()
 					if (randomFloat() < candidateWeight / restWeight)
 					{
 						chosen = int(candidate);
-						chosenWeight = candidateWeight;
+						chosenTarget = candidateWeight;
+					}
+				}
+			}
+
+			// The rest of a crowded cell, stood for by a few drawn from it in
+			// proportion to their rank, each weighed exactly and offered to the
+			// same pick. A draw goes in weighed by what it gives over how
+			// likely it was to be drawn, averaged over the draws: resampled
+			// importance sampling. The pick then stands for the lights weighed
+			// and the rest together, on average exactly as they add up, for
+			// the cost of a few however many the cell holds. Each entry's
+			// second word is the rank of it and every one after it summed, so
+			// a draw is a binary search down the tail.
+			if (weighed < listCount)
+			{
+				float tail = uintBitsToFloat(lightGrid[listStart + 2u * weighed + 1u]);
+				for (uint d = 0u; d < drawCount && tail > 0.0; d++)
+				{
+					float u = randomFloat() * tail;
+					uint lo = weighed, hi = listCount - 1u;
+					while (lo < hi)
+					{
+						uint mid = (lo + hi + 1u) >> 1u;
+						if (uintBitsToFloat(lightGrid[listStart + 2u * mid + 1u]) > u)
+							lo = mid;
+						else
+							hi = mid - 1u;
+					}
+					float here = uintBitsToFloat(lightGrid[listStart + 2u * lo + 1u]);
+					float after = lo + 1u < listCount ? uintBitsToFloat(lightGrid[listStart + 2u * lo + 3u]) : 0.0;
+					float chance = (here - after) / tail;
+					if (chance <= 0.0)
+						continue;
+					uint i = lightGrid[listStart + 2u * lo];
+					vec3 value, base, dir;
+					float distance;
+					bool behind;
+					if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmap, everyLight, value, base, dir, distance, behind))
+						continue;
+					float target = luminance(value);
+					float candidateWeight = target / (float(drawCount) * chance);
+					if (candidateWeight > 0.0)
+					{
+						restWeight += candidateWeight;
+						if (randomFloat() < candidateWeight / restWeight)
+						{
+							chosen = int(i);
+							chosenTarget = target;
+						}
 					}
 				}
 			}
@@ -1350,7 +1418,7 @@ static std::string TraceCommon()
 					lightBase = base * through;
 				}
 			}
-			if (chosen >= 0 && chosenWeight > 0.0)
+			if (chosen >= 0 && chosenTarget > 0.0)
 			{
 				vec3 value, base, dir;
 				float distance;
@@ -1363,7 +1431,7 @@ static std::string TraceCommon()
 				{
 					if (engineSum)
 						through = pow(through, vec3(1.0 / 2.2));
-					float scale = restWeight / chosenWeight;
+					float scale = restWeight / chosenTarget;
 					reaches += value * through * scale;
 					if (highlightWeight <= 0.0)
 					{

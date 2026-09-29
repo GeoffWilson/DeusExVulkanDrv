@@ -810,6 +810,8 @@ void LevelScene::AddLight(AActor* actor)
 	// one. Every light used to be taken as steady, so nothing in the game
 	// ever pulsed, blinked or flickered.
 	float brightness = actor->LightBrightness / 255.0f;
+	// Which every type below only ever dims.
+	float peak = brightness;
 	const bool waver = actor->LightEffect == LE_TorchWaver || actor->LightEffect == LE_FireWaver || actor->LightEffect == LE_WateryShimmer;
 	const bool waves = actor->LightEffect == LE_SlowWave || actor->LightEffect == LE_FastWave;
 	bool changing = actor->LightEffect == LE_Disco || actor->LightEffect == LE_Searchlight || actor->LightEffect == LE_Rotor || waver || waves;
@@ -843,10 +845,16 @@ void LevelScene::AddLight(AActor* actor)
 	case LT_Strobe:      if (StrobeOff) brightness = 0.0f; changing = true; break;
 	default:             break;
 	}
+	// Dark for the moment, a light keeps its place in the list, at no
+	// brightness. Left out, it moved every light after it along one, and the
+	// helper, finding the list changed, built its light grid again - which in
+	// the Wan Chai canal, where the neon flickers, was 2 ms a frame. Its glow
+	// in the fog is left out as before: that list is not what the grid is
+	// made from.
 	if (brightness <= 0.0f)
-		return;
-
-	AddFogLight(actor, c, brightness);
+		brightness = 0.0f;
+	else
+		AddFogLight(actor, c, brightness);
 
 	vec3 colour = SrgbToLinear(c.X, c.Y, c.Z);
 	if (HighlightSpecialLights)
@@ -857,9 +865,11 @@ void LevelScene::AddLight(AActor* actor)
 		{
 			colour = changing ? vec3(0.0f, 1.0f, 0.0f) : (spot ? vec3(1.0f, 0.0f, 1.0f) : vec3(0.0f, 1.0f, 1.0f));
 			brightness *= 8.0f;
+			peak *= 8.0f;
 		}
 	}
 	light.ColorBrightness = vec4(colour.x, colour.y, colour.z, brightness * LightScale);
+	light.Peak = vec4(peak * LightScale, 0.0f, 0.0f, 0.0f);
 
 	// Spotlights shine along the actor's rotation, within a cone set by
 	// LightCone out of 256: the engine takes one minus that as the cosine
