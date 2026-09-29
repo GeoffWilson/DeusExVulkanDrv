@@ -46,6 +46,9 @@ public:
 	// Still there, and not given up.
 	bool Alive() const { return Shared && !Dead; }
 	const std::string& Error() const { return LastError; }
+	// Commands dropped for being bigger than the channel holds, which is
+	// otherwise without a word: Error() says what the last one was.
+	uint32_t Refused() const { return RefusedCount; }
 	const TraceProtocol::Header& Status() const { return *Shared; }
 
 	void ResetScene();
@@ -54,7 +57,9 @@ public:
 	void Lights(const std::vector<SceneLight>& lights, const std::vector<SceneLight>& fogLights);
 	void Lightmaps(const std::vector<uint32_t>& words);
 	void Emitters(const std::vector<uint32_t>& words);
-	void Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels = 1, uint32_t format = 0);
+	// How many of its top levels a texture went without to fit the channel,
+	// or -1 when even its smallest would not and it went as an empty slot.
+	int Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels = 1, uint32_t format = 0);
 	void TexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels);
 
 	// Sends what is queued and a request to trace it, and waits until the
@@ -98,6 +103,7 @@ private:
 	uint32_t Used = 0;
 	bool Dead = false;
 	std::string LastError;
+	uint32_t RefusedCount = 0;
 
 	VkSemaphore ReadySemaphore = VK_NULL_HANDLE;
 	VkSemaphore ReleasedSemaphore = VK_NULL_HANDLE;

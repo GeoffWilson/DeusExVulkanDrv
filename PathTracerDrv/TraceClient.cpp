@@ -202,6 +202,7 @@ uint8_t* TraceClient::Reserve(uint32_t bytes)
 	if (bytes > Shared->CommandCapacity)
 	{
 		LastError = "a command of " + std::to_string(bytes) + " bytes will not fit in the channel";
+		RefusedCount++;
 		return nullptr;
 	}
 	if (Used + bytes > Shared->CommandCapacity && !Send())
@@ -357,18 +358,42 @@ void TraceClient::Emitters(const std::vector<uint32_t>& words)
 		memcpy(p + sizeof(c), words.data(), words.size() * sizeof(uint32_t));
 }
 
-void TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels, uint32_t format)
+int TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels, const vec4& material, bool animated, uint32_t levels, uint32_t format)
 {
 	using namespace TraceProtocol;
 	if (!pixels)
 		width = height = 0;
 	if (!levels)
 		levels = 1;
-	const size_t pixelBytes = MipChainBytes(format, width, height, width && height ? levels : 0);
-	const uint32_t bytes = Rounded(sizeof(TextureCommand) + pixelBytes);
+
+	// One too big to go in a piece - 4096 square, uncompressed, fills the
+	// channel on its own - goes without its top levels until it fits: softer
+	// rather than missing. The shader takes a texture's size from its image,
+	// so it samples what is left at the right level. One that still does not
+	// fit is sent empty, for the slot to be there and white, as one that
+	// could not be converted is.
+	int dropped = 0;
+	auto pixelBytes = [&]() { return MipChainBytes(format, width, height, width && height ? levels : 0); };
+	while (width && height && sizeof(TextureCommand) + pixelBytes() > CommandCapacity)
+	{
+		if (levels < 2)
+		{
+			width = height = 0;
+			dropped = -1;
+			break;
+		}
+		pixels = (const uint32_t*)((const uint8_t*)pixels + MipBytes(format, width, height));
+		width = width > 1 ? width >> 1 : 1;
+		height = height > 1 ? height >> 1 : 1;
+		levels--;
+		dropped++;
+	}
+
+	const size_t chainBytes = pixelBytes();
+	const uint32_t bytes = Rounded(sizeof(TextureCommand) + chainBytes);
 	uint8_t* p = Reserve(bytes);
 	if (!p)
-		return;
+		return dropped;
 	TextureCommand c = {};
 	c.H = { CmdTexture, bytes };
 	c.Index = index;
@@ -379,8 +404,9 @@ void TraceClient::Texture(uint32_t index, uint32_t width, uint32_t height, const
 	c.Format = format;
 	c.Material = material;
 	memcpy(p, &c, sizeof(c));
-	if (pixelBytes)
-		memcpy(p + sizeof(c), pixels, pixelBytes);
+	if (chainBytes)
+		memcpy(p + sizeof(c), pixels, chainBytes);
+	return dropped;
 }
 
 void TraceClient::TexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels)

@@ -137,7 +137,14 @@ void TraceHost::EnsureOutput(uint32_t width, uint32_t height)
 	if (SharedImage && width == SharedWidth && height == SharedHeight)
 		return;
 
-	// The device may still be copying out of the old one.
+	// The device may still be copying the last frame out of the old one,
+	// on its own queue. In this process that queue is the same device's, and
+	// waiting for the device covers it. The helper's wait covers only its own
+	// queue: what keeps the old image alive there is that the device imported
+	// its memory, and memory imported is not released until every process
+	// holding it has freed it - which the device does in ImportOutput, once
+	// its own queue is idle. So the old image is safe to free here only while
+	// the frame is shared as memory handed over like that.
 	if (ExportTo)
 		WaitForGpu();
 	else

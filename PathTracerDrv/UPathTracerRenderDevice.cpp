@@ -1865,6 +1865,8 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 // Starts the helper that traces, from beside this DLL, on this device's GPU.
 bool UPathTracerRenderDevice::StartTracer()
 {
+	// A new client counts its refusals from none.
+	RefusedSeen = 0;
 #ifdef PATHTRACER_LOCAL
 	// A 64-bit game traces in its own process, on this device.
 	Tracer.reset(new TraceClient());
@@ -2019,8 +2021,19 @@ bool UPathTracerRenderDevice::SendScene()
 		// One that changes sends its top level alone from then on, so it has
 		// no mips to fall behind it.
 		const uint32_t sentMips = sent.Animated ? 1u : (uint32_t)levels;
-		Tracer->Texture((uint32_t)i, (uint32_t)sent.Width, (uint32_t)sent.Height, converted ? Pixels.data() : nullptr,
+		const int dropped = Tracer->Texture((uint32_t)i, (uint32_t)sent.Width, (uint32_t)sent.Height, converted ? Pixels.data() : nullptr,
 			Scene.TextureMaterials[i], sent.Animated, sentMips, format);
+		if (dropped)
+		{
+			if (dropped > 0)
+				debugf(TEXT("PathTracer texture %d '%s' %dx%d is too big to send whole: sent from %dx%d"), (int)i, sent.Source->GetName(),
+					sent.Width, sent.Height, Max(sent.Width >> dropped, 1), Max(sent.Height >> dropped, 1));
+			else
+				debugf(TEXT("PathTracer texture %d '%s' %dx%d is too big to send; it is left white"), (int)i, sent.Source->GetName(), sent.Width, sent.Height);
+			// Its frames would not fit either.
+			if (dropped < 0)
+				sent.Width = sent.Height = 0;
+		}
 		SentTextures.push_back(sent);
 		if (converted && sentMips > 1)
 		{
@@ -2065,6 +2078,18 @@ bool UPathTracerRenderDevice::SendScene()
 
 	Tracer->Instances(Scene.Instances, Scene.StaticGeometries);
 	Tracer->Lights(Scene.Lights, Scene.FogLights);
+
+	// Anything else too big for the channel - a level's world past about
+	// half a million triangles - is dropped by it, so said here.
+	if (Tracer->Refused() != RefusedSeen)
+	{
+		RefusedSeen = Tracer->Refused();
+		if (RefusalsLogged < 8)
+		{
+			RefusalsLogged++;
+			debugf(TEXT("PathTracer: %s, and was left out"), *Widen(Tracer->Error().c_str()));
+		}
+	}
 	return Tracer->Alive();
 
 	unguard;

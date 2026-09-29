@@ -11,6 +11,28 @@
 // Matte: roughness 1, no metal, the usual reflectance. See Materials.h.
 static const vec4 MatteMaterial(1.0f, 0.0f, 0.04f, 0.0f);
 
+// A new accumulation and history, cleared and left GENERAL for the trace. Not
+// merely made GENERAL, as everything else is: the accumulation's alpha counts
+// a pixel's frames under a moving shadow, and the trace reads that before it
+// looks at whether the device has thrown the history away. Whatever the
+// memory last held could keep a pixel on a short history until the next
+// resize, or off one altogether if it read as NaN.
+static void StartCleared(VulkanCommandBuffer* cmd, VulkanImage* accum, VulkanImage* history)
+{
+	PipelineBarrier()
+		.AddImage(accum, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
+		.AddImage(history, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
+		.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	const VkClearColorValue zero = {};
+	const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	cmd->clearColorImage(accum->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+	cmd->clearColorImage(history->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+	PipelineBarrier()
+		.AddImage(accum, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+		.AddImage(history, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+		.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+
 TraceRenderer::TraceRenderer(GpuContext* context) : Context(context), Device(context->GetDevice())
 {
 	// Texturing needs to index the array by whatever each ray hit, which is
@@ -501,12 +523,12 @@ void TraceRenderer::Resize(int width, int height, int outputWidth, int outputHei
 		view = ImageViewBuilder().Image(image.get(), format).DebugName(name).Create(Device);
 	};
 
-	makeImage(AccumImage, AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT, "PathTracerAccum");
+	makeImage(AccumImage, AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerAccum");
 
 	// What each pixel was looking at last frame: the world position it hit and
 	// which instance owned it. Compared against this frame to decide whether the
 	// pixel's accumulated history still describes the same thing.
-	makeImage(HistoryImage, HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT, "PathTracerHistory");
+	makeImage(HistoryImage, HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerHistory");
 
 	makeImage(OutputImage, OutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight,
 		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerOutput");
@@ -574,8 +596,9 @@ void TraceRenderer::Resize(int width, int height, int outputWidth, int outputHei
 	// Everything starts undefined and the shaders use it as GENERAL.
 	Context->ExecuteImmediate([this](VulkanCommandBuffer* cmd)
 	{
+		StartCleared(cmd, AccumImage.get(), HistoryImage.get());
 		PipelineBarrier barrier;
-		for (VulkanImage* image : { AccumImage.get(), HistoryImage.get(), OutputImage.get(), RrDepthImage.get(), RrMotionImage.get(), RrColorImage.get(), RrOutputImage.get() })
+		for (VulkanImage* image : { OutputImage.get(), RrDepthImage.get(), RrMotionImage.get(), RrColorImage.get(), RrOutputImage.get() })
 			if (image)
 				barrier.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
 		for (int i = 0; i < GuideImageCount; i++)
@@ -1070,9 +1093,9 @@ void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProto
 				image = ImageBuilder().Format(format).Size(width, height).Usage(usage).DebugName(name).Create(Device);
 				imageView = ImageViewBuilder().Image(image.get(), format).DebugName(name).Create(Device);
 			};
-			makeImage(inset.Accum, inset.AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, "PathTracerInsetAccum");
+			makeImage(inset.Accum, inset.AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerInsetAccum");
 			makeImage(inset.Out, inset.OutView, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, "PathTracerInsetOut");
-			makeImage(inset.History, inset.HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, "PathTracerInsetHistory");
+			makeImage(inset.History, inset.HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerInsetHistory");
 			WriteDescriptors()
 				.AddStorageImage(inset.Set.get(), 0, inset.AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
 				.AddStorageImage(inset.Set.get(), 1, inset.OutView.get(), VK_IMAGE_LAYOUT_GENERAL)
@@ -1084,10 +1107,9 @@ void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProto
 		}
 		if (fresh)
 		{
+			StartCleared(commands, inset.Accum.get(), inset.History.get());
 			PipelineBarrier()
-				.AddImage(inset.Accum.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
 				.AddImage(inset.Out.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
-				.AddImage(inset.History.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT)
 				.Execute(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 		}
 
