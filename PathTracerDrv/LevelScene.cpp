@@ -1160,6 +1160,14 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 	if (it != ActorGeometry.end())
 	{
 		index = it->second;
+		// Photo mode holds the world by bPlayersOnly, which stops every
+		// script and all physics but not the engine advancing animation: a
+		// character caught walking walked on the spot, and the photo's
+		// samples averaged every step into a blur. Whatever has a pose keeps
+		// it until photo mode ends, when its key no longer matches the one
+		// kept here and it is posed again.
+		if (PhotoMode && !Geometries[index].Positions.empty())
+			return index;
 		auto previous = ActorPoseKeys.find(actor);
 		if (previous != ActorPoseKeys.end() && previous->second == key && !Geometries[index].Positions.empty())
 			return index;
@@ -2749,70 +2757,84 @@ bool LevelScene::PlaceHeldItem(APawn* pawn, uint32_t mask)
 		if (face.iWedge[i] >= lod->SpecialVerts)
 			return false;
 
-	// The character's pose in world space, which GetFrame hands back with the
-	// attachment points first.
-	INT request = lod->ModelVerts;
-	HeldPoints.resize(lod->SpecialVerts + Max(lod->ModelVerts, lod->FrameVerts) + 1);
-	lod->GetFrame(&HeldPoints[0], sizeof(FVector), GMath.UnitCoords, pawn, request);
-	const FVector a = HeldPoints[face.iWedge[0]];
-	const FVector b = HeldPoints[face.iWedge[1]];
-	const FVector c = HeldPoints[face.iWedge[2]];
-
-	// The frame DrawLodMesh builds: X along the first edge, Y across the
-	// triangle, the origin halfway along the edge from the first corner to
-	// the third. It works in the view's space, whose axes are mirrored against
-	// the world's, so its two cross products change order here.
-	const FVector x = (b - a).SafeNormal();
-	const FVector y = ((a - c) ^ x).SafeNormal();
-	const FVector z = x ^ y;
-	const FVector origin = (a + c) * 0.5f;
-
-	UMesh* mesh = item->ThirdPersonMesh;
-	UTexture* skins[8] = {};
-	for (int i = 0; i < 8; i++)
-	{
-		if (item->GetSkin(i))
-			skins[i] = item->GetSkin(i);
-		else if (item->MultiSkins[i])
-			skins[i] = item->MultiSkins[i];
-		else if (i != 0 && i < mesh->Textures.Num() && mesh->Textures(i))
-			skins[i] = mesh->Textures(i);
-		else if (item->Skin)
-			skins[i] = item->Skin;
-		else if (i < mesh->Textures.Num())
-			skins[i] = mesh->Textures(i);
-	}
-
-	int frameA = 0, frameB = 0;
-	float alpha = 0.0f;
-	AnimationPose(mesh, item->AnimSequence, item->AnimFrame, frameA, frameB, alpha);
-	const int geometryIndex = GeometryForMesh(mesh, frameA, frameA, 0.0f, skins, -1, KindFromStyle(pawn->Style), nullptr, nullptr, item);
-	if (geometryIndex < 0)
-		return false;
-
-	// The item's own placement with its rotation zeroed, taken into the frame.
-	const float s = item->ThirdPersonScale;
-	const FVector axes[3] = { x, y, z };
-	const FVector offset = x * (item->PrePivot.X * s) + y * (item->PrePivot.Y * s) + z * (item->PrePivot.Z * s);
+	// In photo mode it stays where it was when the world stopped. The engine
+	// goes on animating a character under bPlayersOnly, which the trace
+	// holds still (AnimatedGeometryFor), and a weapon placed from that
+	// animation drifted off the hand it was in.
 	SceneInstance instance;
-	instance.GeometryIndex = geometryIndex;
 	instance.Mask = mask;
-	for (int col = 0; col < 3; col++)
+	PlacedPose pose;
+	auto previous = PreviousPoses.find(item);
+	if (PhotoMode && previous != PreviousPoses.end())
 	{
-		instance.Transform[0 * 4 + col] = axes[col].X * s;
-		instance.Transform[1 * 4 + col] = axes[col].Y * s;
-		instance.Transform[2 * 4 + col] = axes[col].Z * s;
+		pose = previous->second;
+		instance.GeometryIndex = pose.GeometryIndex;
+		memcpy(instance.Transform, pose.Transform, sizeof(pose.Transform));
 	}
-	instance.Transform[0 * 4 + 3] = origin.X + offset.X;
-	instance.Transform[1 * 4 + 3] = origin.Y + offset.Y;
-	instance.Transform[2 * 4 + 3] = origin.Z + offset.Z;
+	else
+	{
+		// The character's pose in world space, which GetFrame hands back
+		// with the attachment points first.
+		INT request = lod->ModelVerts;
+		HeldPoints.resize(lod->SpecialVerts + Max(lod->ModelVerts, lod->FrameVerts) + 1);
+		lod->GetFrame(&HeldPoints[0], sizeof(FVector), GMath.UnitCoords, pawn, request);
+		const FVector a = HeldPoints[face.iWedge[0]];
+		const FVector b = HeldPoints[face.iWedge[1]];
+		const FVector c = HeldPoints[face.iWedge[2]];
+
+		// The frame DrawLodMesh builds: X along the first edge, Y across the
+		// triangle, the origin halfway along the edge from the first corner
+		// to the third. It works in the view's space, whose axes are mirrored
+		// against the world's, so its two cross products change order here.
+		const FVector x = (b - a).SafeNormal();
+		const FVector y = ((a - c) ^ x).SafeNormal();
+		const FVector z = x ^ y;
+		const FVector origin = (a + c) * 0.5f;
+
+		UMesh* mesh = item->ThirdPersonMesh;
+		UTexture* skins[8] = {};
+		for (int i = 0; i < 8; i++)
+		{
+			if (item->GetSkin(i))
+				skins[i] = item->GetSkin(i);
+			else if (item->MultiSkins[i])
+				skins[i] = item->MultiSkins[i];
+			else if (i != 0 && i < mesh->Textures.Num() && mesh->Textures(i))
+				skins[i] = mesh->Textures(i);
+			else if (item->Skin)
+				skins[i] = item->Skin;
+			else if (i < mesh->Textures.Num())
+				skins[i] = mesh->Textures(i);
+		}
+
+		int frameA = 0, frameB = 0;
+		float alpha = 0.0f;
+		AnimationPose(mesh, item->AnimSequence, item->AnimFrame, frameA, frameB, alpha);
+		const int geometryIndex = GeometryForMesh(mesh, frameA, frameA, 0.0f, skins, -1, KindFromStyle(pawn->Style), nullptr, nullptr, item);
+		if (geometryIndex < 0)
+			return false;
+
+		// The item's own placement with its rotation zeroed, taken into the
+		// frame.
+		const float s = item->ThirdPersonScale;
+		const FVector axes[3] = { x, y, z };
+		const FVector offset = x * (item->PrePivot.X * s) + y * (item->PrePivot.Y * s) + z * (item->PrePivot.Z * s);
+		instance.GeometryIndex = geometryIndex;
+		for (int col = 0; col < 3; col++)
+		{
+			instance.Transform[0 * 4 + col] = axes[col].X * s;
+			instance.Transform[1 * 4 + col] = axes[col].Y * s;
+			instance.Transform[2 * 4 + col] = axes[col].Z * s;
+		}
+		instance.Transform[0 * 4 + 3] = origin.X + offset.X;
+		instance.Transform[1 * 4 + 3] = origin.Y + offset.Y;
+		instance.Transform[2 * 4 + 3] = origin.Z + offset.Z;
+		pose.GeometryIndex = geometryIndex;
+		memcpy(pose.Transform, instance.Transform, sizeof(pose.Transform));
+	}
 
 	// Its history is kept as any actor's is. The item is hidden, so nothing
 	// else places it under the same key.
-	PlacedPose pose;
-	pose.GeometryIndex = geometryIndex;
-	memcpy(pose.Transform, instance.Transform, sizeof(pose.Transform));
-	auto previous = PreviousPoses.find(item);
 	const bool moved = (previous == PreviousPoses.end()) || previous->second != pose;
 	CurrentPoses[item] = pose;
 	if (previous != PreviousPoses.end())

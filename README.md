@@ -774,9 +774,11 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   them, as before, or sampled as lights as well, to compare. The two should
   settle to the same picture.
 - `PT PHOTO`: photo mode on or off. The world is held still - the level's own
-  players only switch, so nothing else moves, fires, talks or triggers - and
-  the camera flies free with the movement keys and the mouse: jump and
-  crouch rise and sink, and the walk key goes slowly. The HUD, the weapon and
+  players only switch, so nothing else moves, fires, talks or triggers, and
+  every character and animated thing is held in the pose it had, since that
+  switch does not stop the engine animating them - and the camera flies free
+  with the movement keys and the mouse: jump and crouch rise and sink, and the
+  walk key goes slowly. The HUD, the weapon and
   the screen flashes are left out, and JC stands where he was. While the
   camera moves the picture is denoised; once it has held still for a moment
   it refines instead, every frame's samples averaged, up to 4095 a pixel.
