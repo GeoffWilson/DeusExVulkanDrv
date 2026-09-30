@@ -2167,6 +2167,14 @@ void UVulkanRenderDevice::DrawGouraudTriangles(const FSceneNode* Frame, const FT
 
 #endif
 
+// Deus Ex's flat colour fill, Texture'Solid': what the UI draws boxes, bars
+// and the black round a scope's sight with.
+static bool IsSolidFill(const FTextureInfo& Info)
+{
+	static const FName solid(TEXT("Solid"));
+	return Info.Texture && Info.Texture->GetFName() == solid;
+}
+
 void UVulkanRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags)
 {
 	guardSlow(UVulkanRenderDevice::DrawTile);
@@ -2196,16 +2204,37 @@ void UVulkanRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT 
 	// its ends. Carried on to the picture's edges at the same texel density, so
 	// a pattern continues rather than stretches. Drawn through a viewport as
 	// wide as the picture, in which the frame's own width reaches its edges.
+	//
+	// So is a solid fill against one side of it: the black round a scope's
+	// sight or the binoculars' is four blocks, the two above and below it
+	// across the width, and one either side reaching one edge each, which
+	// left the world showing either side of the sight. Only a solid fill -
+	// the HUD's own art starts against the left edge too, and is not to be
+	// stretched - and only a block, not the dots and lines of a pixel that
+	// are drawn with the same fill.
 	const int uiOffset = GetUiOffsetX();
-	const bool acrossPicture = uiOffset > 0 && XL > 0.0f && Frame->XB == 0 && Frame->X == Viewport->SizeX &&
-		X <= 0.5f && X + XL >= Frame->FX - 0.5f;
+	const bool pinnedFrame = uiOffset > 0 && XL > 0.0f && Frame->XB == 0 && Frame->X == Viewport->SizeX;
+	const bool fromLeft = pinnedFrame && X <= 0.5f;
+	const bool toRight = pinnedFrame && X + XL >= Frame->FX - 0.5f;
+	const bool acrossPicture = (fromLeft && toRight) || ((fromLeft || toRight) && XL >= 8.0f && YL >= 8.0f && IsSolidFill(Info));
 	if (acrossPicture)
 	{
+		// The tile's ends in the picture, in the engine's pixels.
+		const float picture = (float)GetOutputWidth();
 		const float uPerPixel = (u1 - u0) / XL;
-		u0 -= (X + uiOffset) * uPerPixel;
-		u1 += (Frame->FX + uiOffset - (X + XL)) * uPerPixel;
-		X = 0.0f;
-		XL = Frame->FX;
+		float left = X + uiOffset, right = X + XL + uiOffset;
+		if (fromLeft)
+		{
+			u0 -= left * uPerPixel;
+			left = 0.0f;
+		}
+		if (toRight)
+		{
+			u1 += (picture - right) * uPerPixel;
+			right = picture;
+		}
+		X = left * Frame->FX / picture;
+		XL = (right - left) * Frame->FX / picture;
 
 		DrawBatch(Commands->GetDrawCommands());
 		VkViewport whole = viewportdesc;

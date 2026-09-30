@@ -547,7 +547,8 @@ follows from that:
   4:3 mode at the height of the mode chosen, lays its HUD, menus and
   conversations out in it as it was designed to, and the trace fills the rest
   of the mode chosen around them; what spans the whole of the game's width - a
-  conversation's bars, a fade - is carried on to the picture's edges.
+  conversation's bars, a fade - is carried on to the picture's edges, and so
+  is the black round a scope's or the binoculars' sight.
 - **A mode narrower than the screen** is traced at that mode and letterboxed,
   pinned or not, with the bars cleared rather than showing the last picture
   shown there. A 4:3 mode costs what a 4:3 mode costs.
@@ -1035,7 +1036,8 @@ And what was added:
   the height chosen and lays its HUD, menus and conversations out in it as it
   was designed to, while the world fills the rest of the mode chosen around
   them; what spans the game's whole width - a conversation's bars, a fade, the
-  darkening behind a menu - is carried on to the screen's edges. The world
+  darkening behind a menu - is carried on to the screen's edges, and so is the
+  black round a scope's or the binoculars' sight. The world
   either side comes from the engine too: `URender::DrawWorld` in `Render.dll`
   is redirected the same way, and for the player's view alone the frame is
   widened to the screen at the focal length it already had, given a culling

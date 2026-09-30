@@ -3828,6 +3828,14 @@ void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo
 
 	unguardSlow;
 }
+// Deus Ex's flat colour fill, Texture'Solid': what the UI draws boxes, bars
+// and the black round a scope's sight with.
+static bool IsSolidFill(const FTextureInfo& Info)
+{
+	static const FName solid(TEXT("Solid"));
+	return Info.Texture && Info.Texture->GetFName() == solid;
+}
+
 // The engine's 2D drawing: HUD, menus, console, subtitles, the mouse cursor.
 //
 // Collected here rather than drawn, because the traced image does not exist yet
@@ -3923,13 +3931,29 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	// stopping at the edges of a pinned UI left the world showing past its
 	// ends. Carried on to the trace's edges at the same texel density, so a
 	// pattern continues rather than stretches.
-	if (UiOffsetX > 0 && XL > 0.0f && x0 - (float)UiOffsetX <= 0.5f && x1 - (float)UiOffsetX >= (float)Viewport->SizeX - 0.5f)
+	//
+	// So is a solid fill against one side of it: the black round a scope's
+	// sight or the binoculars' is four blocks, the two above and below it
+	// across the width, and one either side reaching one edge each, which
+	// left the world showing either side of the sight. Only a solid fill -
+	// the HUD's own art starts against the left edge too, and is not to be
+	// stretched - and only a block, not the dots and lines of a pixel that
+	// are drawn with the same fill.
+	const bool fromLeft = UiOffsetX > 0 && XL > 0.0f && x0 - (float)UiOffsetX <= 0.5f;
+	const bool toRight = UiOffsetX > 0 && XL > 0.0f && x1 - (float)UiOffsetX >= (float)Viewport->SizeX - 0.5f;
+	if ((fromLeft && toRight) || ((fromLeft || toRight) && XL >= 8.0f && YL >= 8.0f && IsSolidFill(Info)))
 	{
 		const float uPerPixel = (u1 - u0) / (x1 - x0);
-		u0 -= x0 * uPerPixel;
-		u1 += ((float)TraceWidth - x1) * uPerPixel;
-		x0 = 0.0f;
-		x1 = (float)TraceWidth;
+		if (fromLeft)
+		{
+			u0 -= x0 * uPerPixel;
+			x0 = 0.0f;
+		}
+		if (toRight)
+		{
+			u1 += ((float)TraceWidth - x1) * uPerPixel;
+			x1 = (float)TraceWidth;
+		}
 	}
 
 	vec4 colour = vec4(Color.X, Color.Y, Color.Z, 1.0f);
