@@ -178,6 +178,14 @@ static std::string TraceCommon()
 		// How far a ray starts from the surface it leaves, in world units:
 		// these levels are big.
 		const float RayEpsilon = 0.5;
+		// How far along it a ray lifted RayEpsilon off the surface it leaves
+		// starts looking. The lift already keeps it off that surface - the
+		// ray leaves above it - so this is only a hair. Starting RayEpsilon
+		// along as well stepped through whatever else was that close: from
+		// the floor beside a wall, a bounce towards the wall went through it,
+		// and brought the light behind back as a bright line along every
+		// corner and every foot of a wall.
+		const float LiftedRayMin = 0.01;
 
 		// Which instances each kind of ray sees, against SceneInstance::Mask.
 		// The view's own rays and shadows miss the viewer's body while the
@@ -2437,7 +2445,7 @@ std::string Shaders::Trace()
 					// A mirror keeps the view's cone; a glossy reflection spreads.
 					coneWidth = surfaceConeWidth;
 					coneSpread = pendingGloss ? 0.1 : pixelSpread;
-					rayMin = RayEpsilon;
+					rayMin = LiftedRayMin;
 					passes = 0u;
 					hitDistance = 0.0;
 					wantHitDistance = true;
@@ -2875,7 +2883,7 @@ std::string Shaders::Trace()
 						// reflection by that made it invisible.
 						throughput *= mirrorTint;
 						origin = lifted + faceNormal * RayEpsilon;
-						rayMin = RayEpsilon;
+						rayMin = LiftedRayMin;
 						direction = aboveFace(reflect(direction, normal), faceNormal);
 						glowWeights = 0.0;
 						continue;
@@ -3082,7 +3090,7 @@ std::string Shaders::Trace()
 					}
 
 					origin = lifted + faceNormal * RayEpsilon;
-					rayMin = RayEpsilon;
+					rayMin = LiftedRayMin;
 					if (!glossyBounce)
 						direction = cosineDirection(normal);
 					direction = aboveFace(direction, faceNormal);
