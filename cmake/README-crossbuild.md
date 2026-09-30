@@ -85,7 +85,10 @@ many frames, not any one. `--hdr n` finishes the picture for an HDR display
 whose peak is n times the SDR white and says how much went above it, and
 `--neutral` takes the device's neutral tone curve rather than Reinhard's: with
 both, everything below the curve's shoulder should come out exactly as
-`--neutral` alone gives it. The Windows SDK that `xwin` fetches carries the Direct3D
+`--neutral` alone gives it. `--sprites n` hangs a plume of n overlapping
+puffs of smoke before the box, drawn as the device draws sprites: however
+many overlap, their edges should never show, and the scene behind should come
+out as it does without them, with the smoke added. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 

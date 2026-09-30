@@ -13,7 +13,7 @@
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
 //                            [--decal] [--decal-lift units]
 //                            [--bump percent] [--lights n] [--every-light]
-//                            [--hdr ceiling] [--neutral]
+//                            [--hdr ceiling] [--neutral] [--sprites n]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -30,6 +30,12 @@
 // shoulder should come out as it does without. HDR takes the device's
 // default neutral curve, which --neutral gives SDR too, to compare them;
 // without it the harness's SDR is Reinhard's, as it has always been.
+//
+// --sprites hangs a plume of n puffs of smoke between the camera and the
+// box, as the device places sprites: square on to the view, drawn by adding
+// a texture that fades to black at its edges, each overlapping the next.
+// Their edges should never show, however many overlap: the picture behind
+// them should come out as it does without them, with the smoke added.
 //
 // --still holds everything still instead - no animation, nothing arriving, no
 // change of size - and reports how much the picture changes from one frame
@@ -212,6 +218,7 @@ int main(int argc, char** argv)
 	bool everyLight = false;
 	float toneCeiling = 1.0f;
 	bool neutral = false;
+	int sprites = 0;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -266,6 +273,8 @@ int main(int argc, char** argv)
 			toneCeiling = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "--neutral"))
 			neutral = true;
+		else if (!strcmp(argv[i], "--sprites") && i + 1 < argc)
+			sprites = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--photo") && i + 1 < argc)
 		{
 			photoAperture = (float)atof(argv[++i]);
@@ -648,6 +657,88 @@ int main(int argc, char** argv)
 		const vec3 right = Normalized(Cross(forward, vec3(0, 0, 1)));
 		const vec3 down = Cross(forward, right);
 		const float halfWidth = 1.0f, aspect = (float)height / (float)width;
+
+		// --sprites: the plume, one quad as GeometryForSprite makes it -
+		// unlit, drawn by adding (2), lit by nothing and as bright as its
+		// instance's glow (Emission.w 2) - placed n times square on to the
+		// view, as PlaceSprite places one, each a little further off and
+		// round from the last. Its texture is a soft puff, black at the edges.
+		if (sprites > 0)
+		{
+			std::vector<uint32_t> puff;
+			for (int y = 0; y < 64; y++)
+				for (int x = 0; x < 64; x++)
+				{
+					const float d = std::sqrt((x - 31.5f) * (x - 31.5f) + (y - 31.5f) * (y - 31.5f)) / 30.0f;
+					const float f = d >= 1.0f ? 0.0f : (1.0f - d) * (1.0f - d);
+					const uint32_t v = (uint32_t)(255.0f * f + 0.5f);
+					puff.push_back(0xff000000u | (v << 16) | (v << 8) | v);
+				}
+			uint32_t puffLevels = 1;
+			for (int size = 64, above = 0; size > 1; size /= 2, puffLevels++)
+			{
+				const int half = size / 2;
+				for (int y = 0; y < half; y++)
+					for (int x = 0; x < half; x++)
+					{
+						uint32_t sum = 0;
+						for (int k = 0; k < 4; k++)
+							sum += puff[above + (y * 2 + k / 2) * size + x * 2 + k % 2] & 255u;
+						const uint32_t v = sum / 4;
+						puff.push_back(0xff000000u | (v << 16) | (v << 8) | v);
+					}
+				above += size * size;
+			}
+			client.Texture(3, 64, 64, puff.data(), vec4(1.0f, 0.0f, 0.04f, 0.0f), false, puffLevels);
+
+			SceneGeometry quad;
+			quad.HasMasked = true;
+			const vec3 corners[4] = { vec3(-0.5f, 0.5f, 0.0f), vec3(0.5f, 0.5f, 0.0f), vec3(0.5f, -0.5f, 0.0f), vec3(-0.5f, -0.5f, 0.0f) };
+			const float uv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+			const int tris[2][3] = { { 0, 3, 2 }, { 0, 2, 1 } };
+			for (const auto& tri : tris)
+			{
+				TriangleAttributes attr = {};
+				attr.Normal = vec4(0.0f, 0.0f, 1.0f, 0.0f);
+				attr.Albedo = vec4(0.3f, 0.3f, 0.3f, 0.0f);
+				attr.Emission = vec4(0.0f, 0.0f, 0.0f, 2.0f);
+				attr.UV01 = vec4(uv[tri[0]][0], uv[tri[0]][1], uv[tri[1]][0], uv[tri[1]][1]);
+				attr.UV2Tex = vec4(uv[tri[2]][0], uv[tri[2]][1], 3.0f, 2.0f);
+				const vec3 laid[3] = { corners[tri[0]], corners[tri[1]], corners[tri[2]] };
+				SetUvDensity(attr, laid);
+				for (int v = 0; v < 3; v++)
+					quad.Positions.push_back(corners[tri[v]]);
+				quad.Attributes.push_back(attr);
+			}
+			client.Geometry(4, quad);
+
+			const vec3 up(-down.x, -down.y, -down.z);
+			const float size = 180.0f, glow = 0.25f;
+			for (int k = 0; k < sprites; k++)
+			{
+				const float a = k * 2.399963f, r = 50.0f * std::sqrt((k + 0.5f) / sprites);
+				const float along = 380.0f + k * 3.0f;
+				const vec3 centre(eye.x + forward.x * along + (right.x * std::cos(a) + up.x * std::sin(a)) * r,
+					eye.y + forward.y * along + (right.y * std::cos(a) + up.y * std::sin(a)) * r,
+					eye.z + forward.z * along + (right.z * std::cos(a) + up.z * std::sin(a)) * r);
+				SceneInstance puffAt = {};
+				puffAt.GeometryIndex = 4;
+				const vec3 columns[3] = { right * size, up * size, vec3(-forward.x, -forward.y, -forward.z) };
+				for (int col = 0; col < 3; col++)
+				{
+					puffAt.Transform[0 * 4 + col] = columns[col].x;
+					puffAt.Transform[1 * 4 + col] = columns[col].y;
+					puffAt.Transform[2 * 4 + col] = columns[col].z;
+				}
+				puffAt.Transform[3] = centre.x;
+				puffAt.Transform[7] = centre.y;
+				puffAt.Transform[11] = centre.z;
+				// Its glow, and InstanceFlags' w: one more than the glow, 32
+				// more in the fog zone --fog makes, and still.
+				puffAt.Ambient = vec4(glow, glow, glow, 1.0f + glow + (fog ? 32.0f : 0.0f));
+				instances.push_back(puffAt);
+			}
+		}
 
 		TraceProtocol::TraceCommand frame = {};
 		frame.Width = width;

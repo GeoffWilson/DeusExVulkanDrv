@@ -389,6 +389,14 @@ by default with Russian roulette after the second. Glass and water
 are lit by every light at once and without shadows, so the layer they add never
 flickers.
 
+Smoke, sparks, a lamp's light cone - whatever is drawn by adding an unlit
+colour - is summed wherever a ray crosses it, in one pass along the ray to
+the next thing the ray stops at, rather than stopped at one piece at a time
+as glass is: its light does not depend on the order it is met in. One piece
+at a time, a thick plume of steam used up the layers a ray may pass through,
+and the floor and the fog behind it went missing in squares. Glass, decals
+and the like are still passed one at a time, up to sixteen along a ray.
+
 **Materials.** Off by default for now (the `Materials` setting): guessed as
 below and not yet checked by hand, some come out wrong - Liberty Island's brick
 path is as shiny as glass. Deus Ex has no material data for its renderer, but

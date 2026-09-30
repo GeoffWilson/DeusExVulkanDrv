@@ -84,8 +84,9 @@ void AccelStructure::CreateStaticBottomLevel(const SceneGeometry& geometry, Bott
 	geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
 	// Opaque wherever nothing is masked, which is nearly everything: traversal
 	// then accepts a hit outright instead of asking the shader about every
-	// candidate triangle it crosses.
-	geom.flags = out.Opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+	// candidate triangle it crosses. Where it does ask, it asks once for each
+	// triangle, as the trace's sum of glows along a ray needs (glowAlong).
+	geom.flags = out.Opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
 	geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
 	geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
 	geom.geometry.triangles.vertexStride = sizeof(vec3);
@@ -751,7 +752,7 @@ void AccelStructure::CreateDynamicBottomLevel(const SceneGeometry& geometry, Bot
 
 	VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 	geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-	geom.flags = geometry.HasMasked ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+	geom.flags = geometry.HasMasked ? VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR : VK_GEOMETRY_OPAQUE_BIT_KHR;
 	geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
 	geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
 	geom.geometry.triangles.vertexData.deviceAddress = out.Vertices->GetDeviceAddress();
@@ -886,7 +887,7 @@ void AccelStructure::RecordBottomLevelBuilds(VulkanCommandBuffer* commands, Fram
 
 		VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
 		geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-		geom.flags = level.Opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+		geom.flags = level.Opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
 		geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
 		geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
 		geom.geometry.triangles.vertexData.deviceAddress = level.Vertices->GetDeviceAddress();

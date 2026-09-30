@@ -769,7 +769,77 @@ static std::string TraceCommon()
 			float saturation = 1.0 - min(colour.r, min(colour.g, colour.b)) / top;
 			return mix(vec3(1.0), colour / top, saturation);
 		}
+	)";
 
+	source += R"(
+		// A glow: art drawn by adding an unlit colour - a sprite, or an unlit
+		// surface or mesh drawn translucent: smoke, sparks, a lamp's light
+		// cone. What it adds depends neither on what lies behind it nor on
+		// the order the glows are met in, so rather than stop at each one as
+		// at glass, the trace sums every glow before the next thing it does
+		// stop at (glowAlong). One by one, a plume of smoke used up the
+		// layers a ray may pass and the ray ended in the smoke: the floor
+		// behind and the fog in front of it went missing in squares, the
+		// edges of whichever puff was one too many. An environment mapped
+		// one, rare as it is, is passed as glass is instead: its texel is
+		// where the view reflects off its smoothed normal, which that path
+		// works out anyway, and glowAlong is cheaper without it.
+		bool additiveGlow(int attributeBase, int primitive)
+		{
+			float kind = tris[attributeBase + primitive].UV2Tex.w;
+			return kind > 1.5 && kind < 2.5 && tris[attributeBase + primitive].Emission.w > 0.5 &&
+				tris[attributeBase + primitive].Normal.w < 0.5;
+		}
+
+		// Every glow along a ray from tMin to tMax, each a texel of its
+		// texture as bright as its glow - the same as passing them one by
+		// one gave. bounced is a path gathering light rather than the view,
+		// which takes a glow as the level's glowing surfaces (GlowScale).
+		// Each triangle is offered once, as the geometry holding them is
+		// built for (AccelStructure's NO_DUPLICATE_ANY_HIT). changed is set
+		// when one of them moved since the last frame.
+		vec3 glowAlong(vec3 origin, vec3 direction, float tMin, float tMax, uint cullMask, float coneWidth, float coneSpread, bool bounced, inout bool changed)
+		{
+			vec3 sum = vec3(0.0);
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsCullOpaqueEXT, cullMask, origin, tMin, direction, tMax);
+			while (rayQueryProceedEXT(rq))
+			{
+				if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT)
+					continue;
+				int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+				int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+				if (!additiveGlow(attributeBase, primitive))
+					continue;
+				vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+				mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, false);
+				if (!confirmCandidate(attributeBase, primitive, bary, false, direction, mat3(objectToWorld)))
+					continue;
+				TriangleAttributes attr = tris[attributeBase + primitive];
+				float t = rayQueryGetIntersectionTEXT(rq, false);
+				vec3 faceNormal = normalize(mat3(objectToWorld) * attr.Normal.xyz);
+				float side = dot(faceNormal, direction) > 0.0 ? -1.0 : 1.0;
+				faceNormal *= side;
+				float width = coneWidth + coneSpread * t;
+				Footprint footprint;
+				footprint.logWidth = footprintOf(width, faceNormal, direction, objectToWorld, attr.Normal.xyz);
+				footprint.graded = footprintAxes(attr, width, faceNormal, direction,
+					mat3(rayQueryGetIntersectionWorldToObjectEXT(rq, false)), footprint.dx, footprint.dy);
+				int instance = rayQueryGetIntersectionInstanceIdEXT(rq, false);
+				// A sprite's glow, or an unlit mesh's, is its actor's
+				// ScaleGlow, carried by the instance (see the trace's glow).
+				float glow = attr.Emission.w > 1.1 ? pow(max(instanceAmbient[instance].x, 0.0), 2.2) : 1.0;
+				sum += surfaceAlbedo(attr, bary, direction, faceNormal, footprint) * glow;
+				if (instanceAmbient[instance].w < 0.0)
+					changed = true;
+			}
+			if (bounced)
+				return (Disable & 512u) != 0u ? vec3(0.0) : sum * GlowScale;
+			return sum;
+		}
+	)";
+
+	source += R"(
 		// What the glass a shadow ray passed through let through, when it
 		// was not stopped: see occludedBy.
 		vec3 shadowTint = vec3(1.0);
@@ -2003,6 +2073,9 @@ static std::string TraceCommon()
 					if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 					{
 						ivec2 candidate = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, false), rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+						// Through smoke and sparks without counting them.
+						if (additiveGlow(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), candidate.y))
+							continue;
 						bool seen = false;
 						for (uint p = 0u; p < passedCount; p++)
 							seen = seen || passed[p] == candidate;
@@ -2260,7 +2333,8 @@ std::string Shaders::Trace()
 			vec3 throughput = vec3(1.0);
 			// Passing through a translucent surface is not a bounce: a window
 			// with a pane and a frame would otherwise use up the ray's budget
-			// before it reached anything solid.
+			// before it reached anything solid. Up to sixteen of them; glows
+			// (glowAlong) are not passed one by one and do not count.
 			uint passes = 0u;
 			// How far along the ray to start looking. Generous for a bounce off
 			// a surface, because these levels are big and a surface acne
@@ -2399,6 +2473,9 @@ std::string Shaders::Trace()
 					// the weapon at the player's eyes nor its own camera.
 					uint cullMask = (lobePass == 0 && bounce == 0u) ? ((Disable & 32768u) != 0u ? WindowRays : ViewRays) : BouncedRays;
 					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, cullMask, origin, rayMin, direction, 100000.0);
+					// Glows are never stopped at: those before the next thing
+					// the ray does stop at are summed afterwards (glowAlong).
+					bool glowsMet = false;
 					while (rayQueryProceedEXT(rq))
 					{
 						// Only geometry holding masked or translucent art is
@@ -2407,6 +2484,11 @@ std::string Shaders::Trace()
 						if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 						{
 							ivec2 candidate = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, false), rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+							if (additiveGlow(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), candidate.y))
+							{
+								glowsMet = true;
+								continue;
+							}
 							bool passed = false;
 							for (uint p = 0u; p < passedCount; p++)
 								passed = passed || passedLayers[p] == candidate;
@@ -2417,6 +2499,17 @@ std::string Shaders::Trace()
 									false, direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
 								rayQueryConfirmIntersectionEXT(rq);
 						}
+					}
+
+					if (glowsMet)
+					{
+						bool glowChanged = false;
+						float reach = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 100000.0 : rayQueryGetIntersectionTEXT(rq, true);
+						radiance += throughput * glowAlong(origin, direction, rayMin, reach, cullMask, coneWidth, coneSpread, bounce > firstBounce, glowChanged);
+						// The pixel records what lies behind them as what it
+						// sees, so one arriving would otherwise fade in.
+						if (bounce == 0u && glowChanged)
+							primaryChanged = true;
 					}
 
 					if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
@@ -2546,7 +2639,7 @@ std::string Shaders::Trace()
 							// skybox - a small room close by - as wide as the
 							// window's distance made it, and blurred the skyline.
 							coneWidth = 0.0;
-							if (passes < 8u)
+							if (passes < 16u)
 							{
 								passes++;
 								bounce--;
@@ -2626,12 +2719,21 @@ std::string Shaders::Trace()
 									direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true)));
 						}
 
+						// Whatever was passed before lies behind the new start
+						// and cannot be met again, unless it was in the same
+						// plane: only those need refusing. Past eight of them
+						// in one plane - blood on blood - the ray steps on past
+						// it rather than meet the ninth over and over.
+						if (t > 0.05)
+							passedCount = 0u;
 						origin = position;
 						rayMin = 0.0;
 						if (passedCount < 8u)
 							passedLayers[passedCount++] = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, true), primitive);
+						else
+							rayMin = 0.01;
 						passingThrough = true;
-						if (passes < 8u)
+						if (passes < 16u)
 						{
 							passes++;
 							bounce--;
