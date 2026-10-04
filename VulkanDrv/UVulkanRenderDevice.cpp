@@ -2882,7 +2882,8 @@ void UVulkanRenderDevice::PrecacheTexture(FTextureInfo& Info, DWORD PolyFlags)
 void UVulkanRenderDevice::ClearTextureCache()
 {
 	// Frames still in flight sample these textures
-	vkDeviceWaitIdle(Device->device);
+	if (Device)
+		vkDeviceWaitIdle(Device->device);
 	DescriptorSets->ClearCache();
 	Textures->ClearCache();
 	Uploads->ClearCache();

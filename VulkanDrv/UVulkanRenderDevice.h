@@ -346,6 +346,8 @@ inline ivec4 UVulkanRenderDevice::GetTextureIndexes(DWORD PolyFlags, CachedTextu
 	if (DescriptorSets->IsTextureArrayFull())
 	{
 		FlushDrawBatchAndWait();
+		// Frames still in flight read the descriptors about to be rewritten
+		vkDeviceWaitIdle(Device->device);
 		DescriptorSets->ClearCache();
 		Textures->ClearAllBindlessIndexes();
 	}
