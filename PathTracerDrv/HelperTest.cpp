@@ -7,7 +7,7 @@
 // semaphores. What it cannot check is the engine's end - LevelScene and the
 // textures - which only the game can.
 //
-//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--fsr quality] [--still]
+//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--fsr quality] [--still] [--pan d] [--pan-angle a]
 //                            [--lightsize radius] [--reference] [--backlight]
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
@@ -54,6 +54,11 @@
 // change of size - and reports how much the picture changes from one frame
 // to the next over the last quarter of them: with nothing moving, what is
 // left is noise and shimmer, which is what a wrong jitter shows up as.
+//
+// --pan d holds the scene still but takes the eye round the box, d degrees
+// a frame (from --pan-angle a, which with --reference gives the picture a pan
+// should end on): what an upscaler makes of a moving camera, which --still
+// cannot show - its depth and motion going missing look fine held still.
 //
 // --lightsize casts shadows from a disc of that radius around the light
 // rather than from its centre (the game's LightSize). --reference holds the
@@ -234,6 +239,7 @@ int main(int argc, char** argv)
 	bool neutral = false;
 	int sprites = 0;
 	bool headset = false, realHeadset = false;
+	float panStep = 0.0f, panAngle = 0.0f;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -242,6 +248,13 @@ int main(int argc, char** argv)
 			fsr = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--still"))
 			still = true;
+		else if (!strcmp(argv[i], "--pan") && i + 1 < argc)
+		{
+			panStep = (float)atof(argv[++i]);
+			still = true;
+		}
+		else if (!strcmp(argv[i], "--pan-angle") && i + 1 < argc)
+			panAngle = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "--lightsize") && i + 1 < argc)
 			lightSize = (uint32_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--reference"))
@@ -675,7 +688,15 @@ int main(int argc, char** argv)
 
 		// The camera, as the render device builds it: right and "up" - which
 		// points down the screen - scaled to the view's half extents.
-		const vec3 eye(0, -700, 260), target(0, 0, 80);
+		const vec3 eye0(0, -700, 260), target(0, 0, 80);
+		// --pan: the eye goes round the box, that many degrees a frame, from
+		// --pan-angle; everything else still.
+		auto eyeAt = [&](int i) {
+			const float a = (panAngle + panStep * (float)i) * 3.14159265f / 180.0f;
+			return vec3(target.x + (eye0.x - target.x) * std::cos(a) - (eye0.y - target.y) * std::sin(a),
+				target.y + (eye0.x - target.x) * std::sin(a) + (eye0.y - target.y) * std::cos(a), eye0.z);
+		};
+		const vec3 eye = eyeAt(0);
 		const vec3 forward = Normalized(vec3(target.x - eye.x, target.y - eye.y, target.z - eye.z));
 		const vec3 right = Normalized(Cross(forward, vec3(0, 0, 1)));
 		const vec3 down = Cross(forward, right);
@@ -919,6 +940,22 @@ int main(int argc, char** argv)
 			client.Instances(instances, 1);
 			client.Lights(lights, fogLights);
 			frame.Frame = (uint32_t)i;
+			if (panStep != 0.0f)
+			{
+				for (int c = 0; c < 4; c++)
+					frame.PreviousCamera[c] = frame.Camera[c];
+				const vec3 e = eyeAt(i);
+				const vec3 f = Normalized(vec3(target.x - e.x, target.y - e.y, target.z - e.z));
+				const vec3 r = Normalized(Cross(f, vec3(0, 0, 1)));
+				const vec3 d = Cross(f, r);
+				frame.Camera[0] = vec4(e.x, e.y, e.z, 1.0f);
+				frame.Camera[1] = vec4(r.x * halfWidth, r.y * halfWidth, r.z * halfWidth, 0.0f);
+				frame.Camera[2] = vec4(d.x * halfWidth * aspect, d.y * halfWidth * aspect, d.z * halfWidth * aspect, 0.0f);
+				frame.Camera[3] = vec4(f.x, f.y, f.z, 0.0f);
+				if (i == 0)
+					for (int c = 0; c < 4; c++)
+						frame.PreviousCamera[c] = frame.Camera[c];
+			}
 			if (!still && i == frames / 2)
 			{
 				frame.Width = width * 3 / 2;

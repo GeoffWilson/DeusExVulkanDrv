@@ -26,6 +26,13 @@ struct FsrUpscaler::Impl
 		FfxFsr3UpscalerContext Context = {};
 		bool Made = false;
 		uint32_t Render[2] = {}, Output[2] = {};
+		// Where FSR keeps the depth and motion it has prepared, each pixel's
+		// taken from the nearest of its neighbours, and the depth last frame
+		// reprojected: 3.1 calls these shared resources, for frame generation
+		// to read after it, and leaves them to the caller. Without them its
+		// passes write to nothing and read back nothing - no motion and no
+		// depth - and in motion its history never lines up.
+		std::unique_ptr<VulkanImage> DilatedDepth, DilatedMotion, PreviousDepth;
 	};
 	View Views[MaxViews];
 };
@@ -95,6 +102,9 @@ void FsrUpscaler::ReleaseContext(int view)
 	if (v.Made)
 		ffxFsr3UpscalerContextDestroy(&v.Context);
 	v.Made = false;
+	v.DilatedDepth.reset();
+	v.DilatedMotion.reset();
+	v.PreviousDepth.reset();
 }
 
 bool FsrUpscaler::NeedsContext(int view, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight) const
@@ -149,6 +159,22 @@ bool FsrUpscaler::Evaluate(VulkanCommandBuffer* commands, int view, const Inputs
 			return false;
 		}
 		v.Made = true;
+		auto image = [&](VkFormat format, const char* name)
+		{
+			return ImageBuilder()
+				.Format(format)
+				.Size(renderWidth, renderHeight)
+				.Usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+				.DebugName(name)
+				.Create(Device);
+		};
+		v.DilatedDepth = image(VK_FORMAT_R32_SFLOAT, "PathTracerFsrDilatedDepth");
+		v.DilatedMotion = image(VK_FORMAT_R16G16_SFLOAT, "PathTracerFsrDilatedMotion");
+		v.PreviousDepth = image(VK_FORMAT_R32_UINT, "PathTracerFsrPreviousDepth");
+		PipelineBarrier barrier;
+		for (VulkanImage* made : { v.DilatedDepth.get(), v.DilatedMotion.get(), v.PreviousDepth.get() })
+			barrier.AddImage(made, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+		barrier.Execute(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 		v.Render[0] = renderWidth;
 		v.Render[1] = renderHeight;
 		v.Output[0] = outputWidth;
@@ -163,6 +189,9 @@ bool FsrUpscaler::Evaluate(VulkanCommandBuffer* commands, int view, const Inputs
 	dispatch.depth = Resource(inputs.Depth, renderWidth, renderHeight, false, L"PathTracerFsrDepth");
 	dispatch.motionVectors = Resource(inputs.Motion, renderWidth, renderHeight, false, L"PathTracerFsrMotion");
 	dispatch.output = Resource(inputs.Output, outputWidth, outputHeight, true, L"PathTracerFsrOutput");
+	dispatch.dilatedDepth = Resource({ v.DilatedDepth.get(), VK_FORMAT_R32_SFLOAT }, renderWidth, renderHeight, true, L"PathTracerFsrDilatedDepth");
+	dispatch.dilatedMotionVectors = Resource({ v.DilatedMotion.get(), VK_FORMAT_R16G16_SFLOAT }, renderWidth, renderHeight, true, L"PathTracerFsrDilatedMotion");
+	dispatch.reconstructedPrevNearestDepth = Resource({ v.PreviousDepth.get(), VK_FORMAT_R32_UINT }, renderWidth, renderHeight, true, L"PathTracerFsrPreviousDepth");
 	// Told the picture moved the other way from the rays, as DLSS is: both
 	// take the jitter as the projection's offset. Measured: a still scene
 	// changed 0.0002 a frame this way round and 0.0005 the other

@@ -874,7 +874,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   it. Says whether it is running, and why not when NRD stands in. With VR on,
   the quality is the headset's (`VRDLSSQuality`).
 - `PT FSR [OFF | AUTO | ON]`: FSR never, where Ray Reconstruction cannot run,
-  or always; on its own, from one to the next. Its quality is `PT DLSS`'s.
+  or always, in Ray Reconstruction's place even where it could run; on its own,
+  from one to the next. Its quality is `PT DLSS`'s.
 - `PT LIGHTING [ENGINE | LINEAR]`: the level lit as `Lighting` says, or the
   other way.
 - `PT EXPOSURE n`, `PT TONEMAP`: the exposure, as `Exposure`, and the tone

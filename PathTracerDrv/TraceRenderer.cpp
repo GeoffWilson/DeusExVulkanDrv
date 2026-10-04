@@ -869,8 +869,9 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	// Which denoiser. Ray Reconstruction is started the first time it is
 	// asked for, and where it cannot run - no NVIDIA GPU, an old driver, wine
 	// without the pieces NGX needs - NRD stands in for it. PT VIEW shows the
-	// trace's own parts, so it takes neither.
-	const bool wantRr = frame.Denoise == DenoiseDlss && frame.ViewMode == 0;
+	// trace's own parts, so it takes neither. FSR asked for always (PT FSR
+	// ON) takes its place even where it could run.
+	const bool wantRr = frame.Denoise == DenoiseDlss && frame.ViewMode == 0 && frame.Upscaler != UpscaleAlways;
 	if (wantRr && !RrTried)
 	{
 		RrTried = true;
