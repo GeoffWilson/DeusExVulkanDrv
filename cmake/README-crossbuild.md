@@ -116,6 +116,26 @@ afterwards and CMake reports `PathTracerHelper: denoising with NRD`; without it
 the helper builds without the denoiser and `PT DENOISE` says it is missing.
 `Denoise=False` in the device's ini section turns it off at startup.
 
+### FSR 3.1
+
+For GPUs Ray Reconstruction cannot run on, the helper can upscale NRD's
+picture with AMD's FSR 3.1, built in from FidelityFX SDK v1.1.4 - the last
+with a Vulkan backend; the FSR 4 SDKs are DirectX 12 only. Fetch it once,
+before configuring:
+
+```sh
+cmake/fetch-fsr.sh          # into ../.fsr, beside .xwin; needs wine
+```
+
+The script takes the SDK's `sdk` folder alone, at the pinned tag, and runs
+its shader compiler (`FidelityFX_SC.exe`, under wine) over FSR 3.1's ten
+passes as the SDK's own build does, into `../.fsr/generated`. Configure
+`build-x64` (and `build-ut469-x64`) afterwards and CMake reports
+`PathTracerHelper: FSR 3.1`. The upscaler, the Vulkan backend and what they
+share are built as `ffx_fsr3upscaler.lib`, against ZVulkan's Vulkan headers,
+with `volk/volk.h` forced in so the backend's own Vulkan calls go through
+volk. `PathTracerHelperTest --fsr quality` runs it on any GPU.
+
 ### DLSS Ray Reconstruction
 
 The helper can also denoise with NVIDIA's DLSS Ray Reconstruction, when the

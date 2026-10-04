@@ -656,6 +656,14 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   run; on by default, at Quality. `DLSSQuality` is how far it upscales: 0 DLAA
   (not at all), 1 Quality, 2 Balanced, 3 Performance, 4 Ultra Performance.
   `PT DLSS` switches it for the session.
+- `FSR`: AMD's FSR 3.1 upscaler. Where Ray Reconstruction cannot run - any AMD
+  or Intel GPU - the trace and NRD run at the size `DLSSQuality` gives and FSR
+  brings the picture up to the screen's, at the same ratios (0 native, 1
+  Quality 1.5x, 2 Balanced 1.7x, 3 Performance 2x, 4 Ultra Performance 3x).
+  0 never, 1 where Ray Reconstruction cannot run (the default), 2 always, in
+  its place. `FSRSharpness`, 0 to 1, sharpens what it gives; 0.2 by default.
+  On the Steam Machine (Navi 33) at 1080p it took the test scene from 20.2 ms
+  a frame to 10.0 at Quality and 6.0 at Performance.
 - `LogTimings`: logs where each frame's time goes, averaged every few hundred
   frames: the CPU's side and the helper's, the GPU's own time on the scene
   build, the trace, the denoiser and the pass that puts the picture back
@@ -865,6 +873,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
   it. Says whether it is running, and why not when NRD stands in. With VR on,
   the quality is the headset's (`VRDLSSQuality`).
+- `PT FSR [OFF | AUTO | ON]`: FSR never, where Ray Reconstruction cannot run,
+  or always; on its own, from one to the next. Its quality is `PT DLSS`'s.
 - `PT LIGHTING [ENGINE | LINEAR]`: the level lit as `Lighting` says, or the
   other way.
 - `PT EXPOSURE n`, `PT TONEMAP`: the exposure, as `Exposure`, and the tone
@@ -1005,8 +1015,10 @@ redistributed here. `cmake/build-nrd.sh` fetches a pinned NRD release and builds
 it as a 64 bit library for the helper (and a 32 bit one as well), and
 `cmake/fetch-dlss.sh` fetches a pinned release of the DLSS SDK: NGX's loader,
 which the helper links, and Ray Reconstruction's runtime, `nvngx_dlssd.dll`,
-which goes beside it. Without either the path tracer still builds and runs,
-just without that denoiser. See
+which goes beside it. `cmake/fetch-fsr.sh` fetches AMD's FidelityFX SDK v1.1.4
+and compiles FSR 3.1's shaders, which the helper builds in. Without any of
+them the path tracer still builds and runs, just without that denoiser or
+upscaler. See
 [cmake/README-crossbuild.md](cmake/README-crossbuild.md).
 
 ## PathTracerDrv in Unreal Tournament

@@ -35,7 +35,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 22;
+	static const uint32_t Version = 23;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -44,6 +44,22 @@ namespace TraceProtocol
 		DenoiseNrd = 1,
 		// DLSS Ray Reconstruction, and NRD wherever it cannot run.
 		DenoiseDlss = 2,
+		// Reported only (Header's DenoisedWith): NRD at the render size, and
+		// FSR 3.1 bringing the picture up to the output's.
+		DenoiseNrdFsr = 3,
+	};
+
+	// TraceCommand::Upscaler: whether NRD's picture is traced at a fraction
+	// of the output's size and AMD's FSR 3.1 brings it up to it, at the
+	// DlssQuality's ratio.
+	enum UpscalerChoice : uint32_t
+	{
+		UpscaleNone = 0,
+		// Where Ray Reconstruction was asked for and cannot run: an AMD or
+		// Intel GPU, a missing NGX.
+		UpscaleWithoutRr = 1,
+		// Always, NRD and FSR in place of Ray Reconstruction.
+		UpscaleAlways = 2,
 	};
 
 	// The output image, as both sides must create it for the one allocation to
@@ -343,6 +359,8 @@ namespace TraceProtocol
 		float Exposure;
 		float SkyIntensity;
 		uint32_t DlssQuality;       // 0 DLAA, 1 quality, 2 balanced, 3 performance, 4 ultra performance
+		uint32_t Upscaler;          // an UpscalerChoice
+		float UpscaleSharpness;     // FSR's sharpening, 0 none to 1
 		uint32_t LightSize;         // radius shadows are cast from around each light, in world units; 0 a point
 		uint32_t MaxAnisotropy;     // most samples the texture filter takes along a footprint; 1 or less, none
 		// 1 when the level's surfaces take their lights as the engine's

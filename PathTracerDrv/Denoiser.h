@@ -55,6 +55,9 @@ public:
 	{
 		vec3 Origin, Right, Up, Forward;
 		vec2 Shift = vec2(0.0f, 0.0f);
+		// Where within their pixels the primary rays went, -0.5..0.5 pixels:
+		// nothing but for an upscaler, which wants them spread (FSR).
+		vec2 Jitter = vec2(0.0f, 0.0f);
 	};
 
 	// The trace's images for one signal, all in GENERAL layout.

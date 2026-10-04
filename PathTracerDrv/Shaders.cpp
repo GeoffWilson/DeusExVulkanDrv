@@ -157,7 +157,7 @@ static std::string TraceCommon()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 2097152 every light in a cell weighed, 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass
+			uint Disable;         // diagnostic switches: 2097152 every light in a cell weighed, 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass, 4194304 the frame's jitter for an upscaler
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 	)";
@@ -2405,11 +2405,12 @@ std::string Shaders::Trace()
 
 			// Jitter inside the pixel: this is the whole of the antialiasing,
 			// and it costs nothing because the samples are being averaged anyway.
-			// For Ray Reconstruction it is one offset for the whole frame, the
-			// one it is told: it rebuilds detail finer than a pixel from frames
-			// sampled at known, evenly spread offsets, and a random one per
-			// pixel would be a lie about where each sample was taken.
-			vec2 jitter = (Disable & 256u) != 0u ? frameJitter.xy + vec2(0.5) : vec2(randomFloat(), randomFloat());
+			// For an upscaler - Ray Reconstruction, FSR (Disable bit 4194304) -
+			// it is one offset for the whole frame, the one it is told: it
+			// rebuilds detail finer than a pixel from frames sampled at known,
+			// evenly spread offsets, and a random one per pixel would be a lie
+			// about where each sample was taken.
+			vec2 jitter = (Disable & 4194304u) != 0u ? frameJitter.xy + vec2(0.5) : vec2(randomFloat(), randomFloat());
 			vec2 uv = (vec2(pixel) + jitter) / vec2(size) * 2.0 - 1.0;
 
 			vec3 origin = CameraOrigin.xyz;
@@ -3582,11 +3583,15 @@ std::string Shaders::Composite()
 		layout(binding = 6, rgba16f) uniform readonly image2D fogImage;
 		layout(binding = 7, rgba16f) uniform readonly image2D glossAlbedoImage;
 		layout(binding = 8, rgba16f) uniform readonly image2D glossImage;      // glossy reflection, denoised
+		layout(binding = 9, rgba32f) uniform readonly image2D guideDepthMotionImage;   // view z, motion in screens
+		layout(binding = 10, r32f) uniform writeonly image2D upscaleDepthImage;
+		layout(binding = 11, rg16f) uniform writeonly image2D upscaleMotionImage;
 
 		layout(push_constant) uniform PushConstants
 		{
 			vec4 Flash;      // x the picture's scale, yzw the flash colour
 			vec4 Finish;     // x exposure, y 1 when there are glossy reflections to add, z 1 for the neutral tone curve, w its ceiling (toneMap)
+			vec4 Upscale;    // x 1 when FSR takes the picture up to size, y the near plane its depth is written against
 		};
 	)" + ToneMapGlsl() + R"(
 
@@ -3621,6 +3626,16 @@ std::string Shaders::Composite()
 
 			mapped = Flash.yzw + mapped * Flash.x;
 			imageStore(outImage, pixel, vec4(mapped, 1.0));
+
+			// For FSR, beside the picture: the depth as near over the view's
+			// z, so the nearer the larger and nothing beyond reach of it -
+			// inverted and infinite - and the motion as the trace has it.
+			if (Upscale.x > 0.5)
+			{
+				vec4 depthMotion = imageLoad(guideDepthMotionImage, pixel);
+				imageStore(upscaleDepthImage, pixel, vec4(clamp(Upscale.y / max(depthMotion.x, Upscale.y), 0.0, 1.0)));
+				imageStore(upscaleMotionImage, pixel, vec4(depthMotion.yz, 0.0, 0.0));
+			}
 		}
 	)";
 }

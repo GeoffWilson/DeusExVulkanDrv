@@ -454,6 +454,10 @@ void Denoiser::Denoise(VulkanCommandBuffer* commands, const Inputs (&allInputs)[
 	ViewToClip(previous, common.viewToClipMatrixPrev);
 	WorldToView(now, common.worldToViewMatrix);
 	WorldToView(previous, common.worldToViewMatrixPrev);
+	common.cameraJitter[0] = now.Jitter.x;
+	common.cameraJitter[1] = now.Jitter.y;
+	common.cameraJitterPrev[0] = previous.Jitter.x;
+	common.cameraJitterPrev[1] = previous.Jitter.y;
 	common.motionVectorScale[0] = 1.0f;
 	common.motionVectorScale[1] = 1.0f;
 	common.motionVectorScale[2] = 0.0f;

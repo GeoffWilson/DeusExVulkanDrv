@@ -5,6 +5,7 @@
 #include "Denoiser.h"
 #include "FrameUploads.h"
 #include "RayReconstruction.h"
+#include "FsrUpscaler.h"
 #include "Shaders.h"
 #include <stdexcept>
 
@@ -276,12 +277,12 @@ void TraceRenderer::CreateFinishPipeline()
 void TraceRenderer::CreateCompositePipeline()
 {
 	DescriptorSetLayoutBuilder layout;
-	for (int i = 0; i < 9; i++)
+	for (int i = 0; i < 12; i++)
 		layout.AddBinding(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
 	CompositeLayout = layout.DebugName("PathTracerCompositeSetLayout").Create(Device);
 
 	CompositePool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 * MaxViews)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12 * MaxViews)
 		.MaxSets(MaxViews)
 		.DebugName("PathTracerCompositePool")
 		.Create(Device);
@@ -290,7 +291,7 @@ void TraceRenderer::CreateCompositePipeline()
 
 	CompositePipelineLayout = PipelineLayoutBuilder()
 		.AddSetLayout(CompositeLayout.get())
-		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vec4) * 2)
+		.AddPushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vec4) * 3)
 		.DebugName("PathTracerCompositePipelineLayout")
 		.Create(Device);
 
@@ -526,7 +527,7 @@ void TraceRenderer::RecordTexturePixels(VulkanCommandBuffer* commands, FrameUplo
 // A view's images: the trace's at the render size, the picture at the output
 // size - the same two sizes unless Ray Reconstruction is upscaling - and its
 // own images when it is in use.
-void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, int outputHeight, bool forRayReconstruction)
+void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, int outputHeight, bool forRayReconstruction, bool forFsr)
 {
 	Context->WaitForGpu();
 
@@ -551,6 +552,8 @@ void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, i
 	view.RrMotionImage.reset();
 	view.RrOutputView.reset();
 	view.RrOutputImage.reset();
+	view.FsrColorView.reset();
+	view.FsrColorImage.reset();
 
 	auto makeImage = [&](std::unique_ptr<VulkanImage>& image, std::unique_ptr<VulkanImageView>& imageView, VkFormat format, int w, int h, VkImageUsageFlags usage, const char* name)
 	{
@@ -610,6 +613,10 @@ void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, i
 		makeImage(view.RrColorImage, view.RrColorView, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, rrUsage, "PathTracerRrColor");
 		makeImage(view.RrOutputImage, view.RrOutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight, rrUsage, "PathTracerRrOutput");
 	}
+	// FSR's input: the picture finished at the render size. Its depth and
+	// motion go in the Rr images above.
+	if (forFsr)
+		makeImage(view.FsrColorImage, view.FsrColorView, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, rrUsage, "PathTracerFsrColor");
 
 	if (view.Denoise)
 	{
@@ -631,6 +638,7 @@ void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, i
 	view.OutputWidth = outputWidth;
 	view.OutputHeight = outputHeight;
 	view.TracingForRr = forRayReconstruction;
+	view.TracingForFsr = forFsr;
 	DescriptorsDirty = true;
 
 	// Everything starts undefined and the shaders use it as GENERAL.
@@ -638,7 +646,7 @@ void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, i
 	{
 		StartCleared(cmd, view.AccumImage.get(), view.HistoryImage.get());
 		PipelineBarrier barrier;
-		for (VulkanImage* image : { view.OutputImage.get(), view.RrDepthImage.get(), view.RrMotionImage.get(), view.RrColorImage.get(), view.RrOutputImage.get() })
+		for (VulkanImage* image : { view.OutputImage.get(), view.RrDepthImage.get(), view.RrMotionImage.get(), view.RrColorImage.get(), view.RrOutputImage.get(), view.FsrColorImage.get() })
 			if (image)
 				barrier.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
 		for (int i = 0; i < GuideImageCount; i++)
@@ -697,7 +705,8 @@ void TraceRenderer::WriteCompositeDescriptors(View& view)
 
 	VulkanDescriptorSet* set = view.CompositeSet.get();
 	WriteDescriptors()
-		.AddStorageImage(set, 0, view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		// The picture, or with FSR its input at the render size.
+		.AddStorageImage(set, 0, view.TracingForFsr && view.FsrColorView ? view.FsrColorView.get() : view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(set, 1, view.GuideViews[4].get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(set, 2, view.GuideViews[5].get(), VK_IMAGE_LAYOUT_GENERAL)
 		.AddStorageImage(set, 3, view.GuideViews[6].get(), VK_IMAGE_LAYOUT_GENERAL)
@@ -707,6 +716,11 @@ void TraceRenderer::WriteCompositeDescriptors(View& view)
 		.AddStorageImage(set, 7, view.GuideViews[11].get(), VK_IMAGE_LAYOUT_GENERAL)
 		// Never read without materials, but a descriptor still has to be valid.
 		.AddStorageImage(set, 8, view.Denoise->SpecularOutput() ? view.Denoise->SpecularOutput() : view.GuideViews[10].get(), VK_IMAGE_LAYOUT_GENERAL)
+		// What FSR reads beside the picture: the trace's depth and motion,
+		// and where they are written for it.
+		.AddStorageImage(set, 9, view.GuideViews[1].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 10, view.RrDepthView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 11, view.RrMotionView.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.Execute(Device);
 }
 
@@ -752,7 +766,9 @@ void TraceRenderer::UpdateDescriptors()
 			.AddStorageImage(view.ImageSet.get(), 0, view.AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
 			// With Ray Reconstruction the trace's picture is its input, at the
 			// render size; otherwise it is the picture.
-			.AddStorageImage(view.ImageSet.get(), 1, view.TracingForRr ? view.RrColorView.get() : view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			// With FSR, it is at the render size too, and the composite
+			// finishes it there.
+			.AddStorageImage(view.ImageSet.get(), 1, view.TracingForRr ? view.RrColorView.get() : view.TracingForFsr ? view.FsrColorView.get() : view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
 			.AddStorageImage(view.ImageSet.get(), 2, view.HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
 			.AddStorageImage(set, 23, view.RrDepthView.get(), VK_IMAGE_LAYOUT_GENERAL)
 			.AddStorageImage(set, 24, view.RrMotionView.get(), VK_IMAGE_LAYOUT_GENERAL)
@@ -869,6 +885,20 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	const bool wantNrd = frame.Denoise == DenoiseNrd || (frame.Denoise == DenoiseDlss && !useRr);
 	const int quality = (int)std::min(frame.DlssQuality, 4u);
 
+	// FSR over NRD's picture: where Ray Reconstruction was asked for and
+	// cannot run - an AMD GPU above all - or always when the device says so,
+	// at the same quality's ratio. It wants a denoised picture, so not
+	// without NRD.
+	const bool wantFsr = !useRr && wantNrd && !DenoiseFailed && frame.ViewMode == 0 &&
+		(frame.Upscaler == UpscaleAlways || (frame.Upscaler == UpscaleWithoutRr && frame.Denoise == DenoiseDlss));
+	if (wantFsr && !FsrTried)
+	{
+		FsrTried = true;
+		Fsr.reset(new FsrUpscaler(Device));
+		debugf("PathTracer FSR: %s", Fsr->Status());
+	}
+	const bool useFsr = wantFsr && Fsr && Fsr->Available();
+
 	// The views: the screen's, or the headset's eyes. Going from one to the
 	// other, every view's history describes some other view.
 	const int viewCount = eyes ? 2 : 1;
@@ -887,9 +917,11 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		uint32_t renderWidth = width, renderHeight = height;
 		if (useRr)
 			Rr->RenderSize(width, height, quality, renderWidth, renderHeight);
+		else if (useFsr)
+			FsrUpscaler::RenderSize(width, height, quality, renderWidth, renderHeight);
 		if ((int)renderWidth != view.TraceWidth || (int)renderHeight != view.TraceHeight ||
-			(int)width != view.OutputWidth || (int)height != view.OutputHeight || useRr != view.TracingForRr)
-			Resize(view, (int)renderWidth, (int)renderHeight, (int)width, (int)height, useRr);
+			(int)width != view.OutputWidth || (int)height != view.OutputHeight || useRr != view.TracingForRr || useFsr != view.TracingForFsr)
+			Resize(view, (int)renderWidth, (int)renderHeight, (int)width, (int)height, useRr, useFsr);
 
 		if (frame.RestartDenoiser)
 			view.DenoiseRestart = true;
@@ -905,7 +937,19 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 				Context->WaitForGpu();
 				break;
 			}
-	const vec2 jitter = useRr ? RayReconstruction::Jitter(frame.Frame) : vec2(0.0f, 0.0f);
+	if (useFsr)
+		for (int v = 0; v < viewCount; v++)
+			if (Fsr->NeedsContext(v, Views[v].TraceWidth, Views[v].TraceHeight, Views[v].OutputWidth, Views[v].OutputHeight))
+			{
+				Context->WaitForGpu();
+				break;
+			}
+	// Where within its pixel each primary ray goes: anywhere, each its own
+	// way, unless an upscaler is putting the frames together, which wants
+	// the whole frame offset the same way, by a sequence it knows.
+	const vec2 jitter = useRr ? RayReconstruction::Jitter(frame.Frame)
+		: useFsr ? FsrUpscaler::Jitter(frame.Frame, (uint32_t)Views[0].TraceWidth, (uint32_t)Views[0].OutputWidth)
+		: vec2(0.0f, 0.0f);
 
 	const auto now = std::chrono::steady_clock::now();
 	float frameMs = 16.0f;
@@ -1005,7 +1049,8 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		PushConstants.CameraRight = vec4(camera[1].x, camera[1].y, camera[1].z, frame.Camera[1].w);
 		PushConstants.CameraUp = vec4(camera[2].x, camera[2].y, camera[2].z, frame.Camera[2].w);
 		PushConstants.CameraForward = vec4(camera[3].x, camera[3].y, camera[3].z, frame.Camera[3].w);
-		PushConstants.Disable = frame.DisableBits | ((frame.ViewMode || nrdFor(Views[v])) ? 64u : 0u) | (frame.Materials ? 0u : 128u) | (useRr ? 256u : 0u);
+		PushConstants.Disable = frame.DisableBits | ((frame.ViewMode || nrdFor(Views[v])) ? 64u : 0u) | (frame.Materials ? 0u : 128u) | (useRr ? 256u : 0u) |
+			((useRr || useFsr) ? 4194304u : 0u);
 	};
 	setCamera(0);
 	PushConstants.Counts[0] = frame.Frame;
@@ -1100,17 +1145,54 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 			inputs[1].ViewZ = view.GuideViews[9].get();
 			inputs[1].Motion = view.ReflectionMotionView.get();
 			inputs[1].Diffuse = view.GuideViews[3].get();
-			view.Denoise->Denoise(commands, inputs, cameraOf(camera, shift), cameraOf(previousCamera, previousShift), view.DenoiseRestart, slot);
+			Denoiser::Camera now = cameraOf(camera, shift);
+			Denoiser::Camera then = cameraOf(previousCamera, previousShift);
+			now.Jitter = jitter;
+			then.Jitter = view.LastJitter;
+			const bool restart = view.DenoiseRestart;
+			view.Denoise->Denoise(commands, inputs, now, then, restart, slot);
 			view.DenoiseRestart = false;
 
-			struct { vec4 Flash; vec4 Exposure; } finish;
+			// With FSR, the picture is finished at the render size, and the
+			// composite writes FSR's depth - as near / z - and motion too.
+			const float fsrNear = 1.0f;
+			struct { vec4 Flash; vec4 Exposure; vec4 Upscale; } finish;
 			finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
 			finish.Exposure = vec4(frame.Exposure, view.Denoise->HasSpecular() ? 1.0f : 0.0f, (frame.DisableBits & 8192u) ? 1.0f : 0.0f, std::max(frame.ToneCeiling, 1.0f));
+			finish.Upscale = vec4(view.TracingForFsr ? 1.0f : 0.0f, fsrNear, 0.0f, 0.0f);
 			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
 			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, view.CompositeSet.get());
 			commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
 			commands->dispatch((view.TraceWidth + 7) / 8, (view.TraceHeight + 7) / 8, 1);
 			denoisedWith = DenoiseNrd;
+
+			if (view.TracingForFsr && useFsr)
+			{
+				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+				auto target = [](const std::unique_ptr<VulkanImage>& image, VkFormat format)
+				{
+					FsrUpscaler::Target t;
+					t.Image = image.get();
+					t.Format = (int)format;
+					return t;
+				};
+				FsrUpscaler::Inputs fsrInputs;
+				fsrInputs.Color = target(view.FsrColorImage, VK_FORMAT_R16G16B16A16_SFLOAT);
+				fsrInputs.Depth = target(view.RrDepthImage, VK_FORMAT_R32_SFLOAT);
+				fsrInputs.Motion = target(view.RrMotionImage, VK_FORMAT_R16G16_SFLOAT);
+				fsrInputs.Output = target(view.OutputImage, VK_FORMAT_R16G16B16A16_SFLOAT);
+				// The view's height across, as the camera's up vector is
+				// scaled to the half height at a unit's distance.
+				const vec3 up(camera[2].x, camera[2].y, camera[2].z);
+				const float fovY = 2.0f * std::atan(length(up));
+				if (Fsr->Evaluate(commands, v, fsrInputs, view.TraceWidth, view.TraceHeight, view.OutputWidth, view.OutputHeight,
+					jitter, restart, frameMs, fsrNear, fovY, frame.UnitsPerMetre > 0.0f ? frame.UnitsPerMetre : 52.5f, frame.UpscaleSharpness))
+					denoisedWith = DenoiseNrdFsr;
+				VkMemoryBarrier upscaled = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+				upscaled.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+				upscaled.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &upscaled, 0, nullptr, 0, nullptr);
+			}
 		}
 		else if (useRr)
 		{
@@ -1157,6 +1239,8 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 			denoisedWith = reconstructed ? DenoiseDlss : DenoiseOff;
 		}
 	}
+	for (int v = 0; v < viewCount; v++)
+		Views[v].LastJitter = jitter;
 	stamp(3);
 	LastDenoiser = denoisedWith;
 	lap(8);
@@ -1314,7 +1398,7 @@ void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProto
 		constants.CameraRight = vec4(view.Camera[1].x, view.Camera[1].y, view.Camera[1].z, 0.0f);
 		constants.CameraUp = vec4(view.Camera[2].x, view.Camera[2].y, view.Camera[2].z, 0.0f);
 		constants.CameraForward = vec4(view.Camera[3].x, view.Camera[3].y, view.Camera[3].z, 0.0f);
-		constants.Disable = (constants.Disable & ~(64u | 256u)) | 32768u;
+		constants.Disable = (constants.Disable & ~(64u | 256u | 4194304u)) | 32768u;
 		constants.Counts[2] &= 0x00ffffffu;
 		constants.Counts[3] = fresh ? 0u : view.AccumulatedFrames;
 		constants.Params.w = 0.0f;

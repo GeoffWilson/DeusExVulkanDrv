@@ -11,6 +11,7 @@ class AccelStructure;
 class Denoiser;
 class FrameUploads;
 class RayReconstruction;
+class FsrUpscaler;
 class WriteDescriptors;
 namespace TraceProtocol { struct TraceCommand; }
 
@@ -166,6 +167,15 @@ private:
 		// The images are laid out for Ray Reconstruction: the trace writes its
 		// picture into RrColorImage at the render size rather than into Output.
 		bool TracingForRr = false;
+		// Or for FSR: the trace and NRD at the render size, the composite
+		// finishing the picture into FsrColorImage there, with the depth and
+		// motion FSR reads in the Rr images, and FSR bringing it up to Output.
+		bool TracingForFsr = false;
+		std::unique_ptr<VulkanImage> FsrColorImage;
+		std::unique_ptr<VulkanImageView> FsrColorView;
+		// The offset the last frame's primary rays took within their pixels,
+		// which NRD is told along with this frame's.
+		vec2 LastJitter = vec2(0.0f, 0.0f);
 
 		std::unique_ptr<VulkanImage> GuideImages[GuideImageCount];
 		std::unique_ptr<VulkanImageView> GuideViews[GuideImageCount];
@@ -201,7 +211,7 @@ private:
 	void CreateTracePipeline();
 	void CreateCompositePipeline();
 	void CreateFinishPipeline();
-	void Resize(View& view, int renderWidth, int renderHeight, int outputWidth, int outputHeight, bool forRayReconstruction);
+	void Resize(View& view, int renderWidth, int renderHeight, int outputWidth, int outputHeight, bool forRayReconstruction, bool forFsr);
 	void EnsureDenoiser(View& view, bool wanted, bool materials);
 	void UpdateDescriptors();
 	void WriteCompositeDescriptors(View& view);
@@ -265,6 +275,10 @@ private:
 	// only tried the once: where it cannot run, NRD stands in.
 	std::unique_ptr<RayReconstruction> Rr;
 	bool RrTried = false;
+	// AMD's FSR 3.1, started the first time it is asked for, for the GPUs
+	// Ray Reconstruction cannot run on.
+	std::unique_ptr<FsrUpscaler> Fsr;
+	bool FsrTried = false;
 	std::unique_ptr<VulkanSampler> FogSampler;
 	std::unique_ptr<VulkanDescriptorSetLayout> FinishLayout;
 	std::unique_ptr<VulkanDescriptorPool> FinishPool;

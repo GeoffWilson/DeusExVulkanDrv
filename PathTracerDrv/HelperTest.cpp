@@ -7,7 +7,7 @@
 // semaphores. What it cannot check is the engine's end - LevelScene and the
 // textures - which only the game can.
 //
-//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--still]
+//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--fsr quality] [--still]
 //                            [--lightsize radius] [--reference] [--backlight]
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
@@ -17,7 +17,9 @@
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
-// 4 ultra performance) rather than NRD, where it can run.
+// 4 ultra performance) rather than NRD, where it can run. --fsr denoises
+// with NRD at the render size that quality gives and upscales with AMD's
+// FSR 3.1, on any GPU.
 //
 // --lights crowds the scene with n more lights, each reaching all of it, so
 // every cell of the light grid holds them all, and the trace draws from a
@@ -212,6 +214,7 @@ int main(int argc, char** argv)
 {
 	std::vector<const char*> args;
 	int dlss = -1;
+	int fsr = -1;
 	bool still = false, reference = false, backlight = false, detail = false, bc1 = false;
 	uint32_t lightSize = 0;
 	uint32_t engineLighting = 0;
@@ -235,6 +238,8 @@ int main(int argc, char** argv)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
 			dlss = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--fsr") && i + 1 < argc)
+			fsr = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--still"))
 			still = true;
 		else if (!strcmp(argv[i], "--lightsize") && i + 1 < argc)
@@ -768,7 +773,8 @@ int main(int argc, char** argv)
 		frame.LightSize = lightSize;
 		frame.MaxAnisotropy = 16;
 		frame.Lighting = engineLighting;
-		frame.DlssQuality = (uint32_t)std::max(dlss, 0);
+		frame.DlssQuality = (uint32_t)std::max(fsr >= 0 ? fsr : dlss, 0);
+		frame.Upscaler = fsr >= 0 ? TraceProtocol::UpscaleAlways : TraceProtocol::UpscaleNone;
 		frame.Materials = 1;
 		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u) | (everyLight ? 2097152u : 0u) | (neutral ? 8192u : 0u);
 		frame.ToneCeiling = toneCeiling;
@@ -1066,10 +1072,10 @@ int main(int argc, char** argv)
 			}
 			if (i == 0 || i == frames / 2 || i == frames - 1)
 			{
-				static const char* denoisers[] = { "none", "NRD", "DLSS-RR" };
+				static const char* denoisers[] = { "none", "NRD", "DLSS-RR", "NRD+FSR" };
 				printf("frame %d: %ux%u traced at %ux%u, %u lights, %u textures, %u shapes, %u instances, denoised with %s (NRD %s, DLSS %s), GPU build %.2f trace %.2f denoise %.2f composite %.2f ms%s\n",
 					i, client.OutputWidth(), client.OutputHeight(), s.RenderWidth, s.RenderHeight, s.LightCount, s.TextureCount, s.BottomCount, s.InstanceCount,
-					denoisers[std::min(s.DenoisedWith, 2u)], s.DenoiserStatus, s.DlssStatus, s.GpuBuildMs, s.GpuTraceMs, s.GpuDenoiseMs, s.GpuCompositeMs,
+					denoisers[std::min(s.DenoisedWith, 3u)], s.DenoiserStatus, s.DlssStatus, s.GpuBuildMs, s.GpuTraceMs, s.GpuDenoiseMs, s.GpuCompositeMs,
 					s.GpuTimed ? "" : " (not timed)");
 			}
 		}

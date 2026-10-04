@@ -157,6 +157,14 @@ public:
 	// PT DLSS switches it for the session and sets the quality.
 	BITFIELD UseDLSS;
 	INT DLSSQuality;
+	// AMD's FSR 3.1 ("FSR" in the ini): where Ray Reconstruction cannot run
+	// - any AMD or Intel GPU - the trace and NRD run at the size DLSSQuality
+	// gives and FSR brings the picture up to the screen's. 0 never, 1 where
+	// Ray Reconstruction cannot run (the default), 2 always, NRD and FSR in
+	// its place. FSRSharpness, 0 to 1, sharpens what it gives (0.2 by
+	// default). PT FSR [OFF | AUTO | ON] switches it for the session.
+	INT FsrMode;
+	FLOAT FsrSharpness;
 	// Use the S3TC textures a package carries beside its originals - New
 	// Vision's, eight times the size - as OpenGLDrv's UseS3TC does. On by
 	// default: a package without them is unaffected. Only the trace reads
@@ -401,6 +409,7 @@ private:
 	bool DenoiseEnabled = false;
 	bool DlssEnabled = true;
 	int DlssQualityNow = 1;
+	int FsrModeNow = 1;
 	// What a frame is traced with: VR's own (HeadsetDlssQuality,
 	// HeadsetBounces) while it is on, otherwise the screen's.
 	int DlssQualityInUse() const { return Clamp(HeadsetNow ? (int)HeadsetDlssQuality : DlssQualityNow, 0, 4); }

@@ -102,6 +102,37 @@ set(PATHTRACER_DLSS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.dlss" CACHE PATH "Outpu
 # them, for a headset. The loader, openxr_loader.dll, goes beside the helper,
 # which opens it only when a headset is asked for.
 set(PATHTRACER_OPENXR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.openxr" CACHE PATH "Output of cmake/fetch-openxr.sh")
+# AMD's FSR 3.1 upscaler, when cmake/fetch-fsr.sh has fetched FidelityFX SDK
+# v1.1.4 and compiled its shaders: for a GPU that cannot run Ray
+# Reconstruction, the trace runs at a fraction of the screen's size and FSR
+# brings it up to it. Only the upscaler, the Vulkan backend and what they
+# share are built, against ZVulkan's Vulkan headers, the backend's own
+# Vulkan calls going through volk's pointers as everything else's do.
+set(PATHTRACER_FSR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.fsr" CACHE PATH "Output of cmake/fetch-fsr.sh")
+set(PATHTRACER_FSR OFF)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND EXISTS "${PATHTRACER_FSR_DIR}/generated/ffx_fsr3upscaler_accumulate_pass_permutations.h")
+	set(PATHTRACER_FSR ON)
+	set(FFX_SDK "${PATHTRACER_FSR_DIR}/sdk")
+	add_library(ffx_fsr3upscaler STATIC
+		"${FFX_SDK}/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp"
+		"${FFX_SDK}/src/backends/vk/ffx_vk.cpp"
+		"${FFX_SDK}/src/backends/shared/ffx_shader_blobs.cpp"
+		"${FFX_SDK}/src/backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp"
+		"${FFX_SDK}/src/shared/ffx_assert.cpp"
+		"${FFX_SDK}/src/shared/ffx_message.cpp"
+		"${FFX_SDK}/src/shared/ffx_object_management.cpp"
+		"${FFX_SDK}/src/shared/ffx_breadcrumbs_list.cpp")
+	target_include_directories(ffx_fsr3upscaler PUBLIC "${FFX_SDK}/include")
+	target_include_directories(ffx_fsr3upscaler PRIVATE
+		"${FFX_SDK}/src/shared"
+		"${FFX_SDK}/src/backends/shared"
+		"${FFX_SDK}/src/backends/shared/blob_accessors"
+		"${FFX_SDK}/src/components"
+		"${PATHTRACER_FSR_DIR}/generated")
+	target_link_libraries(ffx_fsr3upscaler PRIVATE zvulkan)
+	target_compile_definitions(ffx_fsr3upscaler PRIVATE FFX_FSR3UPSCALER _UNICODE UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+	target_compile_options(ffx_fsr3upscaler PRIVATE /MT /EHsc /FIvolk/volk.h -Wno-everything)
+endif()
 set(PATHTRACERDRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/PathTracerDrv")
 
 # The tracing: everything that turns the scene into a picture on the GPU, and
@@ -111,6 +142,7 @@ set(PATHTRACER_TRACE_SOURCES
 	"${PATHTRACERDRV_DIR}/AccelStructure.cpp"
 	"${PATHTRACERDRV_DIR}/Denoiser.cpp"
 	"${PATHTRACERDRV_DIR}/FrameUploads.cpp"
+	"${PATHTRACERDRV_DIR}/FsrUpscaler.cpp"
 	"${PATHTRACERDRV_DIR}/RayReconstruction.cpp"
 	"${PATHTRACERDRV_DIR}/TraceHost.cpp"
 	"${PATHTRACERDRV_DIR}/TraceRenderer.cpp")
@@ -134,6 +166,13 @@ function(link_trace_libraries target)
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PATHTRACER_DLSS_DIR}/nvngx_dlssd.dll" "$<TARGET_FILE_DIR:${target}>")
 	else()
 		message(STATUS "${target}: no DLSS SDK at ${PATHTRACER_DLSS_DIR}, building without Ray Reconstruction")
+	endif()
+	if(PATHTRACER_FSR)
+		message(STATUS "${target}: FSR 3.1 from ${PATHTRACER_FSR_DIR}")
+		target_compile_definitions(${target} PRIVATE PATHTRACER_FSR)
+		target_link_libraries(${target} PRIVATE ffx_fsr3upscaler)
+	else()
+		message(STATUS "${target}: no FSR at ${PATHTRACER_FSR_DIR}/generated, building without it")
 	endif()
 endfunction()
 
