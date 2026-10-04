@@ -11,6 +11,34 @@
 // Matte: roughness 1, no metal, the usual reflectance. See Materials.h.
 static const vec4 MatteMaterial(1.0f, 0.0f, 0.04f, 0.0f);
 
+// For working on a shader without rebuilding: with PATHTRACER_SHADER_DIR set,
+// a file of the shader's name there is compiled in place of the built-in
+// source, and the built-in source is written there first when it is not, to
+// start from. Development only; unset, nothing changes.
+static std::string DevShaderSource(const char* name, std::string builtin)
+{
+	const char* dir = getenv("PATHTRACER_SHADER_DIR");
+	if (!dir || !*dir)
+		return builtin;
+	const std::string path = std::string(dir) + "/" + name;
+	if (FILE* f = fopen(path.c_str(), "rb"))
+	{
+		std::string text;
+		char buffer[65536];
+		size_t n;
+		while ((n = fread(buffer, 1, sizeof(buffer), f)) > 0)
+			text.append(buffer, n);
+		fclose(f);
+		return text;
+	}
+	if (FILE* f = fopen(path.c_str(), "wb"))
+	{
+		fwrite(builtin.data(), 1, builtin.size(), f);
+		fclose(f);
+	}
+	return builtin;
+}
+
 // A new accumulation and history, cleared and left GENERAL for the trace. Not
 // merely made GENERAL, as everything else is: the accumulation's alpha counts
 // a pixel's frames under a moving shadow, and the trace reads that before it
@@ -171,7 +199,7 @@ void TraceRenderer::CreateTracePipeline()
 
 	TraceShader = ShaderBuilder()
 		.Type(ShaderType::Compute)
-		.AddSource("shaders/Trace.comp", Shaders::Trace())
+		.AddSource("shaders/Trace.comp", DevShaderSource("Trace.comp", Shaders::Trace()))
 		.DebugName("PathTracerTrace")
 		.Create("PathTracerTrace", Device);
 

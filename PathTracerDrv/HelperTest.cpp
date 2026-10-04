@@ -845,6 +845,8 @@ int main(int argc, char** argv)
 		// Frame to frame change over the last quarter, for --still.
 		std::vector<float> lastPicture;
 		double changeSum = 0.0;
+		double gpuTraceSum = 0.0, gpuDenoiseSum = 0.0, gpuTotalSum = 0.0;
+		int gpuTimedFrames = 0;
 		int changeCount = 0;
 
 		auto pool = CommandPoolBuilder().QueueFamily(device->GraphicsFamily).Create(device.get());
@@ -1053,6 +1055,15 @@ int main(int argc, char** argv)
 			}
 
 			const auto& s = client.Status();
+			// The GPU's times averaged over the second half, once the scene
+			// has settled, for comparing one build against another.
+			if (i >= frames / 2 && s.GpuTimed)
+			{
+				gpuTraceSum += s.GpuTraceMs;
+				gpuDenoiseSum += s.GpuDenoiseMs;
+				gpuTotalSum += s.GpuBuildMs + s.GpuTraceMs + s.GpuDenoiseMs + s.GpuCompositeMs;
+				gpuTimedFrames++;
+			}
 			if (i == 0 || i == frames / 2 || i == frames - 1)
 			{
 				static const char* denoisers[] = { "none", "NRD", "DLSS-RR" };
@@ -1068,6 +1079,9 @@ int main(int argc, char** argv)
 		const double loopMs = (double)(loopEnd.QuadPart - loopStart.QuadPart) * 1000.0 / (double)frequency.QuadPart;
 		printf("%d of %d frames arrived, %.2f ms a frame in all, %.2f ms a frame to send and have traced (helper: wait %.2f, apply %.2f, record %.2f; %u stalls)\n",
 			arrived, frames, loopMs / frames, sendMs / frames, helperWait / frames, helperApply / frames, helperRecord / frames, stalls);
+		if (gpuTimedFrames > 0)
+			printf("GPU over the last %d frames: trace %.2f ms, denoise %.2f ms, all %.2f ms\n", gpuTimedFrames,
+				gpuTraceSum / gpuTimedFrames, gpuDenoiseSum / gpuTimedFrames, gpuTotalSum / gpuTimedFrames);
 
 		// The last frame, tonemapped already by the helper, as a PPM.
 		const uint32_t outWidth = client.OutputWidth(), outHeight = client.OutputHeight();

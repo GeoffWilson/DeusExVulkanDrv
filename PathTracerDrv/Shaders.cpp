@@ -863,47 +863,96 @@ static std::string TraceCommon()
 
 		// cullMask is which instances can be in the way: ShadowRays for the
 		// level's lights (occluded), FlashlightRays for the flashlight. Glass
-		// on the way tints the light (shadowTint), each pane once: a ray
-		// query can offer the same triangle more than once.
+		// on the way tints the light (shadowTint), each pane once: the
+		// geometry holding anything not opaque is built so that a ray query
+		// offers each of its triangles once (AccelStructure's
+		// NO_DUPLICATE_ANY_HIT).
+		//
+		// What a candidate does to the light is confirmCandidate's and
+		// glassTransmittance's answers for a shadow ray, worked out here at
+		// once from one read of the triangle and at most one texel: asked of
+		// the two in turn, inside the traversal, with the triangle's
+		// transform fetched for every candidate, they held enough at once
+		// to overflow an AMD GPU's registers into memory at every light's
+		// shadow ray. The transform is wanted only by environment mapped art.
 		bool occludedBy(vec3 origin, vec3 dir, float dist, uint cullMask)
 		{
 			shadowTint = vec3(1.0);
 			if ((Disable & 2u) != 0u)
 				return false;
-			ivec2 tinted[4];
-			uint tintedCount = 0u;
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, topLevel,
 				gl_RayFlagsTerminateOnFirstHitEXT | ((Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : 0u),
 				cullMask, origin, RayEpsilon, dir, dist);
-			// A hole in a grate lets light through, so a candidate only counts
-			// as occluding once its texel is known to be there.
-			// Light passes through glass and through the holes in a grate, so a
-			// candidate only occludes once it is confirmed.
 			while (rayQueryProceedEXT(rq))
 			{
-				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+				if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT)
+					continue;
+				TriangleAttributes attr = tris[rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false) + rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)];
+				float kind = attr.UV2Tex.w;
+				// Sprites cast no shadows: the engine draws them flat onto
+				// the screen, after the world, and a quad turned to face the
+				// camera would throw a shadow that swings as the view turns.
+				// Nor do they tint the light.
+				if (attr.Emission.w > 1.5)
+					continue;
+				// Solid; and a mirror, which reflects rather than letting
+				// anything past, and a window onto the sky zone (5). Not
+				// modulated art (4): every decal then shut out any light
+				// reaching the floor under it at a slant, a darker square
+				// round every scorch mark and bloodstain.
+				if (kind < 0.5 || (kind > 2.5 && (kind < 3.5 || kind > 4.5)))
 				{
-					int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
-					int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-					vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-					mat3 toWorld = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false));
-					if (confirmCandidate(attributeBase, primitive, bary, true, dir, toWorld))
-						rayQueryConfirmIntersectionEXT(rq);
-					else
-					{
-						ivec2 pane = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, false), primitive);
-						bool seen = false;
-						for (uint p = 0u; p < tintedCount; p++)
-							seen = seen || tinted[p] == pane;
-						if (!seen)
-						{
-							shadowTint *= glassTransmittance(attributeBase, primitive, bary, dir, toWorld);
-							if (tintedCount < 4u)
-								tinted[tintedCount++] = pane;
-						}
-					}
+					rayQueryConfirmIntersectionEXT(rq);
+					continue;
 				}
+				// A hole in a grate lets light through, so masked art only
+				// stops it where its texel is there. Glass - translucent or
+				// modulated - never stops it, but tints it, unless it glows:
+				// a lamp's light cone, a force field tint nothing.
+				bool masked = kind < 1.5;
+				if (!masked && ((Disable & 1048576u) != 0u || attr.Emission.w > 0.5))
+					continue;
+				int index = int(attr.UV2Tex.z);
+				bool textured = index >= 0 && uint(index) < TextureCount;
+				// Tested at the top mip level, however far off: each ray finds
+				// a hole or a bar exactly, and a stained window's pattern
+				// lands on the floor, softening with distance as its shadows
+				// do. A smaller mip's blurred alpha thickened bars or closed
+				// holes.
+				vec4 texel = vec4(0.0, 0.0, 0.0, 1.0);
+				if (textured)
+				{
+					vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+					vec3 normal = attr.Normal.w > 0.5 ? normalize(mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false)) * attr.Normal.xyz) : vec3(0.0, 0.0, 1.0);
+					texel = textureLod(sceneTextures[nonuniformEXT(index)], surfaceUV(attr, bary, dir, normal), 0.0);
+				}
+				if (masked)
+				{
+					if (texel.a > 0.5)
+						rayQueryConfirmIntersectionEXT(rq);
+					continue;
+				}
+				// What the glass lets through. Modulated glass passes what it
+				// multiplies the view by, at most all of it. Translucent glass
+				// - drawn by adding its colour, so it absorbs nothing the
+				// engine shows - passes its texel's hue, as far as the texel
+				// is coloured at all: clear and grey glass pass the light as
+				// it is, deep red stained glass passes red. Its holes pass it
+				// all.
+				if (textured && texel.a <= 0.5)
+					continue;
+				vec3 colour = textured ? pow(max(texel.rgb, vec3(0.0)), vec3(2.2)) : attr.Albedo.rgb;
+				if (kind > 3.5)
+				{
+					shadowTint *= clamp(colour * 4.595, vec3(0.0), vec3(1.0));
+					continue;
+				}
+				float top = max(colour.r, max(colour.g, colour.b));
+				if (top < 0.01)
+					continue;
+				float saturation = 1.0 - min(colour.r, min(colour.g, colour.b)) / top;
+				shadowTint *= mix(vec3(1.0), colour / top, saturation);
 			}
 			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
 				return false;
@@ -1000,8 +1049,8 @@ static std::string TraceCommon()
 			return float((lightmapData[b >> 2u] >> ((b & 3u) * 8u)) & 255u);
 		}
 
-		// Where a point lies on its surface's lightmap, worked out once for
-		// every light there. present is false with no lightmap, or with the
+		// Where a point lies on its surface's lightmap, worked out for each
+		// light that asks (lightAt). present is false with no lightmap, or with the
 		// masks left out (PT BAKEDSHADOWS, Disable bit 16384).
 		struct LightmapPoint
 		{
@@ -1068,7 +1117,7 @@ static std::string TraceCommon()
 			return 2.0 * mix(top, bottom, p.f.y) / 255.0;
 		}
 
-		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir, LightmapPoint lightmap, bool masked,
+		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir, uint lightmapSurface, bool masked,
 			out vec3 value, out vec3 base, out vec3 dir, out float distance, out bool behind)
 		{
 			value = vec3(0.0);
@@ -1229,7 +1278,7 @@ static std::string TraceCommon()
 				float x = reach / radius;
 				float mask = 1.0;
 				if (light.Flags.y > 1.5)
-					mask = masked ? bakedScale(lightmap, uint(light.Flags.y * 0.5)) : 2.0;
+					mask = masked ? bakedScale(lightmapPoint(lightmapSurface, position), uint(light.Flags.y * 0.5)) : 2.0;
 				float lit = shade * (1.0 - x * x * (3.0 - 2.0 * x)) * mask;
 				base = pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) * lit;
 				value = min(base * response, vec3(1.0));
@@ -1323,8 +1372,12 @@ static std::string TraceCommon()
 			// clear all round, and each pick weighed by that, which is what
 			// makes the estimate come out right whatever its mask turns out
 			// to be. Looking up every light in reach cost more than the rest
-			// of the lighting together.
-			LightmapPoint lightmap = lightmapPoint(engineSum ? surface : 0u, position);
+			// of the lighting together. Where the point lies on its
+			// lightmap is worked out for each light that wants it rather
+			// than once here and carried through the loop: a dozen values
+			// held across every light's shadow ray cost an AMD GPU more
+			// than the dozen reads.
+			uint lightmapSurface = engineSum ? surface : 0u;
 			// A lightmap's full is drawn at twice the texture's brightness.
 			lightmapAmbient = EngineLighting ? pow(2.0 * min(shownAmbient, vec3(1.0)), vec3(2.2)) : vec3(0.0);
 			if ((Disable & 1u) != 0u)
@@ -1369,70 +1422,62 @@ static std::string TraceCommon()
 			uint listCount = lightGrid[9u + cellIndex * 2u];
 			uint weighed = (everyLight || (Disable & 2097152u) != 0u) ? listCount : min(listCount, exactCount);
 
-			for (uint k = 0u; k < weighed; k++)
+			// One loop through four phases, so that lightAt and the shadow ray
+			// are each written once. Every call is inlined, and written once
+			// per phase this function came to ten times the code it needs:
+			// on AMD's GPUs, the registers it held at once overflowed into
+			// memory, and that cost more than the tracing. In order:
+			//   0  the lights at the head of the cell's list, each weighed
+			//   1  the rest of a crowded cell, stood for by a few drawn from it
+			//   2  the strongest, each traced (not for everyLight)
+			//   3  the pick standing for the rest, traced
+			//
+			// Phase 1: the rest of a crowded cell, stood for by a few drawn
+			// from it in proportion to their rank, each weighed exactly and
+			// offered to the same pick. A draw goes in weighed by what it gives
+			// over how likely it was to be drawn, averaged over the draws:
+			// resampled importance sampling. The pick then stands for the
+			// lights weighed and the rest together, on average exactly as they
+			// add up, for the cost of a few however many the cell holds. Each
+			// entry's second word is the rank of it and every one after it
+			// summed, so a draw is a binary search down the tail.
+			//
+			// Phases 2 and 3: what reaches the point - the strongest lights
+			// each traced, and the pick standing for the rest, divided by the
+			// chance it was picked with. The highlight follows the strongest
+			// light that got through, or else the pick.
+			float tail = weighed < listCount ? uintBitsToFloat(lightGrid[listStart + 2u * weighed + 1u]) : 0.0;
+			vec3 reaches = vec3(0.0);
+			float highlightWeight = 0.0;
+			uint phase = 0u;
+			uint step = 0u;
+			while (true)
 			{
-				uint i = lightGrid[listStart + 2u * k];
-				vec3 value, base, dir;
-				float distance;
-				bool behind;
-				if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmap, everyLight, value, base, dir, distance, behind))
-					continue;
-				float weight = luminance(value);
-				total += value;
-				anyChanging = anyChanging || lights[i].Flags.z > 0.5;
-
-				// Kept among the strongest if it is one, pushing out the
-				// weakest of them into the rest.
-				uint candidate = i;
-				float candidateWeight = weight;
-				for (uint t = 0u; t < strongest; t++)
+				// The next light, or on to the next phase.
+				uint i;
+				bool masked = true;
+				float drawChance = 0.0;
+				if (phase == 0u)
 				{
-					if (t == strongCount)
+					if (step >= weighed)
 					{
-						strongIndex[t] = candidate;
-						strongWeight[t] = candidateWeight;
-						strongCount++;
-						candidateWeight = 0.0;
-						break;
+						phase = 1u;
+						step = 0u;
+						continue;
 					}
-					if (candidateWeight > strongWeight[t])
-					{
-						uint heldIndex = strongIndex[t];
-						float held = strongWeight[t];
-						strongIndex[t] = candidate;
-						strongWeight[t] = candidateWeight;
-						candidate = heldIndex;
-						candidateWeight = held;
-					}
+					i = lightGrid[listStart + 2u * step];
+					masked = everyLight;
 				}
-				// Reservoir sampling: each candidate replaces the held one with
-				// probability equal to its share of the weight seen so far, so
-				// one pass leaves a sample drawn in proportion to weight.
-				if (candidateWeight > 0.0)
+				else if (phase == 1u)
 				{
-					restWeight += candidateWeight;
-					if (randomFloat() < candidateWeight / restWeight)
+					if (weighed >= listCount || step >= drawCount || tail <= 0.0)
 					{
-						chosen = int(candidate);
-						chosenTarget = candidateWeight;
+						if (everyLight)
+							break;
+						phase = 2u;
+						step = 0u;
+						continue;
 					}
-				}
-			}
-
-			// The rest of a crowded cell, stood for by a few drawn from it in
-			// proportion to their rank, each weighed exactly and offered to the
-			// same pick. A draw goes in weighed by what it gives over how
-			// likely it was to be drawn, averaged over the draws: resampled
-			// importance sampling. The pick then stands for the lights weighed
-			// and the rest together, on average exactly as they add up, for
-			// the cost of a few however many the cell holds. Each entry's
-			// second word is the rank of it and every one after it summed, so
-			// a draw is a binary search down the tail.
-			if (weighed < listCount)
-			{
-				float tail = uintBitsToFloat(lightGrid[listStart + 2u * weighed + 1u]);
-				for (uint d = 0u; d < drawCount && tail > 0.0; d++)
-				{
 					float u = randomFloat() * tail;
 					uint lo = weighed, hi = listCount - 1u;
 					while (lo < hi)
@@ -1445,17 +1490,89 @@ static std::string TraceCommon()
 					}
 					float here = uintBitsToFloat(lightGrid[listStart + 2u * lo + 1u]);
 					float after = lo + 1u < listCount ? uintBitsToFloat(lightGrid[listStart + 2u * lo + 3u]) : 0.0;
-					float chance = (here - after) / tail;
-					if (chance <= 0.0)
+					drawChance = (here - after) / tail;
+					if (drawChance <= 0.0)
+					{
+						step++;
 						continue;
-					uint i = lightGrid[listStart + 2u * lo];
-					vec3 value, base, dir;
-					float distance;
-					bool behind;
-					if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmap, everyLight, value, base, dir, distance, behind))
+					}
+					i = lightGrid[listStart + 2u * lo];
+					masked = everyLight;
+				}
+				else if (phase == 2u)
+				{
+					if (step >= strongCount)
+					{
+						phase = 3u;
+						step = 0u;
+						continue;
+					}
+					i = strongIndex[step];
+				}
+				else
+				{
+					if (step > 0u || chosen < 0 || chosenTarget <= 0.0)
+						break;
+					i = uint(chosen);
+				}
+				step++;
+
+				vec3 value, base, dir;
+				float distance;
+				bool behind;
+				bool lit = lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, masked, value, base, dir, distance, behind);
+
+				if (phase == 0u)
+				{
+					if (!lit)
+						continue;
+					float weight = luminance(value);
+					total += value;
+					anyChanging = anyChanging || lights[i].Flags.z > 0.5;
+
+					// Kept among the strongest if it is one, pushing out the
+					// weakest of them into the rest.
+					uint candidate = i;
+					float candidateWeight = weight;
+					for (uint t = 0u; t < strongest; t++)
+					{
+						if (t == strongCount)
+						{
+							strongIndex[t] = candidate;
+							strongWeight[t] = candidateWeight;
+							strongCount++;
+							candidateWeight = 0.0;
+							break;
+						}
+						if (candidateWeight > strongWeight[t])
+						{
+							uint heldIndex = strongIndex[t];
+							float held = strongWeight[t];
+							strongIndex[t] = candidate;
+							strongWeight[t] = candidateWeight;
+							candidate = heldIndex;
+							candidateWeight = held;
+						}
+					}
+					// Reservoir sampling: each candidate replaces the held one with
+					// probability equal to its share of the weight seen so far, so
+					// one pass leaves a sample drawn in proportion to weight.
+					if (candidateWeight > 0.0)
+					{
+						restWeight += candidateWeight;
+						if (randomFloat() < candidateWeight / restWeight)
+						{
+							chosen = int(candidate);
+							chosenTarget = candidateWeight;
+						}
+					}
+				}
+				else if (phase == 1u)
+				{
+					if (!lit)
 						continue;
 					float target = luminance(value);
-					float candidateWeight = target / (float(drawCount) * chance);
+					float candidateWeight = target / (float(drawCount) * drawChance);
 					if (candidateWeight > 0.0)
 					{
 						restWeight += candidateWeight;
@@ -1464,6 +1581,37 @@ static std::string TraceCommon()
 							chosen = int(i);
 							chosenTarget = target;
 						}
+					}
+				}
+				else
+				{
+					if (lights[i].Flags.z > 0.5)
+						litByChangingLight = true;
+					float weight = luminance(value);
+					if (weight <= 0.0)
+						continue;
+					// Glass tints light as it is, linear; the engine's sum is of
+					// displayed values.
+					vec3 through = lightReaches(position, dir, distance, behind);
+					if (luminance(through) <= 0.0)
+						continue;
+					if (engineSum)
+						through = pow(through, vec3(1.0 / 2.2));
+					float scale = phase == 3u ? restWeight / chosenTarget : 1.0;
+					reaches += value * through * scale;
+					if (phase == 2u)
+					{
+						if (weight > highlightWeight)
+						{
+							highlightWeight = weight;
+							lightDirection = dir;
+							lightBase = base * through;
+						}
+					}
+					else if (highlightWeight <= 0.0)
+					{
+						lightDirection = dir;
+						lightBase = base * through * scale;
 					}
 				}
 			}
@@ -1483,61 +1631,6 @@ static std::string TraceCommon()
 				// and unclamped: its ambient goes on before the clamp
 				// (meshLight).
 				return total;
-			}
-
-			// What reaches the point: the strongest lights each traced, and
-			// the pick standing for the rest, divided by the chance it was
-			// picked with. The highlight follows the strongest light that got
-			// through, or else the pick.
-			vec3 reaches = vec3(0.0);
-			float highlightWeight = 0.0;
-			for (uint t = 0u; t < strongCount; t++)
-			{
-				vec3 value, base, dir;
-				float distance;
-				bool behind;
-				lightAt(strongIndex[t], position, normal, specialLit, meshGlow, viewDir, lightmap, true, value, base, dir, distance, behind);
-				if (lights[strongIndex[t]].Flags.z > 0.5)
-					litByChangingLight = true;
-				float weight = luminance(value);
-				if (weight <= 0.0)
-					continue;
-				// Glass tints light as it is, linear; the engine's sum is of
-				// displayed values.
-				vec3 through = lightReaches(position, dir, distance, behind);
-				if (luminance(through) <= 0.0)
-					continue;
-				if (engineSum)
-					through = pow(through, vec3(1.0 / 2.2));
-				reaches += value * through;
-				if (weight > highlightWeight)
-				{
-					highlightWeight = weight;
-					lightDirection = dir;
-					lightBase = base * through;
-				}
-			}
-			if (chosen >= 0 && chosenTarget > 0.0)
-			{
-				vec3 value, base, dir;
-				float distance;
-				bool behind;
-				lightAt(uint(chosen), position, normal, specialLit, meshGlow, viewDir, lightmap, true, value, base, dir, distance, behind);
-				if (lights[chosen].Flags.z > 0.5)
-					litByChangingLight = true;
-				vec3 through = luminance(value) > 0.0 ? lightReaches(position, dir, distance, behind) : vec3(0.0);
-				if (luminance(through) > 0.0)
-				{
-					if (engineSum)
-						through = pow(through, vec3(1.0 / 2.2));
-					float scale = restWeight / chosenTarget;
-					reaches += value * through * scale;
-					if (highlightWeight <= 0.0)
-					{
-						lightDirection = dir;
-						lightBase = base * through * scale;
-					}
-				}
 			}
 
 			// Added up as the engine does it: the ambient and the lights as
