@@ -4412,12 +4412,13 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 		return;
 	}
 
-	// A particle of a mesh drawn as particles (LevelScene::PlaceParticles),
-	// which the trace has too, placed where walls hide it. The engine draws
-	// these with no span, so they came through every wall in the way: UT's
-	// spawn effects, its sparks. Only while it draws the world, so the HUD's
-	// own art is never taken for one.
-	if (WorldPass && Info.Texture && Scene.ParticleTextures.count(Info.Texture))
+	// A sprite the trace has too - a sprite actor, a particle of a mesh drawn
+	// as particles, a muzzle flash (LevelScene::TracedSpriteTextures) - placed
+	// where walls hide it. UT 469 draws these with no span, so they came
+	// through whatever was in front: its spawn effects, its sparks, the lower
+	// half of an explosion over the ledge before it. Only while it draws the
+	// world, so the HUD's own art is never taken for one.
+	if (WorldPass && Info.Texture && Scene.TracedSpriteTextures.count(Info.Texture))
 		return;
 
 	// A texture can carry PF_Masked itself rather than the caller passing it.

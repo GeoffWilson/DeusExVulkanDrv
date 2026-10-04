@@ -1302,10 +1302,26 @@ bool LevelScene::PlaceSprite(AActor* actor, int& geometryIndex, float transform[
 	geometryIndex = GeometryForSprite(texture, SpriteKind(actor, texture));
 	if (geometryIndex < 0)
 		return false;
+	// The engine is handed the frame it draws, which for one playing once is
+	// the one picked here and for a looping one any along its chain.
+	NoteTracedSprite(actor->Texture);
 
 	const float scale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
 	SpriteTransform(scale * texture->USize, scale * texture->VSize, actor->Location + actor->PrePivot, transform);
 	return true;
+}
+
+void LevelScene::NoteTracedSprite(UTexture* texture)
+{
+	if (!texture || TracedSpriteTextures.count(texture))
+		return;
+	int frames = 0;
+	for (UTexture* t = texture; t && frames < 256; t = t->AnimNext, frames++)
+	{
+		TracedSpriteTextures.insert(t);
+		if (t->AnimNext == texture)
+			break;
+	}
 }
 
 // The texture's own flags say whether it has holes in it; the style can make
@@ -1386,16 +1402,7 @@ void LevelScene::PlaceParticles(AActor* actor, uint32_t mask)
 		}
 		if (!texture)
 			continue;
-		if (!ParticleTextures.count(texture))
-		{
-			int frames = 0;
-			for (UTexture* t = texture; t && frames < 256; t = t->AnimNext, frames++)
-			{
-				ParticleTextures.insert(t);
-				if (t->AnimNext == texture)
-					break;
-			}
-		}
+		NoteTracedSprite(texture);
 
 		const int geometryIndex = GeometryForSprite(texture, SpriteKind(actor, texture));
 		if (geometryIndex < 0)
@@ -2570,7 +2577,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 	GeometryAdded = false;
 	Instances.clear();
 	ActorInstances.clear();
-	ParticleTextures.clear();
+	TracedSpriteTextures.clear();
 	FittingCandidates.clear();
 	LightPositions.clear();
 	Lights.clear();
@@ -3053,12 +3060,7 @@ bool LevelScene::PlaceHeldItem(APawn* pawn, uint32_t mask)
 			const FVector flashOffset = x * (item->PrePivot.X * fs) + y * (item->PrePivot.Y * fs) + z * (item->PrePivot.Z * fs);
 			const FCoords flashCoords = GMath.UnitCoords / flash->RotOrigin;
 			UTexture* texture = item->MuzzleFlashTexture;
-			for (UTexture* t = texture; t; t = t->AnimNext)
-			{
-				ParticleTextures.insert(t);
-				if (t->AnimNext == texture || ParticleTextures.size() > 4096)
-					break;
-			}
+			NoteTracedSprite(texture);
 			const float kind = KindFromStyle(item->MuzzleFlashStyle) != 0.0f ? KindFromStyle(item->MuzzleFlashStyle) : 2.0f;
 			const int spriteIndex = GeometryForSprite(texture, kind);
 			for (INT v = first; spriteIndex >= 0 && v < frameVerts && v < flash->Verts.Num(); v++)

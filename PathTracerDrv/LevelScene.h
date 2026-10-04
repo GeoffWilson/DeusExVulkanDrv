@@ -63,12 +63,16 @@ private:
 	void SpriteTransform(float width, float height, const FVector& centre, float transform[12]) const;
 	float SpriteKind(AActor* actor, UTexture* texture) const;
 	std::vector<FVector> ParticlePoints;
+	// A texture a sprite in the trace is drawn with, and every frame of it
+	// if it animates: see TracedSpriteTextures.
+	void NoteTracedSprite(UTexture* texture);
 public:
-	// The textures this frame's particles are drawn with, every frame of an
-	// animated one: the engine draws them again as flat tiles over the
+	// The textures this frame's sprites are drawn with - sprite actors, the
+	// particles of meshes drawn as particles, muzzle flashes - every frame of
+	// an animated one. UT 469 draws these again as flat tiles over the
 	// picture, with no span to say a wall hides them, and the device leaves
-	// those out (DrawTile).
-	std::unordered_set<UTexture*> ParticleTextures;
+	// those out (DrawTile): the trace has them already, where walls hide them.
+	std::unordered_set<UTexture*> TracedSpriteTextures;
 private:
 
 	// What was placed, for the log.
