@@ -57,6 +57,19 @@ private:
 	// showing it. Its size and facing come from the instance.
 	int GeometryForSprite(UTexture* texture, float kind);
 	bool PlaceSprite(AActor* actor, int& geometryIndex, float transform[12]);
+	// A mesh with bParticles: a sprite at every vertex, as Render draws it.
+	void PlaceParticles(AActor* actor, uint32_t mask);
+	// Square on to the view, size units across, centred on centre.
+	void SpriteTransform(float width, float height, const FVector& centre, float transform[12]) const;
+	float SpriteKind(AActor* actor, UTexture* texture) const;
+	std::vector<FVector> ParticlePoints;
+public:
+	// The textures this frame's particles are drawn with, every frame of an
+	// animated one: the engine draws them again as flat tiles over the
+	// picture, with no span to say a wall hides them, and the device leaves
+	// those out (DrawTile).
+	std::unordered_set<UTexture*> ParticleTextures;
+private:
 
 	// What was placed, for the log.
 	struct PlaceCounts
@@ -85,6 +98,10 @@ private:
 	// Room reserved up front: a geometry's shading data cannot grow after it
 	// is first built.
 	static const int MaxDecals = 1024;
+	// Triangles for them all: a decal cut to the polygons it lies on is a
+	// few pieces of a few triangles each.
+	static const int MaxDecalTriangles = MaxDecals * 6;
+	std::vector<FVector> DecalPieces[3];
 	std::unordered_map<uint64_t, int> SpriteGeometry;
 
 	// Geometry index for a mover's brush, built on first sight.

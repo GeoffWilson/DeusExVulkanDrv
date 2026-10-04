@@ -1153,6 +1153,8 @@ int LevelScene::AnimatedGeometryFor(AActor* actor, UMesh* mesh, int frameA, int 
 	mix((uint64_t)(uintptr_t)actor->Texture);
 	mix(actor->bUnlit ? 1u : 0u);
 	mix(actor->bMeshEnviroMap ? 1u : 0u);
+	mix((uint64_t)actor->Fatness);
+	mix(bits(actor->DrawScale));
 	mix(toLocal ? 1u : 0u);
 
 	auto it = ActorGeometry.find(actor);
@@ -1297,8 +1299,19 @@ bool LevelScene::PlaceSprite(AActor* actor, int& geometryIndex, float transform[
 			FixedFrames.insert(texture);
 	}
 
-	// The texture's own flags say whether it has holes in it; the style can
-	// make the whole thing additive or multiplying instead.
+	geometryIndex = GeometryForSprite(texture, SpriteKind(actor, texture));
+	if (geometryIndex < 0)
+		return false;
+
+	const float scale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
+	SpriteTransform(scale * texture->USize, scale * texture->VSize, actor->Location + actor->PrePivot, transform);
+	return true;
+}
+
+// The texture's own flags say whether it has holes in it; the style can make
+// the whole thing additive or multiplying instead.
+float LevelScene::SpriteKind(AActor* actor, UTexture* texture) const
+{
 	float kind = KindFromStyle(actor->Style);
 	if (kind == 0.0f && (texture->PolyFlags & PF_Translucent))
 		kind = 2.0f;
@@ -1306,15 +1319,11 @@ bool LevelScene::PlaceSprite(AActor* actor, int& geometryIndex, float transform[
 		kind = 4.0f;
 	else if (kind == 0.0f && (texture->PolyFlags & PF_Masked))
 		kind = 1.0f;
+	return kind;
+}
 
-	geometryIndex = GeometryForSprite(texture, kind);
-	if (geometryIndex < 0)
-		return false;
-
-	const float scale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
-	const float width = scale * texture->USize;
-	const float height = scale * texture->VSize;
-
+void LevelScene::SpriteTransform(float width, float height, const FVector& centre, float transform[12]) const
+{
 	// Quad X along the view's right, Y up the screen, Z back at the viewer.
 	const FVector up = -ViewDown;
 	const FVector columns[3] = { ViewRight * width, up * height, -ViewForward };
@@ -1324,11 +1333,80 @@ bool LevelScene::PlaceSprite(AActor* actor, int& geometryIndex, float transform[
 		transform[1 * 4 + col] = columns[col].Y;
 		transform[2 * 4 + col] = columns[col].Z;
 	}
-	const FVector centre = actor->Location + actor->PrePivot;
 	transform[0 * 4 + 3] = centre.X;
 	transform[1 * 4 + 3] = centre.Y;
 	transform[2 * 4 + 3] = centre.Z;
-	return true;
+}
+
+// A mesh drawn as particles - UT's spawn and respawn effects, its sparks,
+// some of its muzzle flashes - which Render draws as a sprite at each of the
+// mesh's vertices, posed as the mesh is, rather than as triangles: the
+// actor's Texture (or with bRandomFrame one of its MultiSkins, by vertex), as
+// big as a sprite of it would be. Placed as sprites, one an instance, so walls
+// hide them as they hide everything else.
+void LevelScene::PlaceParticles(AActor* actor, uint32_t mask)
+{
+	UMesh* mesh = actor->Mesh;
+	if (!mesh || actor->Style == STY_None)
+		return;
+
+	// The pose in world space, from the engine, which folds in the
+	// animation, the placement and the draw scale.
+	int first = 0, count = 0;
+	ULodMesh* lod = Cast<ULodMesh>(mesh);
+	if (lod)
+	{
+		if (lod->ModelVerts <= 0)
+			return;
+		INT request = lod->ModelVerts;
+		ParticlePoints.resize(lod->SpecialVerts + Max(lod->ModelVerts, lod->FrameVerts) + 1);
+		lod->GetFrame(&ParticlePoints[0], sizeof(FVector), GMath.UnitCoords, actor, request);
+		first = lod->SpecialVerts;
+		count = (request > 0 && request <= lod->ModelVerts) ? request : lod->ModelVerts;
+	}
+	else
+	{
+		if (mesh->FrameVerts <= 0)
+			return;
+		ParticlePoints.resize(mesh->FrameVerts + 1);
+		mesh->GetFrame(&ParticlePoints[0], sizeof(FVector), GMath.UnitCoords, actor);
+		count = mesh->FrameVerts;
+	}
+
+	const float scale = actor->DrawScale != 0.0f ? actor->DrawScale : 1.0f;
+	const float glow = Clamp((float)actor->ScaleGlow, 0.0f, 4.0f);
+	for (int i = 0; i < count; i++)
+	{
+		UTexture* texture = actor->Texture;
+		if (actor->bRandomFrame)
+		{
+			UTexture* chosen = actor->MultiSkins[((i + 2) / 3) % 8];
+			if (chosen)
+				texture = chosen;
+		}
+		if (!texture)
+			continue;
+		if (!ParticleTextures.count(texture))
+		{
+			int frames = 0;
+			for (UTexture* t = texture; t && frames < 256; t = t->AnimNext, frames++)
+			{
+				ParticleTextures.insert(t);
+				if (t->AnimNext == texture)
+					break;
+			}
+		}
+
+		const int geometryIndex = GeometryForSprite(texture, SpriteKind(actor, texture));
+		if (geometryIndex < 0)
+			return;
+		SceneInstance instance;
+		instance.GeometryIndex = geometryIndex;
+		SpriteTransform(scale * texture->USize, scale * texture->VSize, ParticlePoints[first + i], instance.Transform);
+		instance.Mask = mask;
+		instance.Ambient = vec4(glow, glow, glow, InstanceFlags(true, actor->ScaleGlow, actor->Region.Zone));
+		Instances.push_back(instance);
+	}
 }
 
 // The game's blob shadows: a decal it re-attaches under each character every
@@ -1401,8 +1479,8 @@ void LevelScene::CollectDecals(ULevel* level)
 		// when the ray is confirmed against it.
 		geometry.HasMasked = true;
 
-		int added = 0;
-		for (INT s = 0; s < model->Surfs.Num() && added < MaxDecals; s++)
+		int added = 0, decalTriangles = 0;
+		for (INT s = 0; s < model->Surfs.Num() && added < MaxDecals && decalTriangles < MaxDecalTriangles; s++)
 		{
 			const FBspSurf& surf = model->Surfs(s);
 			if (surf.Decals.Num() == 0)
@@ -1420,7 +1498,7 @@ void LevelScene::CollectDecals(ULevel* level)
 			// not start again already beyond the wall it is painted on.
 			const FVector lift = surfaceNormal * 0.25f;
 
-			for (INT d = 0; d < surf.Decals.Num() && added < MaxDecals; d++)
+			for (INT d = 0; d < surf.Decals.Num() && added < MaxDecals && decalTriangles < MaxDecalTriangles; d++)
 			{
 				const FDecal& decal = surf.Decals(d);
 				ADecal* actor = decal.Actor;
@@ -1438,27 +1516,103 @@ void LevelScene::CollectDecals(ULevel* level)
 				const int textureIndex = TextureFor(texture, kind == 1.0f);
 				const vec3 albedo = AverageColour(texture, vec3(0.5f, 0.5f, 0.5f));
 
-				vec3 corners[4];
-				for (int v = 0; v < 4; v++)
-					corners[v] = ToVec3(base + decal.Vertices[v] + lift);
-				const float uv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
-				const int tris[2][3] = { { 0, 1, 2 }, { 0, 2, 3 } };
-
-				for (const auto& tri : tris)
+				// The decal's square, cut to the polygons of the nodes it lies
+				// on, as the engine draws it: laid as it is, it hung off the
+				// edge of a pillar into the air beside it. Its texture is laid
+				// across the square, the first corner at its top left.
+				const FVector c0 = base + decal.Vertices[0];
+				const FVector eu = decal.Vertices[1] - decal.Vertices[0];
+				const FVector ev = decal.Vertices[3] - decal.Vertices[0];
+				const float a = eu | eu, b = eu | ev, c = ev | ev;
+				const float det = a * c - b * b;
+				if (Abs(det) < 1.0e-6f)
+					continue;
+				auto uvAt = [&](const FVector& point, float* uv)
 				{
-					TriangleAttributes attr;
-					attr.Normal = vec4(surfaceNormal.X, surfaceNormal.Y, surfaceNormal.Z, 0.0f);
-					attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(texture) ? 1.0f : 0.0f);
-					attr.Emission = vec4(0.0f, 0.0f, 0.0f, 0.0f);
-					attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
-					attr.UV01 = vec4(uv[tri[0]][0], uv[tri[0]][1], uv[tri[1]][0], uv[tri[1]][1]);
-					attr.UV2Tex = vec4(uv[tri[2]][0], uv[tri[2]][1], (float)textureIndex, kind);
-					const vec3 laid[3] = { corners[tri[0]], corners[tri[1]], corners[tri[2]] };
-					SetUvDensity(attr, laid);
-					for (int v = 0; v < 3; v++)
-						geometry.Positions.push_back(corners[tri[v]]);
-					geometry.Attributes.push_back(attr);
+					const FVector d = point - c0;
+					const float du = d | eu, dv = d | ev;
+					uv[0] = (c * du - b * dv) / det;
+					uv[1] = (a * dv - b * du) / det;
+				};
+				std::vector<FVector>& square = DecalPieces[0];
+				square.clear();
+				for (int v = 0; v < 4; v++)
+					square.push_back(base + decal.Vertices[v]);
+
+				auto addPiece = [&](const std::vector<FVector>& piece)
+				{
+					for (size_t t = 1; t + 1 < piece.size() && decalTriangles < MaxDecalTriangles; t++)
+					{
+						const FVector* laidOut[3] = { &piece[0], &piece[t], &piece[t + 1] };
+						float uv[3][2];
+						vec3 laid[3];
+						for (int v = 0; v < 3; v++)
+						{
+							uvAt(*laidOut[v], uv[v]);
+							laid[v] = ToVec3(*laidOut[v] + lift);
+						}
+						TriangleAttributes attr;
+						attr.Normal = vec4(surfaceNormal.X, surfaceNormal.Y, surfaceNormal.Z, 0.0f);
+						attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(texture) ? 1.0f : 0.0f);
+						attr.Emission = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+						attr.Ambient = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+						attr.UV01 = vec4(uv[0][0], uv[0][1], uv[1][0], uv[1][1]);
+						attr.UV2Tex = vec4(uv[2][0], uv[2][1], (float)textureIndex, kind);
+						SetUvDensity(attr, laid);
+						for (int v = 0; v < 3; v++)
+							geometry.Positions.push_back(laid[v]);
+						geometry.Attributes.push_back(attr);
+						decalTriangles++;
+					}
+				};
+
+				bool clipped = false;
+				for (INT n = 0; n < decal.Nodes.Num(); n++)
+				{
+					const INT iNode = decal.Nodes(n);
+					if (iNode < 0 || iNode >= model->Nodes.Num())
+						continue;
+					const FBspNode& node = model->Nodes(iNode);
+					if (node.NumVertices < 3 || node.iVertPool < 0 || node.iVertPool + node.NumVertices > model->Verts.Num())
+						continue;
+					clipped = true;
+					FVector centre(0.0f, 0.0f, 0.0f);
+					for (INT v = 0; v < node.NumVertices; v++)
+						centre += model->Points(model->Verts(node.iVertPool + v).pVertex);
+					centre /= (float)node.NumVertices;
+
+					// Sutherland-Hodgman, against the plane through each edge
+					// square to the surface, keeping the side the node's middle
+					// is on.
+					std::vector<FVector>* piece = &DecalPieces[1];
+					std::vector<FVector>* next = &DecalPieces[2];
+					*piece = square;
+					for (INT v = 0; v < node.NumVertices && piece->size() >= 3; v++)
+					{
+						const FVector& p = model->Points(model->Verts(node.iVertPool + v).pVertex);
+						const FVector& q = model->Points(model->Verts(node.iVertPool + (v + 1) % node.NumVertices).pVertex);
+						FVector across = surfaceNormal ^ (q - p);
+						if (((centre - p) | across) < 0.0f)
+							across = -across;
+						next->clear();
+						for (size_t i = 0; i < piece->size(); i++)
+						{
+							const FVector& from = (*piece)[i];
+							const FVector& to = (*piece)[(i + 1) % piece->size()];
+							const float df = (from - p) | across, dt = (to - p) | across;
+							if (df >= 0.0f)
+								next->push_back(from);
+							if ((df >= 0.0f) != (dt >= 0.0f))
+								next->push_back(from + (to - from) * (df / (df - dt)));
+						}
+						std::swap(piece, next);
+					}
+					if (piece->size() >= 3)
+						addPiece(*piece);
 				}
+				// One the engine has no nodes for is laid whole.
+				if (!clipped)
+					addPiece(square);
 				added++;
 			}
 		}
@@ -1468,7 +1622,7 @@ void LevelScene::CollectDecals(ULevel* level)
 		// may ever hold.
 		TriangleAttributes unused = {};
 		unused.UV2Tex = vec4(0.0f, 0.0f, -1.0f, 0.0f);
-		geometry.Attributes.resize((size_t)MaxDecals * 2, unused);
+		geometry.Attributes.resize((size_t)MaxDecalTriangles, unused);
 
 		if (created)
 			GeometryAdded = true;
@@ -1696,6 +1850,11 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 	// every polygon, whatever the mesh says.
 	const bool actorUnlit = envSource && envSource->bUnlit;
 	skinHash ^= actorUnlit ? 2u : 0u;
+	skinHash *= 1099511628211ull;
+	// Fatness, which swells the mesh along its normals: a shield belt's
+	// shell is the wearer's own mesh, drawn a few units out from it.
+	const int fatness = envSource ? (int)envSource->Fatness : 128;
+	skinHash ^= (uint64_t)fatness << 8;
 	skinHash *= 1099511628211ull;
 
 #if defined(OLDUNREAL469SDK)
@@ -1925,6 +2084,44 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 			vertexNormals[tri.Vertex[v]] += posedTri.Normal;
 	}
 
+	// Fatness away from 128 pushes every vertex out along its smoothed normal
+	// (or in, below it) by Fatness / 16 - 8 world units, as Render's
+	// DrawLodMesh does: how a shield belt's shell stands off the body it
+	// wraps, rather than lying in it. Here in the mesh's own space, which
+	// the instance scales by DrawScale. Out is taken as away from the
+	// middle of the mesh, whichever way its faces are wound.
+	if (fatness != 128)
+	{
+		const float drawScale = (envSource && envSource->DrawScale != 0.0f) ? envSource->DrawScale : 1.0f;
+		const float push = ((float)fatness / 16.0f - 8.0f) / drawScale;
+		vec3 middle(0.0f);
+		int corners = 0;
+		for (const PosedTriangle& posedTri : posedTriangles)
+			if (posedTri.Ok)
+				for (int v = 0; v < 3; v++, corners++)
+					middle = middle + posedTri.Corners[v];
+		if (corners > 0)
+			middle = middle * (1.0f / (float)corners);
+		float outward = 0.0f;
+		for (size_t t = 0; t < triangles.size(); t++)
+			if (posedTriangles[t].Ok)
+				outward += dot(posedTriangles[t].Normal, posedTriangles[t].Corners[0] - middle);
+		const float sign = outward < 0.0f ? -1.0f : 1.0f;
+		for (size_t t = 0; t < triangles.size(); t++)
+		{
+			PosedTriangle& posedTri = posedTriangles[t];
+			if (!posedTri.Ok)
+				continue;
+			for (int v = 0; v < 3; v++)
+			{
+				const vec3 n = vertexNormals[triangles[t].Vertex[v]];
+				const float n2 = dot(n, n);
+				if (n2 > 1e-8f)
+					posedTri.Corners[v] = posedTri.Corners[v] + n * (sign * push / std::sqrt(n2));
+			}
+		}
+	}
+
 	// What each material comes to - its skin, its slot, its colour and kind -
 	// is the same for every triangle using it, and a mesh has a handful: each
 	// is worked out the first time a triangle uses it rather than for every
@@ -2138,6 +2335,12 @@ int LevelScene::GeometryForMesh(UMesh* mesh, int frameA, int frameB, float alpha
 // of its items in turn - which has no placement of its own to remember.
 void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCounts& counts)
 {
+	if (actor->DrawType == DT_Mesh && actor->Mesh && actor->bParticles)
+	{
+		PlaceParticles(actor, mask);
+		return;
+	}
+
 	int geometryIndex = -1;
 	FVector scale(1.0f, 1.0f, 1.0f);
 	const bool isCharacterActor = (actor->DrawType == DT_Mesh && actor->Mesh && actor->Mesh->AnimFrames > 1);
@@ -2367,6 +2570,7 @@ void LevelScene::CollectDynamic(ULevel* level)
 	GeometryAdded = false;
 	Instances.clear();
 	ActorInstances.clear();
+	ParticleTextures.clear();
 	FittingCandidates.clear();
 	LightPositions.clear();
 	Lights.clear();
@@ -2830,6 +3034,46 @@ bool LevelScene::PlaceHeldItem(APawn* pawn, uint32_t mask)
 		instance.Transform[1 * 4 + 3] = origin.Y + offset.Y;
 		instance.Transform[2 * 4 + 3] = origin.Z + offset.Z;
 		pose.GeometryIndex = geometryIndex;
+
+		// Its muzzle flash, while it fires: the engine draws the item again
+		// in the same frame with MuzzleFlashMesh, MuzzleFlashScale and
+		// MuzzleFlashTexture swapped in, and for most of UT's weapons as
+		// particles - a sprite at each of the flash mesh's vertices - which
+		// otherwise reached the screen only as flat tiles, through any wall.
+		if (item->bMuzzleFlashParticles && item->MuzzleFlashMesh && item->MuzzleFlashTexture && item->MuzzleFlashScale != 0.0f &&
+			(item->bSteadyFlash3rd || item->FlashCount != item->OldFlashCount))
+		{
+			UMesh* flash = item->MuzzleFlashMesh;
+			ULodMesh* flashLod = Cast<ULodMesh>(flash);
+			// The first frame's block, laid out as GeometryForMesh reads it.
+			const bool remap = flashLod && flashLod->Faces.Num() > 0 && flashLod->RemapAnimVerts.Num() > 0;
+			const INT first = (flashLod && !remap) ? flashLod->SpecialVerts : 0;
+			const INT frameVerts = remap ? flashLod->OldFrameVerts : flash->FrameVerts;
+			const float fs = item->MuzzleFlashScale;
+			const FVector flashOffset = x * (item->PrePivot.X * fs) + y * (item->PrePivot.Y * fs) + z * (item->PrePivot.Z * fs);
+			const FCoords flashCoords = GMath.UnitCoords / flash->RotOrigin;
+			UTexture* texture = item->MuzzleFlashTexture;
+			for (UTexture* t = texture; t; t = t->AnimNext)
+			{
+				ParticleTextures.insert(t);
+				if (t->AnimNext == texture || ParticleTextures.size() > 4096)
+					break;
+			}
+			const float kind = KindFromStyle(item->MuzzleFlashStyle) != 0.0f ? KindFromStyle(item->MuzzleFlashStyle) : 2.0f;
+			const int spriteIndex = GeometryForSprite(texture, kind);
+			for (INT v = first; spriteIndex >= 0 && v < frameVerts && v < flash->Verts.Num(); v++)
+			{
+				FVector local = (flash->Verts(v).Vector() - flash->Origin) * flash->Scale;
+				local = flashCoords.XAxis * local.X + flashCoords.YAxis * local.Y + flashCoords.ZAxis * local.Z;
+				const FVector at = origin + flashOffset + (x * local.X + y * local.Y + z * local.Z) * fs;
+				SceneInstance particle;
+				particle.GeometryIndex = spriteIndex;
+				SpriteTransform(fs * texture->USize, fs * texture->VSize, at, particle.Transform);
+				particle.Mask = mask;
+				particle.Ambient = vec4(1.0f, 1.0f, 1.0f, InstanceFlags(true, 1.0f, pawn->Region.Zone));
+				Instances.push_back(particle);
+			}
+		}
 		memcpy(pose.Transform, instance.Transform, sizeof(pose.Transform));
 	}
 

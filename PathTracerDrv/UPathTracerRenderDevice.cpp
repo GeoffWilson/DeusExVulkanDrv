@@ -370,6 +370,10 @@ void UPathTracerRenderDevice::StaticConstructor()
 	UseDLSS = 1;
 	DLSSQuality = 1;
 	DetailTextures = 1;
+	// As the other devices have them: the engine's lens flares round lights,
+	// and the game's full effects (see Init).
+	Coronas = 1;
+	HighDetailActors = 1;
 	MaxAnisotropy = 16.0f;
 	UseS3TC = 1;
 	Lighting = 1;
@@ -448,6 +452,13 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	guard(UPathTracerRenderDevice::Init);
 
 	Viewport = InViewport;
+	// Always the game's full effects. Without them UT's level runs in low
+	// detail (LevelInfo's bHighDetailMode follows this switch), where the
+	// damage amplifier paints the weapon solid purple instead of laying its
+	// fire over it, and the shield belt gilds the player and the weapon
+	// instead of wrapping them in its shell. An ini written before this
+	// device set it, with the engine's default of off, had UT so.
+	HighDetailActors = 1;
 	DenoiseEnabled = UseDenoiser != 0;
 	DlssEnabled = UseDLSS != 0;
 	DlssQualityNow = Clamp(DLSSQuality, 0, 4);
@@ -2132,6 +2143,21 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	unguardSlow;
 }
 
+// An FPlane the engine hands over by value. 469's 64-bit headers align FPlane
+// to 16 bytes, and the compiler loads one whole with an aligned move on the
+// strength of it, but the engine passes pointers to copies it makes on its
+// own stack 8 bytes off that (UViewport::Lock does): the aligned load faulted
+// at the first frame. Read a float at a time through a pointer the compiler
+// knows nothing about.
+static FPlane PlaneFromEngine(const FPlane& plane)
+{
+	const float* f = (const float*)&plane;
+#if defined(__clang__) || defined(__GNUC__)
+	__asm__("" : "+r"(f));
+#endif
+	return FPlane(f[0], f[1], f[2], f[3]);
+}
+
 void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* HitData, INT* HitSize)
 {
 	guard(UPathTracerRenderDevice::Lock);
@@ -2159,8 +2185,8 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 		CheckPhoto();
 		UpdateHeadsetHud();
 		HaveCamera = false;
-		FlashScale = InFlashScale;
-		FlashFog = InFlashFog;
+		FlashScale = PlaneFromEngine(InFlashScale);
+		FlashFog = PlaneFromEngine(InFlashFog);
 		TileVertices.clear();
 		TileBatches.clear();
 		TilesUploaded = false;
@@ -4386,6 +4412,14 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 		return;
 	}
 
+	// A particle of a mesh drawn as particles (LevelScene::PlaceParticles),
+	// which the trace has too, placed where walls hide it. The engine draws
+	// these with no span, so they came through every wall in the way: UT's
+	// spawn effects, its sparks. Only while it draws the world, so the HUD's
+	// own art is never taken for one.
+	if (WorldPass && Info.Texture && Scene.ParticleTextures.count(Info.Texture))
+		return;
+
 	// A texture can carry PF_Masked itself rather than the caller passing it.
 	// Modulated art is excluded: its transparency is carried by the grey level
 	// rather than by a palette hole, and punching alpha into it would leave
@@ -4472,7 +4506,8 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 		}
 	}
 
-	vec4 colour = vec4(Color.X, Color.Y, Color.Z, 1.0f);
+	const FPlane tint = PlaneFromEngine(Color);
+	vec4 colour = vec4(tint.X, tint.Y, tint.Z, 1.0f);
 	if (flags & PF_Modulated)
 		colour = vec4(1.0f, 1.0f, 1.0f, 1.0f);
 
