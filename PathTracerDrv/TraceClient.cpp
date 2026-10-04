@@ -31,7 +31,7 @@ bool TraceClient::Die(const std::string& why)
 	return false;
 }
 
-bool TraceClient::Start(VulkanDevice* device, const std::string& helperPath, const std::string& workingDirectory, bool vkDebug)
+bool TraceClient::Start(VulkanDevice* device, const std::string& helperPath, const std::string& workingDirectory, bool vkDebug, int headset)
 {
 	Device = device;
 
@@ -67,8 +67,9 @@ bool TraceClient::Start(VulkanDevice* device, const std::string& helperPath, con
 		snprintf(uuid + b * 2, 3, "%02x", id.deviceUUID[b]);
 
 	char cmdline[MAX_PATH * 2 + 256];
-	snprintf(cmdline, sizeof(cmdline), "\"%s\" --parent %lu --name %s --uuid %s%s",
-		helperPath.c_str(), GetCurrentProcessId(), name, uuid, vkDebug ? " --vkdebug" : "");
+	snprintf(cmdline, sizeof(cmdline), "\"%s\" --parent %lu --name %s --uuid %s%s%s",
+		helperPath.c_str(), GetCurrentProcessId(), name, uuid, vkDebug ? " --vkdebug" : "",
+		headset == 2 ? " --headset sim" : headset ? " --headset" : "");
 
 	// Tied to this process: a job that kills it when the last handle to the
 	// job closes, which the process's end does. The helper also watches for
@@ -180,6 +181,7 @@ void TraceClient::Stop()
 	if (Device)
 	{
 		ReleaseOutput();
+		ReleaseHud();
 		if (ReadySemaphore) vkDestroySemaphore(Device->device, ReadySemaphore, nullptr);
 		if (ReleasedSemaphore) vkDestroySemaphore(Device->device, ReleasedSemaphore, nullptr);
 		ReadySemaphore = ReleasedSemaphore = VK_NULL_HANDLE;
@@ -444,6 +446,8 @@ bool TraceClient::Trace(const TraceProtocol::TraceCommand& frame)
 		return false;
 	if (Shared->OutputGeneration != ImportedGeneration && !ImportOutput())
 		return false;
+	if (Shared->HudGeneration != ImportedHudGeneration && !ImportHud())
+		return false;
 	return true;
 }
 
@@ -474,53 +478,81 @@ bool TraceClient::ImportOutput()
 #endif
 	vkDeviceWaitIdle(Device->device);
 	ReleaseOutput();
+	if (!ImportImage(TraceProtocol::OutputFormat, TraceProtocol::OutputUsage, Shared->OutputWidth, Shared->OutputHeight,
+		Shared->OutputMemory, Shared->OutputAllocationSize, OutputImage, OutputMemory))
+		return false;
+	ImportedGeneration = Shared->OutputGeneration;
+	ImportedWidth = Shared->OutputWidth;
+	ImportedHeight = Shared->OutputHeight;
+	return true;
+}
 
-	const uint32_t width = Shared->OutputWidth, height = Shared->OutputHeight;
+void TraceClient::ReleaseHud()
+{
+	if (HudImage) vkDestroyImage(Device->device, HudImage, nullptr);
+	if (HudMemory) vkFreeMemory(Device->device, HudMemory, nullptr);
+	HudImage = VK_NULL_HANDLE;
+	HudMemory = VK_NULL_HANDLE;
+	HudImported[0] = HudImported[1] = 0;
+}
+
+// The HUD's image, likewise, when the helper has made it anew.
+bool TraceClient::ImportHud()
+{
+	vkDeviceWaitIdle(Device->device);
+	ReleaseHud();
+	if (!ImportImage(TraceProtocol::HudFormat, TraceProtocol::HudUsage, Shared->HudWidth, Shared->HudHeight,
+		Shared->HudMemory, Shared->HudAllocationSize, HudImage, HudMemory))
+		return false;
+	ImportedHudGeneration = Shared->HudGeneration;
+	HudImported[0] = Shared->HudWidth;
+	HudImported[1] = Shared->HudHeight;
+	return true;
+}
+
+bool TraceClient::ImportImage(VkFormat format, VkImageUsageFlags usage, uint32_t width, uint32_t height, uint64_t handle, uint64_t size, VkImage& image, VkDeviceMemory& memory)
+{
 	VkExternalMemoryImageCreateInfo external = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
 	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 	VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
 	info.pNext = &external;
 	info.imageType = VK_IMAGE_TYPE_2D;
-	info.format = TraceProtocol::OutputFormat;
+	info.format = format;
 	info.extent = { width, height, 1 };
 	info.mipLevels = 1;
 	info.arrayLayers = 1;
 	info.samples = VK_SAMPLE_COUNT_1_BIT;
 	info.tiling = VK_IMAGE_TILING_OPTIMAL;
-	info.usage = TraceProtocol::OutputUsage;
+	info.usage = usage;
 	info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	if (vkCreateImage(Device->device, &info, nullptr, &OutputImage) != VK_SUCCESS)
+	if (vkCreateImage(Device->device, &info, nullptr, &image) != VK_SUCCESS)
 		return Die("could not create the shared image here");
 
 	VkMemoryRequirements requirements;
-	vkGetImageMemoryRequirements(Device->device, OutputImage, &requirements);
-	VkPhysicalDeviceMemoryProperties memory;
-	vkGetPhysicalDeviceMemoryProperties(Device->PhysicalDevice.Device, &memory);
+	vkGetImageMemoryRequirements(Device->device, image, &requirements);
+	VkPhysicalDeviceMemoryProperties properties;
+	vkGetPhysicalDeviceMemoryProperties(Device->PhysicalDevice.Device, &properties);
 	uint32_t type = UINT32_MAX;
-	for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
-		if ((requirements.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+	for (uint32_t i = 0; i < properties.memoryTypeCount; i++)
+		if ((requirements.memoryTypeBits & (1u << i)) && (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
 		{
 			type = i;
 			break;
 		}
 
 	VkMemoryDedicatedAllocateInfo dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
-	dedicated.image = OutputImage;
+	dedicated.image = image;
 	VkImportMemoryWin32HandleInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
 	import.pNext = &dedicated;
 	import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-	import.handle = (HANDLE)(uintptr_t)Shared->OutputMemory;
+	import.handle = (HANDLE)(uintptr_t)handle;
 	VkMemoryAllocateInfo allocate = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
 	allocate.pNext = &import;
-	allocate.allocationSize = Shared->OutputAllocationSize;
+	allocate.allocationSize = size;
 	allocate.memoryTypeIndex = type;
-	if (type == UINT32_MAX || vkAllocateMemory(Device->device, &allocate, nullptr, &OutputMemory) != VK_SUCCESS)
+	if (type == UINT32_MAX || vkAllocateMemory(Device->device, &allocate, nullptr, &memory) != VK_SUCCESS)
 		return Die("could not import the shared image's memory");
-	if (vkBindImageMemory(Device->device, OutputImage, OutputMemory, 0) != VK_SUCCESS)
+	if (vkBindImageMemory(Device->device, image, memory, 0) != VK_SUCCESS)
 		return Die("could not bind the shared image's memory");
-
-	ImportedGeneration = Shared->OutputGeneration;
-	ImportedWidth = width;
-	ImportedHeight = height;
 	return true;
 }

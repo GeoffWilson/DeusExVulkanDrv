@@ -133,18 +133,22 @@ void TraceRenderer::CreateTracePipeline()
 		.DebugName("PathTracerViewSetLayout")
 		.Create(Device);
 
-	const int viewSets = 1 + (int)TraceProtocol::MaxInsets;
+	// Set 0 once for each view, and set 1 for each view and each window.
+	const int imageSets = MaxViews + (int)TraceProtocol::MaxInsets;
 	DescriptorPool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 + GuideImageCount + 3 * viewSets)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxTextures)
-		.MaxSets(1 + viewSets)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, MaxViews)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MaxViews * (2 + GuideImageCount) + 3 * imageSets)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaxViews * 9)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxViews * MaxTextures)
+		.MaxSets(MaxViews + imageSets)
 		.DebugName("PathTracerDescriptorPool")
 		.Create(Device);
 
-	DescriptorSet = DescriptorPool->allocate(DescriptorLayout.get());
-	ViewSet = DescriptorPool->allocate(ViewLayout.get());
+	for (View& view : Views)
+	{
+		view.SceneSet = DescriptorPool->allocate(DescriptorLayout.get());
+		view.ImageSet = DescriptorPool->allocate(ViewLayout.get());
+	}
 	for (Inset& inset : Insets)
 		inset.Set = DescriptorPool->allocate(ViewLayout.get());
 
@@ -153,9 +157,10 @@ void TraceRenderer::CreateTracePipeline()
 		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
 		.DebugName("PathTracerMaterials")
 		.Create(Device);
-	WriteDescriptors()
-		.AddBuffer(DescriptorSet.get(), 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaterialBuffer.get())
-		.Execute(Device);
+	WriteDescriptors materials;
+	for (View& view : Views)
+		materials.AddBuffer(view.SceneSet.get(), 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaterialBuffer.get());
+	materials.Execute(Device);
 
 	PipelineLayout = PipelineLayoutBuilder()
 		.AddSetLayout(DescriptorLayout.get())
@@ -203,12 +208,13 @@ void TraceRenderer::CreateFinishPipeline()
 		.Create(Device);
 
 	FinishPool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2)
-		.MaxSets(1)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * MaxViews)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * MaxViews)
+		.MaxSets(MaxViews)
 		.DebugName("PathTracerFinishPool")
 		.Create(Device);
-	FinishSet = FinishPool->allocate(FinishLayout.get());
+	for (View& view : Views)
+		view.FinishSet = FinishPool->allocate(FinishLayout.get());
 
 	// The fog is traced at the render size and filtered up to the output's.
 	FogSampler = SamplerBuilder()
@@ -247,11 +253,12 @@ void TraceRenderer::CreateCompositePipeline()
 	CompositeLayout = layout.DebugName("PathTracerCompositeSetLayout").Create(Device);
 
 	CompositePool = DescriptorPoolBuilder()
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9)
-		.MaxSets(1)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 * MaxViews)
+		.MaxSets(MaxViews)
 		.DebugName("PathTracerCompositePool")
 		.Create(Device);
-	CompositeSet = CompositePool->allocate(CompositeLayout.get());
+	for (View& view : Views)
+		view.CompositeSet = CompositePool->allocate(CompositeLayout.get());
 
 	CompositePipelineLayout = PipelineLayoutBuilder()
 		.AddSetLayout(CompositeLayout.get())
@@ -289,7 +296,7 @@ void TraceRenderer::ResetScene()
 	// which slots the shader might reach.
 	WriteDescriptors writes;
 	for (int i = 0; i < MaxTextures; i++)
-		writes.AddCombinedImageSampler(DescriptorSet.get(), 6, i, WhiteView.get(), SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		WriteTextureSlot(writes, i, WhiteView.get());
 	writes.Execute(Device);
 	auto* mapped = (vec4*)MaterialBuffer->Map(0, MaxTextures * sizeof(vec4));
 	for (int i = 0; i < MaxTextures; i++)
@@ -297,7 +304,15 @@ void TraceRenderer::ResetScene()
 	MaterialBuffer->Unmap();
 
 	DescriptorsDirty = true;
-	DenoiseRestart = true;
+	for (View& view : Views)
+		view.DenoiseRestart = true;
+}
+
+// A slot of the texture array, in every view's set.
+void TraceRenderer::WriteTextureSlot(WriteDescriptors& writes, int index, VulkanImageView* image)
+{
+	for (View& view : Views)
+		writes.AddCombinedImageSampler(view.SceneSet.get(), 6, index, image, SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 // The texture filter's anisotropy, the device's MaxAnisotropy: how many
@@ -328,10 +343,7 @@ void TraceRenderer::SetAnisotropy(uint32_t samples)
 
 	WriteDescriptors writes;
 	for (int i = 0; i < MaxTextures; i++)
-	{
-		VulkanImageView* view = Slots[i].View ? Slots[i].View.get() : WhiteView.get();
-		writes.AddCombinedImageSampler(DescriptorSet.get(), 6, i, view, SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-	}
+		WriteTextureSlot(writes, i, Slots[i].View ? Slots[i].View.get() : WhiteView.get());
 	writes.Execute(Device);
 	if (samples > 1)
 		debugf("PathTracer texture filter: %ux anisotropic", samples);
@@ -341,9 +353,9 @@ void TraceRenderer::SetAnisotropy(uint32_t samples)
 
 void TraceRenderer::BindWhite(uint32_t index)
 {
-	WriteDescriptors()
-		.AddCombinedImageSampler(DescriptorSet.get(), 6, (int)index, WhiteView.get(), SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-		.Execute(Device);
+	WriteDescriptors writes;
+	WriteTextureSlot(writes, (int)index, WhiteView.get());
+	writes.Execute(Device);
 }
 
 // A new level's textures, or one first seen mid-level. It rewrites the
@@ -423,9 +435,9 @@ void TraceRenderer::SetTexture(uint32_t index, uint32_t width, uint32_t height, 
 			.Execute(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	});
 
-	WriteDescriptors()
-		.AddCombinedImageSampler(DescriptorSet.get(), 6, (int)index, slot.View.get(), SceneSampler.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-		.Execute(Device);
+	WriteDescriptors writes;
+	WriteTextureSlot(writes, (int)index, slot.View.get());
+	writes.Execute(Device);
 }
 
 void TraceRenderer::SetTexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels)
@@ -483,36 +495,36 @@ void TraceRenderer::RecordTexturePixels(VulkanCommandBuffer* commands, FrameUplo
 	Pending.clear();
 }
 
-// The trace's images at the render size, the picture at the output size -
-// the same two sizes unless Ray Reconstruction is upscaling - and its own
-// images when it is in use.
-void TraceRenderer::Resize(int width, int height, int outputWidth, int outputHeight, bool forRayReconstruction)
+// A view's images: the trace's at the render size, the picture at the output
+// size - the same two sizes unless Ray Reconstruction is upscaling - and its
+// own images when it is in use.
+void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, int outputHeight, bool forRayReconstruction)
 {
 	Context->WaitForGpu();
 
-	AccumView.reset();
-	AccumImage.reset();
-	HistoryView.reset();
-	HistoryImage.reset();
-	OutputView.reset();
-	OutputImage.reset();
-	MotionView.reset();
-	ReflectionMotionView.reset();
+	view.AccumView.reset();
+	view.AccumImage.reset();
+	view.HistoryView.reset();
+	view.HistoryImage.reset();
+	view.OutputView.reset();
+	view.OutputImage.reset();
+	view.MotionView.reset();
+	view.ReflectionMotionView.reset();
 	for (int i = 0; i < GuideImageCount; i++)
 	{
-		GuideViews[i].reset();
-		GuideImages[i].reset();
+		view.GuideViews[i].reset();
+		view.GuideImages[i].reset();
 	}
-	RrColorView.reset();
-	RrColorImage.reset();
-	RrDepthView.reset();
-	RrDepthImage.reset();
-	RrMotionView.reset();
-	RrMotionImage.reset();
-	RrOutputView.reset();
-	RrOutputImage.reset();
+	view.RrColorView.reset();
+	view.RrColorImage.reset();
+	view.RrDepthView.reset();
+	view.RrDepthImage.reset();
+	view.RrMotionView.reset();
+	view.RrMotionImage.reset();
+	view.RrOutputView.reset();
+	view.RrOutputImage.reset();
 
-	auto makeImage = [&](std::unique_ptr<VulkanImage>& image, std::unique_ptr<VulkanImageView>& view, VkFormat format, int w, int h, VkImageUsageFlags usage, const char* name)
+	auto makeImage = [&](std::unique_ptr<VulkanImage>& image, std::unique_ptr<VulkanImageView>& imageView, VkFormat format, int w, int h, VkImageUsageFlags usage, const char* name)
 	{
 		image = ImageBuilder()
 			.Format(format)
@@ -520,17 +532,17 @@ void TraceRenderer::Resize(int width, int height, int outputWidth, int outputHei
 			.Usage(usage)
 			.DebugName(name)
 			.Create(Device);
-		view = ImageViewBuilder().Image(image.get(), format).DebugName(name).Create(Device);
+		imageView = ImageViewBuilder().Image(image.get(), format).DebugName(name).Create(Device);
 	};
 
-	makeImage(AccumImage, AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerAccum");
+	makeImage(view.AccumImage, view.AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerAccum");
 
 	// What each pixel was looking at last frame: the world position it hit and
 	// which instance owned it. Compared against this frame to decide whether the
 	// pixel's accumulated history still describes the same thing.
-	makeImage(HistoryImage, HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerHistory");
+	makeImage(view.HistoryImage, view.HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerHistory");
 
-	makeImage(OutputImage, OutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight,
+	makeImage(view.OutputImage, view.OutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight,
 		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerOutput");
 
 	// In the trace shader's binding order. Depth and motion want the full
@@ -538,7 +550,7 @@ void TraceRenderer::Resize(int width, int height, int outputWidth, int outputHei
 	for (int i = 0; i < GuideImageCount; i++)
 	{
 		const VkFormat format = GuideIsDepth(i) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-		makeImage(GuideImages[i], GuideViews[i], format, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "PathTracerGuide");
+		makeImage(view.GuideImages[i], view.GuideViews[i], format, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "PathTracerGuide");
 	}
 
 	// NRD reads motion from x and y, where the trace keeps the depth; a view
@@ -552,188 +564,202 @@ void TraceRenderer::Resize(int width, int height, int outputWidth, int outputHei
 		info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
 		info.components = { VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE };
 		info.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-		VkImageView view = VK_NULL_HANDLE;
-		vkCreateImageView(Device->device, &info, nullptr, &view);
-		return std::unique_ptr<VulkanImageView>(new VulkanImageView(Device, view));
+		VkImageView handle = VK_NULL_HANDLE;
+		vkCreateImageView(Device->device, &info, nullptr, &handle);
+		return std::unique_ptr<VulkanImageView>(new VulkanImageView(Device, handle));
 	};
-	MotionView = motionView(GuideImages[1].get());
-	ReflectionMotionView = motionView(GuideImages[9].get());
+	view.MotionView = motionView(view.GuideImages[1].get());
+	view.ReflectionMotionView = motionView(view.GuideImages[9].get());
 
 	// Ray Reconstruction's own. The depth and motion are bound whether or not
 	// it is in use, so they are always made; the picture it reads and the one
 	// it writes only when it is.
 	const VkImageUsageFlags rrUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-	makeImage(RrDepthImage, RrDepthView, VK_FORMAT_R32_SFLOAT, width, height, rrUsage, "PathTracerRrDepth");
-	makeImage(RrMotionImage, RrMotionView, VK_FORMAT_R16G16_SFLOAT, width, height, rrUsage, "PathTracerRrMotion");
+	makeImage(view.RrDepthImage, view.RrDepthView, VK_FORMAT_R32_SFLOAT, width, height, rrUsage, "PathTracerRrDepth");
+	makeImage(view.RrMotionImage, view.RrMotionView, VK_FORMAT_R16G16_SFLOAT, width, height, rrUsage, "PathTracerRrMotion");
 	if (forRayReconstruction)
 	{
-		makeImage(RrColorImage, RrColorView, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, rrUsage, "PathTracerRrColor");
-		makeImage(RrOutputImage, RrOutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight, rrUsage, "PathTracerRrOutput");
+		makeImage(view.RrColorImage, view.RrColorView, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, rrUsage, "PathTracerRrColor");
+		makeImage(view.RrOutputImage, view.RrOutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight, rrUsage, "PathTracerRrOutput");
 	}
 
-	if (Denoise)
+	if (view.Denoise)
 	{
 		try
 		{
-			Denoise->Resize(width, height);
+			view.Denoise->Resize(width, height);
 		}
 		catch (const std::exception& e)
 		{
 			debugf("PathTracer denoiser failed: %s", e.what());
-			Denoise.reset();
+			view.Denoise.reset();
 			DenoiseFailed = true;
 		}
 	}
-	DenoiseRestart = true;
+	view.DenoiseRestart = true;
 
-	TraceWidth = width;
-	TraceHeight = height;
-	OutputWidth = outputWidth;
-	OutputHeight = outputHeight;
-	TracingForRr = forRayReconstruction;
+	view.TraceWidth = width;
+	view.TraceHeight = height;
+	view.OutputWidth = outputWidth;
+	view.OutputHeight = outputHeight;
+	view.TracingForRr = forRayReconstruction;
 	DescriptorsDirty = true;
 
 	// Everything starts undefined and the shaders use it as GENERAL.
-	Context->ExecuteImmediate([this](VulkanCommandBuffer* cmd)
+	Context->ExecuteImmediate([&view](VulkanCommandBuffer* cmd)
 	{
-		StartCleared(cmd, AccumImage.get(), HistoryImage.get());
+		StartCleared(cmd, view.AccumImage.get(), view.HistoryImage.get());
 		PipelineBarrier barrier;
-		for (VulkanImage* image : { OutputImage.get(), RrDepthImage.get(), RrMotionImage.get(), RrColorImage.get(), RrOutputImage.get() })
+		for (VulkanImage* image : { view.OutputImage.get(), view.RrDepthImage.get(), view.RrMotionImage.get(), view.RrColorImage.get(), view.RrOutputImage.get() })
 			if (image)
 				barrier.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
 		for (int i = 0; i < GuideImageCount; i++)
-			barrier.AddImage(GuideImages[i].get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+			barrier.AddImage(view.GuideImages[i].get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
 		barrier.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	});
 
+	const char* which = &view == &Views[0] ? "" : " (right eye)";
 	if (width == outputWidth && height == outputHeight)
-		debugf("PathTracer buffers: %dx%d", width, height);
+		debugf("PathTracer buffers: %dx%d%s", width, height, which);
 	else
-		debugf("PathTracer buffers: traced at %dx%d for %dx%d", width, height, outputWidth, outputHeight);
+		debugf("PathTracer buffers: traced at %dx%d for %dx%d%s", width, height, outputWidth, outputHeight, which);
 }
 
 // Made the first time it is wanted, so a game that never denoises neither
 // builds NRD's pipelines nor risks them failing, and made again when materials
 // are switched, since that changes the shape of its first signal. A failure
 // switches denoising off rather than taking the helper down with it.
-void TraceRenderer::EnsureDenoiser(bool wanted, bool materials)
+void TraceRenderer::EnsureDenoiser(View& view, bool wanted, bool materials)
 {
-	if (Denoise && Denoise->HasSpecular() != materials)
+	if (view.Denoise && view.Denoise->HasSpecular() != materials)
 	{
 		Context->WaitForGpu();
-		Denoise.reset();
-		DenoiseRestart = true;
+		view.Denoise.reset();
+		view.DenoiseRestart = true;
 		DescriptorsDirty = true;
 	}
 
-	if (!wanted || Denoise || DenoiseFailed || !TraceWidth)
+	if (!wanted || view.Denoise || DenoiseFailed || !view.TraceWidth)
 		return;
 
 	try
 	{
-		Denoise.reset(new Denoiser(Device, materials));
-		Denoise->Resize(TraceWidth, TraceHeight);
+		view.Denoise.reset(new Denoiser(Device, materials));
+		view.Denoise->Resize(view.TraceWidth, view.TraceHeight);
 	}
 	catch (const std::exception& e)
 	{
 		debugf("PathTracer denoiser failed: %s", e.what());
-		Denoise.reset();
+		view.Denoise.reset();
 		DenoiseFailed = true;
 	}
 	DescriptorsDirty = true;
-	if (Denoise)
+	if (view.Denoise)
 	{
-		debugf("PathTracer denoiser: %s", Denoise->Problem());
-		if (!Denoise->Available())
+		debugf("PathTracer denoiser: %s", view.Denoise->Problem());
+		if (!view.Denoise->Available())
 			DenoiseFailed = true;
 	}
 }
 
-void TraceRenderer::WriteCompositeDescriptors()
+void TraceRenderer::WriteCompositeDescriptors(View& view)
 {
-	if (!CompositeSet || !OutputView || !Denoise || !Denoise->Available() || !Denoise->Output(0))
+	if (!view.CompositeSet || !view.OutputView || !view.Denoise || !view.Denoise->Available() || !view.Denoise->Output(0))
 		return;
 
+	VulkanDescriptorSet* set = view.CompositeSet.get();
 	WriteDescriptors()
-		.AddStorageImage(CompositeSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 1, GuideViews[4].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 2, GuideViews[5].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 3, GuideViews[6].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 4, Denoise->Output(0), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 5, Denoise->Output(1), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 6, GuideViews[7].get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(CompositeSet.get(), 7, GuideViews[11].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 0, view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 1, view.GuideViews[4].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 2, view.GuideViews[5].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 3, view.GuideViews[6].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 4, view.Denoise->Output(0), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 5, view.Denoise->Output(1), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 6, view.GuideViews[7].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 7, view.GuideViews[11].get(), VK_IMAGE_LAYOUT_GENERAL)
 		// Never read without materials, but a descriptor still has to be valid.
-		.AddStorageImage(CompositeSet.get(), 8, Denoise->SpecularOutput() ? Denoise->SpecularOutput() : GuideViews[10].get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(set, 8, view.Denoise->SpecularOutput() ? view.Denoise->SpecularOutput() : view.GuideViews[10].get(), VK_IMAGE_LAYOUT_GENERAL)
 		.Execute(Device);
 }
 
 // Only when something they point at was made again. The frame before may
 // still be reading them, so it is waited for first: descriptors in use cannot
 // be rewritten.
-void TraceRenderer::WriteFinishDescriptors()
+void TraceRenderer::WriteFinishDescriptors(View& view)
 {
-	if (!FinishSet || !OutputView || !RrOutputView)
+	if (!view.FinishSet || !view.OutputView || !view.RrOutputView)
 		return;
 	WriteDescriptors()
-		.AddStorageImage(FinishSet.get(), 0, OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(FinishSet.get(), 1, RrOutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddCombinedImageSampler(FinishSet.get(), 2, GuideViews[7].get(), FogSampler.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(view.FinishSet.get(), 0, view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddStorageImage(view.FinishSet.get(), 1, view.RrOutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddCombinedImageSampler(view.FinishSet.get(), 2, view.GuideViews[7].get(), FogSampler.get(), VK_IMAGE_LAYOUT_GENERAL)
 		// The flashlight's beam, in the emission image NRD would use.
-		.AddCombinedImageSampler(FinishSet.get(), 3, GuideViews[4].get(), FogSampler.get(), VK_IMAGE_LAYOUT_GENERAL)
+		.AddCombinedImageSampler(view.FinishSet.get(), 3, view.GuideViews[4].get(), FogSampler.get(), VK_IMAGE_LAYOUT_GENERAL)
 		.Execute(Device);
 }
 
+// Every view that has its images: the scene's bindings, which are the same in
+// each, and its own.
 void TraceRenderer::UpdateDescriptors()
 {
-	if (!DescriptorsDirty || !Accel->IsReady() || !AccumView || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !Accel->GetLightmapBuffer() || !Accel->GetEmitterBuffer() || !MotionBuffer || !FogShadowBuffer)
+	if (!DescriptorsDirty || !Accel->IsReady() || !Accel->GetInstanceDataBuffer() || !Accel->GetLightGridBuffer() || !Accel->GetLightmapBuffer() || !Accel->GetEmitterBuffer() || !FogShadowBuffer)
 		return;
+	for (int v = 0; v < ActiveViews; v++)
+		if (!Views[v].AccumView || !Views[v].MotionBuffer)
+			return;
 	Context->WaitForGpu();
 
-	WriteDescriptors writes;
-	for (int i = 0; i < GuideImageCount; i++)
-		writes.AddStorageImage(DescriptorSet.get(), GuideBinding(i), GuideViews[i].get(), VK_IMAGE_LAYOUT_GENERAL);
-	writes.AddBuffer(DescriptorSet.get(), 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MotionBuffer.get());
-	writes.AddBuffer(DescriptorSet.get(), 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, FogShadowBuffer.get());
-	writes
-		.AddAccelerationStructure(DescriptorSet.get(), 0, Accel->GetTopLevel())
-		.AddStorageImage(ViewSet.get(), 0, AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		// With Ray Reconstruction the trace's picture is its input, at the
-		// render size; otherwise it is the picture.
-		.AddStorageImage(ViewSet.get(), 1, TracingForRr ? RrColorView.get() : OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(ViewSet.get(), 2, HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(DescriptorSet.get(), 23, RrDepthView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddStorageImage(DescriptorSet.get(), 24, RrMotionView.get(), VK_IMAGE_LAYOUT_GENERAL)
-		.AddBuffer(DescriptorSet.get(), 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
-		.AddBuffer(DescriptorSet.get(), 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
-		.AddBuffer(DescriptorSet.get(), 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
-		.AddBuffer(DescriptorSet.get(), 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightGridBuffer())
-		.AddBuffer(DescriptorSet.get(), 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightmapBuffer())
-		.AddBuffer(DescriptorSet.get(), 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetEmitterBuffer())
-		.Execute(Device);
-	WriteCompositeDescriptors();
-	WriteFinishDescriptors();
+	for (View& view : Views)
+	{
+		if (!view.AccumView || !view.MotionBuffer)
+			continue;
+		VulkanDescriptorSet* set = view.SceneSet.get();
+		WriteDescriptors writes;
+		for (int i = 0; i < GuideImageCount; i++)
+			writes.AddStorageImage(set, GuideBinding(i), view.GuideViews[i].get(), VK_IMAGE_LAYOUT_GENERAL);
+		writes.AddBuffer(set, 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, view.MotionBuffer.get());
+		writes.AddBuffer(set, 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, FogShadowBuffer.get());
+		writes
+			.AddAccelerationStructure(set, 0, Accel->GetTopLevel())
+			.AddStorageImage(view.ImageSet.get(), 0, view.AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			// With Ray Reconstruction the trace's picture is its input, at the
+			// render size; otherwise it is the picture.
+			.AddStorageImage(view.ImageSet.get(), 1, view.TracingForRr ? view.RrColorView.get() : view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			.AddStorageImage(view.ImageSet.get(), 2, view.HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			.AddStorageImage(set, 23, view.RrDepthView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			.AddStorageImage(set, 24, view.RrMotionView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			.AddBuffer(set, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
+			.AddBuffer(set, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightBuffer())
+			.AddBuffer(set, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetInstanceDataBuffer())
+			.AddBuffer(set, 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightGridBuffer())
+			.AddBuffer(set, 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetLightmapBuffer())
+			.AddBuffer(set, 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetEmitterBuffer())
+			.Execute(Device);
+		WriteCompositeDescriptors(view);
+		WriteFinishDescriptors(view);
+	}
 
 	DescriptorsDirty = false;
 }
 
 // Last frame's camera, this frame's jitter for Ray Reconstruction and how
-// much the glowing surfaces light, the flashlight, then each instance's last
-// placement as three rows, in the
+// much the glowing surfaces light, the flashlight, where the middle of the
+// view is, then each instance's last placement as three rows, in the
 // order the top level structure numbers them. An instance with no last
 // placement - new this frame, or one that never moves - is given its current
-// one, which reads as not having moved.
-void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 jitter, FrameUploads& uploads)
+// one, which reads as not having moved. Each view has its own, for its own
+// last camera.
+void TraceRenderer::WriteMotion(View& view, const TraceProtocol::TraceCommand& frame, const vec4* previousCamera, vec4 shift, vec2 jitter, FrameUploads& uploads)
 {
-	const size_t header = 13;
+	const size_t header = 14;
 	const size_t count = Scene.Instances.size();
 	const size_t wanted = header + std::max<size_t>(count, 1) * 3;
-	if (!MotionBuffer || wanted > MotionCapacity)
+	if (!view.MotionBuffer || wanted > view.MotionCapacity)
 	{
-		MotionCapacity = std::max<size_t>(wanted * 2, header + 256 * 3);
-		uploads.Retire(std::move(MotionBuffer));
-		MotionBuffer = BufferBuilder()
-			.Size(MotionCapacity * sizeof(vec4))
+		view.MotionCapacity = std::max<size_t>(wanted * 2, header + 256 * 3);
+		uploads.Retire(std::move(view.MotionBuffer));
+		view.MotionBuffer = BufferBuilder()
+			.Size(view.MotionCapacity * sizeof(vec4))
 			.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 			.MinAlignment(256)
 			.DebugName("PathTracerMotion")
@@ -741,9 +767,9 @@ void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 j
 		DescriptorsDirty = true;
 	}
 
-	auto* mapped = (vec4*)uploads.Write(MotionBuffer.get(), 0, wanted * sizeof(vec4));
+	auto* mapped = (vec4*)uploads.Write(view.MotionBuffer.get(), 0, wanted * sizeof(vec4));
 	for (int i = 0; i < 4; i++)
-		mapped[i] = frame.PreviousCamera[i];
+		mapped[i] = previousCamera[i];
 	mapped[4] = vec4(jitter.x, jitter.y, frame.GlowLighting, frame.Wetness);
 	for (int i = 0; i < 3; i++)
 		mapped[5 + i] = frame.Flashlight[i];
@@ -751,6 +777,7 @@ void TraceRenderer::WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 j
 		mapped[8 + i] = frame.SkyAxes[i];
 	mapped[11] = frame.PhotoLens;
 	mapped[12] = vec4(frame.BumpMapping, std::max(frame.ToneCeiling, 1.0f), 0.0f, 0.0f);
+	mapped[13] = shift;
 	for (size_t i = 0; i < count; i++)
 	{
 		const SceneInstance& instance = Scene.Instances[i];
@@ -782,7 +809,7 @@ void TraceRenderer::EnsureFogShadows(uint32_t count, FrameUploads& uploads)
 	DescriptorsDirty = true;
 }
 
-bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, int slot)
+bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, int slot, const EyeView* eyes, bool sideBySide)
 {
 	using namespace TraceProtocol;
 	if (frame.Width == 0 || frame.Height == 0)
@@ -814,24 +841,42 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	const bool wantNrd = frame.Denoise == DenoiseNrd || (frame.Denoise == DenoiseDlss && !useRr);
 	const int quality = (int)std::min(frame.DlssQuality, 4u);
 
-	// The trace runs at the size Ray Reconstruction is trained for at this
-	// quality, which it then upscales to the size the device asked for.
-	uint32_t renderWidth = frame.Width, renderHeight = frame.Height;
-	if (useRr)
-		Rr->RenderSize(frame.Width, frame.Height, quality, renderWidth, renderHeight);
-	if ((int)renderWidth != TraceWidth || (int)renderHeight != TraceHeight ||
-		(int)frame.Width != OutputWidth || (int)frame.Height != OutputHeight || useRr != TracingForRr)
-		Resize((int)renderWidth, (int)renderHeight, (int)frame.Width, (int)frame.Height, useRr);
+	// The views: the screen's, or the headset's eyes. Going from one to the
+	// other, every view's history describes some other view.
+	const int viewCount = eyes ? 2 : 1;
+	if ((eyes != nullptr) != TracedEyes)
+		for (View& view : Views)
+			view.DenoiseRestart = true;
+	ActiveViews = viewCount;
+	for (int v = 0; v < viewCount; v++)
+	{
+		View& view = Views[v];
+		const uint32_t width = eyes ? eyes[v].Width : frame.Width;
+		const uint32_t height = eyes ? eyes[v].Height : frame.Height;
 
-	if (frame.RestartDenoiser)
-		DenoiseRestart = true;
-	EnsureDenoiser(wantNrd, frame.Materials != 0);
-	const bool denoising = wantNrd && Denoise && Denoise->Available() && frame.ViewMode == 0;
+		// The trace runs at the size Ray Reconstruction is trained for at
+		// this quality, which it then upscales to the size asked for.
+		uint32_t renderWidth = width, renderHeight = height;
+		if (useRr)
+			Rr->RenderSize(width, height, quality, renderWidth, renderHeight);
+		if ((int)renderWidth != view.TraceWidth || (int)renderHeight != view.TraceHeight ||
+			(int)width != view.OutputWidth || (int)height != view.OutputHeight || useRr != view.TracingForRr)
+			Resize(view, (int)renderWidth, (int)renderHeight, (int)width, (int)height, useRr);
+
+		if (frame.RestartDenoiser)
+			view.DenoiseRestart = true;
+		EnsureDenoiser(view, wantNrd, frame.Materials != 0);
+	}
 
 	// Remade when its sizes or quality change, which the frame in flight may
 	// still be using.
-	if (useRr && Rr->NeedsFeature(TraceWidth, TraceHeight, OutputWidth, OutputHeight, quality))
-		Context->WaitForGpu();
+	if (useRr)
+		for (int v = 0; v < viewCount; v++)
+			if (Rr->NeedsFeature(v, Views[v].TraceWidth, Views[v].TraceHeight, Views[v].OutputWidth, Views[v].OutputHeight, quality))
+			{
+				Context->WaitForGpu();
+				break;
+			}
 	const vec2 jitter = useRr ? RayReconstruction::Jitter(frame.Frame) : vec2(0.0f, 0.0f);
 
 	const auto now = std::chrono::steady_clock::now();
@@ -852,7 +897,11 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	lap(1);
 	RecordStageMs[1] -= Accel->LightsMs - lightsBefore;
 	RecordStageMs[2] += Accel->LightsMs - lightsBefore;
-	WriteMotion(frame, jitter, uploads);
+	for (int v = 0; v < viewCount; v++)
+	{
+		const vec4 shift = eyes ? vec4(eyes[v].Shift.x, eyes[v].Shift.y, eyes[v].PreviousShift.x, eyes[v].PreviousShift.y) : vec4(0.0f);
+		WriteMotion(Views[v], frame, eyes ? eyes[v].PreviousCamera : frame.PreviousCamera, shift, jitter, uploads);
+	}
 	// Room for a shadow cube for each fog light, when the fog is drawn
 	// with its shadows.
 	const uint32_t fogShadows = ((frame.DisableBits & (32u | 65536u)) == 0u)
@@ -915,19 +964,32 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	UpdateDescriptors();
 	lap(6);
 
-	PushConstants.CameraOrigin = frame.Camera[0];
-	PushConstants.CameraRight = frame.Camera[1];
-	PushConstants.CameraUp = frame.Camera[2];
-	PushConstants.CameraForward = frame.Camera[3];
-	PushConstants.Disable = frame.DisableBits | ((frame.ViewMode || denoising) ? 64u : 0u) | (frame.Materials ? 0u : 128u) | (useRr ? 256u : 0u);
+	// Whether a view is denoised by NRD: it wants it, and its denoiser could
+	// be made.
+	auto nrdFor = [&](const View& view) { return wantNrd && view.Denoise && view.Denoise->Available() && frame.ViewMode == 0; };
+
+	// A view's camera, as the frame describes the screen's or as an eye is.
+	// The screen flash rides in the frame's w, whichever it is.
+	auto setCamera = [&](int v)
+	{
+		const vec4* camera = eyes ? eyes[v].Camera : frame.Camera;
+		PushConstants.CameraOrigin = vec4(camera[0].x, camera[0].y, camera[0].z, frame.Camera[0].w);
+		PushConstants.CameraRight = vec4(camera[1].x, camera[1].y, camera[1].z, frame.Camera[1].w);
+		PushConstants.CameraUp = vec4(camera[2].x, camera[2].y, camera[2].z, frame.Camera[2].w);
+		PushConstants.CameraForward = vec4(camera[3].x, camera[3].y, camera[3].z, frame.Camera[3].w);
+		PushConstants.Disable = frame.DisableBits | ((frame.ViewMode || nrdFor(Views[v])) ? 64u : 0u) | (frame.Materials ? 0u : 128u) | (useRr ? 256u : 0u);
+	};
+	setCamera(0);
 	PushConstants.Counts[0] = frame.Frame;
 	PushConstants.Counts[1] = (uint32_t)Accel->LightCount();
 	// The top byte, signed, in sixteenths: how many mip levels sharper to
 	// sample than the traced pixels' size calls for, when they are fewer than
 	// the output's - Ray Reconstruction rebuilds the finer detail, and NVIDIA
 	// asks for textures at the output's resolution, log2(render / output).
-	const float mipBias = (OutputHeight > 0 && TraceHeight > 0 && TraceHeight < OutputHeight)
-		? std::log2((float)TraceHeight / (float)OutputHeight) : 0.0f;
+	// The eyes are one size, so one serves both.
+	const View& first = Views[0];
+	const float mipBias = (first.OutputHeight > 0 && first.TraceHeight > 0 && first.TraceHeight < first.OutputHeight)
+		? std::log2((float)first.TraceHeight / (float)first.OutputHeight) : 0.0f;
 	const int mipBiasSteps = std::max(-128, std::min(127, (int)std::lround(mipBias * 16.0f)));
 	PushConstants.Counts[2] = std::min(std::max(frame.Bounces, 1u), 255u) | (std::min(frame.GlossBounces, 255u) << 8) |
 		(std::min(frame.LightSize, 255u) << 16) | ((uint32_t)(uint8_t)(int8_t)mipBiasSteps << 24);
@@ -942,15 +1004,15 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		frame.Lighting ? 1.0f : 0.0f,
 		(float)(frame.ViewMode ? frame.ViewMode : frame.DebugMode));
 
-	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet.get());
-	commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, ViewSet.get());
-	commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
-
 	// The fog lights' shadow cubes, every frame, since anything that moves
 	// can cast a shadow through the glow: a texel a thread, six faces a
 	// light. The trace, the views in the HUD's windows among it, reads them.
+	// Any view's sets serve: the scene's bindings are the same in each.
 	if (fogShadows > 0)
 	{
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, Views[0].SceneSet.get());
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, Views[0].ImageSet.get());
+		commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
 		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, FogShadowPipeline.get());
 		commands->dispatch(FogShadowSize / 8, FogShadowSize / 8, fogShadows * 6);
 		VkMemoryBarrier written = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -960,106 +1022,207 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	}
 
 	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
-	commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
+	for (int v = 0; v < viewCount; v++)
+	{
+		View& view = Views[v];
+		setCamera(v);
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, view.SceneSet.get());
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, view.ImageSet.get());
+		commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &PushConstants);
+		commands->dispatch((view.TraceWidth + 7) / 8, (view.TraceHeight + 7) / 8, 1);
+	}
 	stamp(2);
 	lap(7);
 
-	// Denoised: NRD over the trace's split lighting, then the picture rebuilt
-	// from it over the one the trace wrote.
-	if (denoising)
+	auto cameraOf = [](const vec4* p, vec2 shift)
 	{
-		VkMemoryBarrier memory = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-		memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
-
-		auto cameraOf = [](const vec4* p)
-		{
-			Denoiser::Camera c;
-			c.Origin = vec3(p[0].x, p[0].y, p[0].z);
-			c.Right = vec3(p[1].x, p[1].y, p[1].z);
-			c.Up = vec3(p[2].x, p[2].y, p[2].z);
-			c.Forward = vec3(p[3].x, p[3].y, p[3].z);
-			return c;
-		};
-		Denoiser::Inputs inputs[Denoiser::SignalCount];
-		inputs[0].NormalRoughness = GuideViews[0].get();
-		inputs[0].ViewZ = GuideViews[1].get();
-		inputs[0].Motion = MotionView.get();
-		inputs[0].Diffuse = GuideViews[2].get();
-		inputs[0].Specular = Denoise->HasSpecular() ? GuideViews[10].get() : nullptr;
-		inputs[1].NormalRoughness = GuideViews[8].get();
-		inputs[1].ViewZ = GuideViews[9].get();
-		inputs[1].Motion = ReflectionMotionView.get();
-		inputs[1].Diffuse = GuideViews[3].get();
-		Denoise->Denoise(commands, inputs, cameraOf(frame.Camera), cameraOf(frame.PreviousCamera), DenoiseRestart, slot);
-		DenoiseRestart = false;
-		stamp(3);
-
-		struct { vec4 Flash; vec4 Exposure; } finish;
-		finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
-		finish.Exposure = vec4(frame.Exposure, Denoise->HasSpecular() ? 1.0f : 0.0f, (frame.DisableBits & 8192u) ? 1.0f : 0.0f, std::max(frame.ToneCeiling, 1.0f));
-		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
-		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, CompositeSet.get());
-		commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
-		commands->dispatch((TraceWidth + 7) / 8, (TraceHeight + 7) / 8, 1);
-		LastDenoiser = DenoiseNrd;
-	}
-	else if (useRr)
+		Denoiser::Camera c;
+		c.Origin = vec3(p[0].x, p[0].y, p[0].z);
+		c.Right = vec3(p[1].x, p[1].y, p[1].z);
+		c.Up = vec3(p[2].x, p[2].y, p[2].z);
+		c.Forward = vec3(p[3].x, p[3].y, p[3].z);
+		c.Shift = shift;
+		return c;
+	};
+	uint32_t denoisedWith = DenoiseOff;
+	for (int v = 0; v < viewCount; v++)
 	{
-		// Ray Reconstruction over the trace's picture, denoised and upscaled
-		// in one, then finished at the output's size. NGX's own passes read
-		// and write in stages of their choosing, so the barriers either side
-		// cover everything.
-		VkMemoryBarrier memory = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-		memory.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-		memory.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+		View& view = Views[v];
+		const vec4* camera = eyes ? eyes[v].Camera : frame.Camera;
+		const vec4* previousCamera = eyes ? eyes[v].PreviousCamera : frame.PreviousCamera;
+		const vec2 shift = eyes ? eyes[v].Shift : vec2(0.0f, 0.0f);
+		const vec2 previousShift = eyes ? eyes[v].PreviousShift : vec2(0.0f, 0.0f);
 
-		auto target = [](const std::unique_ptr<VulkanImage>& image, const std::unique_ptr<VulkanImageView>& view, VkFormat format)
+		// Denoised: NRD over the trace's split lighting, then the picture
+		// rebuilt from it over the one the trace wrote.
+		if (nrdFor(view))
 		{
-			RayReconstruction::Target t;
-			t.Image = image.get();
-			t.View = view.get();
-			t.Format = (int)format;
-			return t;
-		};
-		RayReconstruction::Inputs inputs;
-		inputs.Color = target(RrColorImage, RrColorView, VK_FORMAT_R16G16B16A16_SFLOAT);
-		inputs.NormalRoughness = target(GuideImages[0], GuideViews[0], VK_FORMAT_R16G16B16A16_SFLOAT);
-		inputs.DiffuseAlbedo = target(GuideImages[5], GuideViews[5], VK_FORMAT_R16G16B16A16_SFLOAT);
-		inputs.SpecularAlbedo = target(GuideImages[6], GuideViews[6], VK_FORMAT_R16G16B16A16_SFLOAT);
-		inputs.Depth = target(RrDepthImage, RrDepthView, VK_FORMAT_R32_SFLOAT);
-		inputs.Motion = target(RrMotionImage, RrMotionView, VK_FORMAT_R16G16_SFLOAT);
-		inputs.Output = target(RrOutputImage, RrOutputView, VK_FORMAT_R16G16B16A16_SFLOAT);
-		const bool reconstructed = Rr->Evaluate(commands, inputs, TraceWidth, TraceHeight, OutputWidth, OutputHeight, quality, jitter, DenoiseRestart, frameMs);
-		DenoiseRestart = false;
-		stamp(3);
+			VkMemoryBarrier memory = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+			memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
 
-		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
-		if (reconstructed)
-		{
-			struct { vec4 Flash; vec4 Mode; } finish;
+			Denoiser::Inputs inputs[Denoiser::SignalCount];
+			inputs[0].NormalRoughness = view.GuideViews[0].get();
+			inputs[0].ViewZ = view.GuideViews[1].get();
+			inputs[0].Motion = view.MotionView.get();
+			inputs[0].Diffuse = view.GuideViews[2].get();
+			inputs[0].Specular = view.Denoise->HasSpecular() ? view.GuideViews[10].get() : nullptr;
+			inputs[1].NormalRoughness = view.GuideViews[8].get();
+			inputs[1].ViewZ = view.GuideViews[9].get();
+			inputs[1].Motion = view.ReflectionMotionView.get();
+			inputs[1].Diffuse = view.GuideViews[3].get();
+			view.Denoise->Denoise(commands, inputs, cameraOf(camera, shift), cameraOf(previousCamera, previousShift), view.DenoiseRestart, slot);
+			view.DenoiseRestart = false;
+
+			struct { vec4 Flash; vec4 Exposure; } finish;
 			finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
-			finish.Mode = vec4((frame.DisableBits & 8192u) ? 1.0f : 0.0f, std::max(frame.ToneCeiling, 1.0f), 0.0f, 0.0f);
-			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipeline.get());
-			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipelineLayout.get(), 0, FinishSet.get());
-			commands->pushConstants(FinishPipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
-			commands->dispatch((OutputWidth + 7) / 8, (OutputHeight + 7) / 8, 1);
+			finish.Exposure = vec4(frame.Exposure, view.Denoise->HasSpecular() ? 1.0f : 0.0f, (frame.DisableBits & 8192u) ? 1.0f : 0.0f, std::max(frame.ToneCeiling, 1.0f));
+			commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipeline.get());
+			commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, CompositePipelineLayout.get(), 0, view.CompositeSet.get());
+			commands->pushConstants(CompositePipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
+			commands->dispatch((view.TraceWidth + 7) / 8, (view.TraceHeight + 7) / 8, 1);
+			denoisedWith = DenoiseNrd;
 		}
-		LastDenoiser = reconstructed ? DenoiseDlss : DenoiseOff;
+		else if (useRr)
+		{
+			// Ray Reconstruction over the trace's picture, denoised and
+			// upscaled in one, then finished at the output's size. NGX's own
+			// passes read and write in stages of their choosing, so the
+			// barriers either side cover everything.
+			VkMemoryBarrier memory = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+			memory.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+			memory.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+
+			auto target = [](const std::unique_ptr<VulkanImage>& image, const std::unique_ptr<VulkanImageView>& imageView, VkFormat format)
+			{
+				RayReconstruction::Target t;
+				t.Image = image.get();
+				t.View = imageView.get();
+				t.Format = (int)format;
+				return t;
+			};
+			RayReconstruction::Inputs inputs;
+			inputs.Color = target(view.RrColorImage, view.RrColorView, VK_FORMAT_R16G16B16A16_SFLOAT);
+			inputs.NormalRoughness = target(view.GuideImages[0], view.GuideViews[0], VK_FORMAT_R16G16B16A16_SFLOAT);
+			inputs.DiffuseAlbedo = target(view.GuideImages[5], view.GuideViews[5], VK_FORMAT_R16G16B16A16_SFLOAT);
+			inputs.SpecularAlbedo = target(view.GuideImages[6], view.GuideViews[6], VK_FORMAT_R16G16B16A16_SFLOAT);
+			inputs.Depth = target(view.RrDepthImage, view.RrDepthView, VK_FORMAT_R32_SFLOAT);
+			inputs.Motion = target(view.RrMotionImage, view.RrMotionView, VK_FORMAT_R16G16_SFLOAT);
+			inputs.Output = target(view.RrOutputImage, view.RrOutputView, VK_FORMAT_R16G16B16A16_SFLOAT);
+			const bool reconstructed = Rr->Evaluate(commands, v, inputs, view.TraceWidth, view.TraceHeight, view.OutputWidth, view.OutputHeight,
+				quality, jitter, view.DenoiseRestart, frameMs);
+			view.DenoiseRestart = false;
+
+			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+			if (reconstructed)
+			{
+				struct { vec4 Flash; vec4 Mode; } finish;
+				finish.Flash = vec4(frame.Camera[0].w, frame.Camera[1].w, frame.Camera[2].w, frame.Camera[3].w);
+				finish.Mode = vec4((frame.DisableBits & 8192u) ? 1.0f : 0.0f, std::max(frame.ToneCeiling, 1.0f), 0.0f, 0.0f);
+				commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipeline.get());
+				commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, FinishPipelineLayout.get(), 0, view.FinishSet.get());
+				commands->pushConstants(FinishPipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
+				commands->dispatch((view.OutputWidth + 7) / 8, (view.OutputHeight + 7) / 8, 1);
+			}
+			denoisedWith = reconstructed ? DenoiseDlss : DenoiseOff;
+		}
+	}
+	stamp(3);
+	LastDenoiser = denoisedWith;
+	lap(8);
+
+	TracedEyes = eyes != nullptr;
+	if (eyes)
+	{
+		RecordMirror(commands, (int)frame.Width, (int)frame.Height, sideBySide);
+		RecordInsets(commands, frame, MirrorImage.get(), MirrorWidth, MirrorHeight);
 	}
 	else
-	{
-		stamp(3);
-		LastDenoiser = DenoiseOff;
-	}
-	lap(8);
-	RecordInsets(commands, frame);
+		RecordInsets(commands, frame, Views[0].OutputImage.get(), Views[0].OutputWidth, Views[0].OutputHeight);
 	stamp(4);
 	lap(9);
 	TimestampsPending[slot] = timing;
 	return true;
+}
+
+// With the eyes traced, the picture the device is handed for the screen: the
+// left eye's, the middle of it cut to the screen's shape - or, for the test
+// harness, both eyes whole, side by side.
+void TraceRenderer::RecordMirror(VulkanCommandBuffer* commands, int width, int height, bool sideBySide)
+{
+	if (!MirrorImage || MirrorWidth != width || MirrorHeight != height)
+	{
+		// The last frame's hand over may still be copying out of the old one.
+		Context->WaitForGpu();
+		MirrorImage = ImageBuilder()
+			.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
+			.Size(width, height)
+			.Usage(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+			.DebugName("PathTracerMirror")
+			.Create(Device);
+		MirrorWidth = width;
+		MirrorHeight = height;
+		MirrorFresh = true;
+	}
+
+	PipelineBarrier()
+		.AddImage(MirrorImage.get(), MirrorFresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+			VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+		.AddImage(Views[0].OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+		.AddImage(Views[1].OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	MirrorFresh = false;
+
+	VkClearColorValue black = {};
+	black.float32[3] = 1.0f;
+	const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	commands->clearColorImage(MirrorImage->image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &range);
+	PipelineBarrier()
+		.AddImage(MirrorImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+	auto blit = [&](const View& eye, int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh)
+	{
+		VkImageBlit region = {};
+		region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		region.srcOffsets[0] = { sx, sy, 0 };
+		region.srcOffsets[1] = { sx + sw, sy + sh, 1 };
+		region.dstSubresource = region.srcSubresource;
+		region.dstOffsets[0] = { dx, dy, 0 };
+		region.dstOffsets[1] = { dx + dw, dy + dh, 1 };
+		commands->blitImage(eye.OutputImage->image, VK_IMAGE_LAYOUT_GENERAL, MirrorImage->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
+	};
+	if (sideBySide)
+	{
+		for (int e = 0; e < 2; e++)
+		{
+			const View& eye = Views[e];
+			const float scale = std::min((width / 2) / (float)eye.OutputWidth, height / (float)eye.OutputHeight);
+			const int dw = std::max((int)(eye.OutputWidth * scale), 1), dh = std::max((int)(eye.OutputHeight * scale), 1);
+			blit(eye, 0, 0, eye.OutputWidth, eye.OutputHeight, e * (width / 2) + (width / 2 - dw) / 2, (height - dh) / 2, dw, dh);
+		}
+	}
+	else
+	{
+		const View& eye = Views[0];
+		const float screen = width / (float)height, picture = eye.OutputWidth / (float)eye.OutputHeight;
+		int sw = eye.OutputWidth, sh = eye.OutputHeight;
+		if (picture > screen)
+			sw = std::max((int)(eye.OutputHeight * screen), 1);
+		else
+			sh = std::max((int)(eye.OutputWidth / screen), 1);
+		blit(eye, (eye.OutputWidth - sw) / 2, (eye.OutputHeight - sh) / 2, sw, sh, 0, 0, width, height);
+	}
+
+	// For the windows' views copied in over it, and the hand over after; the
+	// eyes are read again on their way to the headset.
+	PipelineBarrier()
+		.AddImage(MirrorImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
+		.AddImage(Views[0].OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT)
+		.AddImage(Views[1].OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 
 // The views the HUD draws in windows of their own - a security computer's
@@ -1069,16 +1232,18 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 // averages its own samples over the frames it holds still, as a view with
 // denoising off does, in images of its own. The engine draws them over the
 // view the same way, and the device draws them back at their place among
-// the HUD's own drawing (see UPathTracerRenderDevice::SetSceneNode).
-void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame)
+// the HUD's own drawing (see UPathTracerRenderDevice::SetSceneNode). With a
+// headset's eyes traced, they go into the picture the screen is handed,
+// which is where the device takes them from for the HUD.
+void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, VulkanImage* target, int targetWidth, int targetHeight)
 {
 	static_assert(MaxInsets == (int)TraceProtocol::MaxInsets, "one set of images for each inset the protocol carries");
 	const uint32_t count = std::min(frame.InsetCount, TraceProtocol::MaxInsets);
 	for (uint32_t i = 0; i < count; i++)
 	{
 		const TraceProtocol::TraceInset& view = frame.Insets[i];
-		const int width = (int)std::min<uint32_t>(view.Width, (uint32_t)std::max(OutputWidth - (int)view.X, 0));
-		const int height = (int)std::min<uint32_t>(view.Height, (uint32_t)std::max(OutputHeight - (int)view.Y, 0));
+		const int width = (int)std::min<uint32_t>(view.Width, (uint32_t)std::max(targetWidth - (int)view.X, 0));
+		const int height = (int)std::min<uint32_t>(view.Height, (uint32_t)std::max(targetHeight - (int)view.Y, 0));
 		if (width <= 0 || height <= 0)
 			continue;
 
@@ -1127,7 +1292,7 @@ void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProto
 		constants.Params.w = 0.0f;
 
 		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
-		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, DescriptorSet.get());
+		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, Views[0].SceneSet.get());
 		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, inset.Set.get());
 		commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &constants);
 		commands->dispatch((width + 7) / 8, (height + 7) / 8, 1);
@@ -1143,7 +1308,7 @@ void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProto
 		copy.dstSubresource = copy.srcSubresource;
 		copy.dstOffset = { (int32_t)view.X, (int32_t)view.Y, 0 };
 		copy.extent = { (uint32_t)width, (uint32_t)height, 1 };
-		vkCmdCopyImage(commands->buffer, inset.Out->image, VK_IMAGE_LAYOUT_GENERAL, OutputImage->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+		vkCmdCopyImage(commands->buffer, inset.Out->image, VK_IMAGE_LAYOUT_GENERAL, target->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
 		VkMemoryBarrier afterCopy = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
 		afterCopy.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 		afterCopy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1178,5 +1343,5 @@ void TraceRenderer::FrameCompleted(int slot)
 
 int TraceRenderer::LightCount() const { return Accel->LightCount(); }
 int TraceRenderer::BottomCount() const { return Accel->BottomCount(); }
-bool TraceRenderer::DenoiserActive() const { return Denoise && Denoise->Available(); }
-const char* TraceRenderer::DenoiserStatus() const { return Denoise ? Denoise->Problem() : (DenoiseFailed ? "failed" : "not made yet"); }
+bool TraceRenderer::DenoiserActive() const { return Views[0].Denoise && Views[0].Denoise->Available(); }
+const char* TraceRenderer::DenoiserStatus() const { return Views[0].Denoise ? Views[0].Denoise->Problem() : (DenoiseFailed ? "failed" : "not made yet"); }

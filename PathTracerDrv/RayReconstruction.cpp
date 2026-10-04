@@ -139,19 +139,20 @@ RayReconstruction::RayReconstruction(VulkanDevice* device, const std::wstring& d
 
 RayReconstruction::~RayReconstruction()
 {
-	ReleaseFeature();
+	for (int view = 0; view < MaxViews; view++)
+		ReleaseFeature(view);
 	if (Params)
 		NVSDK_NGX_VULKAN_DestroyParameters((NVSDK_NGX_Parameter*)Params);
 	if (Initialised)
 		NVSDK_NGX_VULKAN_Shutdown1(Device->device);
 }
 
-void RayReconstruction::ReleaseFeature()
+void RayReconstruction::ReleaseFeature(int view)
 {
-	if (Handle)
-		NVSDK_NGX_VULKAN_ReleaseFeature((NVSDK_NGX_Handle*)Handle);
-	Handle = nullptr;
-	FeatureQuality = -1;
+	Feature& feature = Features[view];
+	if (feature.Handle)
+		NVSDK_NGX_VULKAN_ReleaseFeature((NVSDK_NGX_Handle*)feature.Handle);
+	feature = Feature();
 }
 
 // NGX_DLSSD_GET_OPTIMAL_SETTINGS, which the SDK offers only among its D3D
@@ -184,11 +185,12 @@ void RayReconstruction::RenderSize(uint32_t width, uint32_t height, int quality,
 	}
 }
 
-bool RayReconstruction::NeedsFeature(uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, int quality) const
+bool RayReconstruction::NeedsFeature(int view, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, int quality) const
 {
-	return !Handle || FeatureQuality != quality ||
-		FeatureRender[0] != renderWidth || FeatureRender[1] != renderHeight ||
-		FeatureOutput[0] != outputWidth || FeatureOutput[1] != outputHeight;
+	const Feature& feature = Features[view];
+	return !feature.Handle || feature.Quality != quality ||
+		feature.Render[0] != renderWidth || feature.Render[1] != renderHeight ||
+		feature.Output[0] != outputWidth || feature.Output[1] != outputHeight;
 }
 
 static NVSDK_NGX_Resource_VK Resource(const RayReconstruction::Target& t, bool readWrite)
@@ -197,17 +199,18 @@ static NVSDK_NGX_Resource_VK Resource(const RayReconstruction::Target& t, bool r
 		(VkFormat)t.Format, (unsigned int)t.Image->width, (unsigned int)t.Image->height, readWrite);
 }
 
-bool RayReconstruction::Evaluate(VulkanCommandBuffer* commands, const Inputs& in,
+bool RayReconstruction::Evaluate(VulkanCommandBuffer* commands, int view, const Inputs& in,
 	uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, int quality,
 	vec2 jitter, bool reset, float frameMs)
 {
-	if (!Params)
+	if (!Params || view < 0 || view >= MaxViews)
 		return false;
 	NVSDK_NGX_Parameter* params = (NVSDK_NGX_Parameter*)Params;
+	Feature& feature = Features[view];
 
-	if (NeedsFeature(renderWidth, renderHeight, outputWidth, outputHeight, quality))
+	if (NeedsFeature(view, renderWidth, renderHeight, outputWidth, outputHeight, quality))
 	{
-		ReleaseFeature();
+		ReleaseFeature(view);
 		NVSDK_NGX_DLSSD_Create_Params create = {};
 		create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
 		// Roughness rides in the normals' w.
@@ -233,13 +236,14 @@ bool RayReconstruction::Evaluate(VulkanCommandBuffer* commands, const Inputs& in
 			Params = nullptr;
 			return false;
 		}
-		Handle = handle;
-		FeatureRender[0] = renderWidth;
-		FeatureRender[1] = renderHeight;
-		FeatureOutput[0] = outputWidth;
-		FeatureOutput[1] = outputHeight;
-		FeatureQuality = quality;
-		HelperLog("PathTracer Ray Reconstruction: %ux%u to %ux%u", renderWidth, renderHeight, outputWidth, outputHeight);
+		feature.Handle = handle;
+		feature.Render[0] = renderWidth;
+		feature.Render[1] = renderHeight;
+		feature.Output[0] = outputWidth;
+		feature.Output[1] = outputHeight;
+		feature.Quality = quality;
+		HelperLog("PathTracer Ray Reconstruction: %ux%u to %ux%u%s", renderWidth, renderHeight, outputWidth, outputHeight,
+			view ? " for the right eye" : "");
 		// It is always going to reject the history on its first frame.
 		reset = true;
 	}
@@ -277,7 +281,7 @@ bool RayReconstruction::Evaluate(VulkanCommandBuffer* commands, const Inputs& in
 	eval.InFrameTimeDeltaInMsec = frameMs;
 	eval.InPreExposure = 1.0f;
 	eval.InExposureScale = 1.0f;
-	NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSSD_EXT(commands->buffer, (NVSDK_NGX_Handle*)Handle, params, &eval);
+	NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSSD_EXT(commands->buffer, (NVSDK_NGX_Handle*)feature.Handle, params, &eval);
 	if (NVSDK_NGX_FAILED(r))
 	{
 		if (!LoggedEvaluateFailure)
@@ -295,9 +299,9 @@ bool RayReconstruction::Evaluate(VulkanCommandBuffer* commands, const Inputs& in
 void RayReconstruction::RequiredExtensions(std::vector<std::string>&, std::vector<std::string>&) {}
 RayReconstruction::RayReconstruction(VulkanDevice* device, const std::wstring&) : Device(device) { StatusText = "built without the DLSS SDK (see cmake/fetch-dlss.sh)"; }
 RayReconstruction::~RayReconstruction() {}
-void RayReconstruction::ReleaseFeature() {}
+void RayReconstruction::ReleaseFeature(int) {}
 void RayReconstruction::RenderSize(uint32_t width, uint32_t height, int, uint32_t& renderWidth, uint32_t& renderHeight) { renderWidth = width; renderHeight = height; }
-bool RayReconstruction::NeedsFeature(uint32_t, uint32_t, uint32_t, uint32_t, int) const { return false; }
-bool RayReconstruction::Evaluate(VulkanCommandBuffer*, const Inputs&, uint32_t, uint32_t, uint32_t, uint32_t, int, vec2, bool, float) { return false; }
+bool RayReconstruction::NeedsFeature(int, uint32_t, uint32_t, uint32_t, uint32_t, int) const { return false; }
+bool RayReconstruction::Evaluate(VulkanCommandBuffer*, int, const Inputs&, uint32_t, uint32_t, uint32_t, uint32_t, int, vec2, bool, float) { return false; }
 
 #endif

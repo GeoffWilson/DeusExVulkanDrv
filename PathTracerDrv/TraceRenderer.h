@@ -11,6 +11,7 @@ class AccelStructure;
 class Denoiser;
 class FrameUploads;
 class RayReconstruction;
+class WriteDescriptors;
 namespace TraceProtocol { struct TraceCommand; }
 
 // The trace shader's push constants: see Shaders::Trace.
@@ -46,6 +47,12 @@ struct TracePushConstants
 // picture, which it upscales as it denoises; everything else is at the
 // picture's own size.
 //
+// A frame is traced for one view, the screen's, or for a headset's two eyes,
+// each a view of its own with its own images, history and denoiser; the scene,
+// the structures and the textures are the same for all of them. With the
+// eyes, the picture handed back to the device is the left eye's, cut to the
+// screen's shape.
+//
 // It runs in the 64-bit helper, which keeps Scene as the render device sends
 // it and asks for a frame at a time; nothing here knows the engine exists.
 class TraceRenderer
@@ -67,24 +74,49 @@ public:
 	void SetTexturePixels(uint32_t index, uint32_t width, uint32_t height, const uint32_t* pixels);
 	void SetAnisotropy(uint32_t samples);
 
+	// One of a headset's eyes, as the trace shader takes a camera: the eye,
+	// and its right, down and forward, the first two scaled to the view's
+	// half extents - and where the middle of its view is off that forward, in
+	// half widths and heights, since an eye sees further to one side than the
+	// other (the trace shader's viewShift). The same for last frame, and the
+	// size of its picture.
+	struct EyeView
+	{
+		vec4 Camera[4];
+		vec4 PreviousCamera[4];
+		vec2 Shift = vec2(0.0f, 0.0f);
+		vec2 PreviousShift = vec2(0.0f, 0.0f);
+		uint32_t Width = 0, Height = 0;
+	};
+	static const int MaxViews = 2;
+
 	// Records a frame into one of the FramesInFlight slots, whose last frame
 	// the caller has waited for: the uploads, the structures, the trace, and
 	// when denoising NRD and the composite. The frame before may still be on
 	// the GPU, and the recording starts by waiting for it there. The picture
 	// ends up in Output, in GENERAL layout. False when there is nothing to
 	// trace yet.
-	bool Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, int slot);
+	//
+	// With eyes, the two of them are traced instead of the view the frame
+	// describes, each into EyeOutput; Output is then the left eye's picture
+	// at the frame's size - or with sideBySide both, each in its half, which
+	// the test harness looks at.
+	bool Record(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, int slot, const EyeView* eyes = nullptr, bool sideBySide = false);
 
 	// The GPU has finished the frame in slot: its timestamps can be read.
 	void FrameCompleted(int slot);
 
 	// The picture, at the size the device asked for.
-	VulkanImage* Output() const { return OutputImage.get(); }
-	int Width() const { return OutputWidth; }
-	int Height() const { return OutputHeight; }
+	VulkanImage* Output() const { return TracedEyes ? MirrorImage.get() : Views[0].OutputImage.get(); }
+	int Width() const { return TracedEyes ? MirrorWidth : Views[0].OutputWidth; }
+	int Height() const { return TracedEyes ? MirrorHeight : Views[0].OutputHeight; }
+	// An eye's picture, from the last frame traced for them, GENERAL.
+	VulkanImage* EyeOutput(int eye) const { return Views[eye].OutputImage.get(); }
+	VulkanImageView* EyeOutputView(int eye) const { return Views[eye].OutputView.get(); }
+	bool TracedForEyes() const { return TracedEyes; }
 	// What the trace itself ran at.
-	int RenderWidth() const { return TraceWidth; }
-	int RenderHeight() const { return TraceHeight; }
+	int RenderWidth() const { return Views[0].TraceWidth; }
+	int RenderHeight() const { return Views[0].TraceHeight; }
 	bool SamplesTextures() const { return CanSampleTextures; }
 
 	// About the last frame.
@@ -105,19 +137,82 @@ public:
 	double RecordStageMs[RecordStages] = {};
 
 private:
+	// A denoiser's inputs, written by the trace at bindings 9 to 15 when asked
+	// for, the fog at 17, what mirrors show at 18 and 19, and the glossy
+	// reflection off a surface and its colour at 21 and 22: see the trace
+	// shader.
+	static const int GuideImageCount = 12;
+	static int GuideBinding(int i) { return i < 7 ? 9 + i : (i < 10 ? 10 + i : 11 + i); }
+	static bool GuideIsDepth(int i) { return i == 1 || i == 9; }
+
+	// What one view traces into and denoises from, and the descriptor sets
+	// that point at it: set 0 of the trace, whose scene bindings every view
+	// shares, and set 1, its own images.
+	struct View
+	{
+		std::unique_ptr<VulkanDescriptorSet> SceneSet;
+		std::unique_ptr<VulkanDescriptorSet> ImageSet;
+
+		std::unique_ptr<VulkanImage> AccumImage;
+		std::unique_ptr<VulkanImageView> AccumView;
+		std::unique_ptr<VulkanImage> HistoryImage;
+		std::unique_ptr<VulkanImageView> HistoryView;
+		std::unique_ptr<VulkanImage> OutputImage;
+		std::unique_ptr<VulkanImageView> OutputView;
+		int TraceWidth = 0;
+		int TraceHeight = 0;
+		int OutputWidth = 0;
+		int OutputHeight = 0;
+		// The images are laid out for Ray Reconstruction: the trace writes its
+		// picture into RrColorImage at the render size rather than into Output.
+		bool TracingForRr = false;
+
+		std::unique_ptr<VulkanImage> GuideImages[GuideImageCount];
+		std::unique_ptr<VulkanImageView> GuideViews[GuideImageCount];
+		// The depth and motion images again, their motion moved to where NRD
+		// reads it: the surfaces seen, and those seen in mirrors.
+		std::unique_ptr<VulkanImageView> MotionView;
+		std::unique_ptr<VulkanImageView> ReflectionMotionView;
+
+		std::unique_ptr<Denoiser> Denoise;
+		bool DenoiseRestart = true;
+		std::unique_ptr<VulkanDescriptorSet> CompositeSet;
+
+		// Ray Reconstruction's inputs that NRD's images cannot carry - the
+		// picture at the render size, the depth and the motion each on their
+		// own - and its output. The depth and motion are always there, since
+		// the trace binds them.
+		std::unique_ptr<VulkanImage> RrColorImage;
+		std::unique_ptr<VulkanImageView> RrColorView;
+		std::unique_ptr<VulkanImage> RrDepthImage;
+		std::unique_ptr<VulkanImageView> RrDepthView;
+		std::unique_ptr<VulkanImage> RrMotionImage;
+		std::unique_ptr<VulkanImageView> RrMotionView;
+		std::unique_ptr<VulkanImage> RrOutputImage;
+		std::unique_ptr<VulkanImageView> RrOutputView;
+		std::unique_ptr<VulkanDescriptorSet> FinishSet;
+
+		// Last frame's camera and each instance's last placement, for motion
+		// vectors. Rewritten every frame.
+		std::unique_ptr<VulkanBuffer> MotionBuffer;
+		size_t MotionCapacity = 0;
+	};
+
 	void CreateTracePipeline();
 	void CreateCompositePipeline();
 	void CreateFinishPipeline();
-	void Resize(int renderWidth, int renderHeight, int outputWidth, int outputHeight, bool forRayReconstruction);
-	void EnsureDenoiser(bool wanted, bool materials);
+	void Resize(View& view, int renderWidth, int renderHeight, int outputWidth, int outputHeight, bool forRayReconstruction);
+	void EnsureDenoiser(View& view, bool wanted, bool materials);
 	void UpdateDescriptors();
-	void WriteCompositeDescriptors();
-	void WriteFinishDescriptors();
-	void WriteMotion(const TraceProtocol::TraceCommand& frame, vec2 jitter, FrameUploads& uploads);
+	void WriteCompositeDescriptors(View& view);
+	void WriteFinishDescriptors(View& view);
+	void WriteMotion(View& view, const TraceProtocol::TraceCommand& frame, const vec4* previousCamera, vec4 shift, vec2 jitter, FrameUploads& uploads);
 	void EnsureFogShadows(uint32_t count, FrameUploads& uploads);
 	void RecordTexturePixels(VulkanCommandBuffer* commands, FrameUploads& uploads);
 	void BindWhite(uint32_t index);
-	void RecordInsets(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame);
+	void WriteTextureSlot(WriteDescriptors& writes, int index, VulkanImageView* image);
+	void RecordMirror(VulkanCommandBuffer* commands, int width, int height, bool sideBySide);
+	void RecordInsets(VulkanCommandBuffer* commands, const TraceProtocol::TraceCommand& frame, VulkanImage* target, int targetWidth, int targetHeight);
 
 	GpuContext* Context = nullptr;
 	VulkanDevice* Device = nullptr;
@@ -127,11 +222,9 @@ private:
 
 	std::unique_ptr<VulkanDescriptorSetLayout> DescriptorLayout;
 	std::unique_ptr<VulkanDescriptorPool> DescriptorPool;
-	std::unique_ptr<VulkanDescriptorSet> DescriptorSet;
-	// A view's own images, set 1 of the trace: the player's view's, and one
-	// set for each window of the HUD's that shows a view of its own.
+	// The views' own images, set 1 of the trace: one set for each view, and
+	// one for each window of the HUD's that shows a view of its own.
 	std::unique_ptr<VulkanDescriptorSetLayout> ViewLayout;
-	std::unique_ptr<VulkanDescriptorSet> ViewSet;
 	struct Inset
 	{
 		int Width = 0;
@@ -149,40 +242,21 @@ private:
 	std::unique_ptr<VulkanPipeline> FogShadowPipeline;
 	bool DescriptorsDirty = true;
 
-	std::unique_ptr<VulkanImage> AccumImage;
-	std::unique_ptr<VulkanImageView> AccumView;
-	std::unique_ptr<VulkanImage> HistoryImage;
-	std::unique_ptr<VulkanImageView> HistoryView;
-	std::unique_ptr<VulkanImage> OutputImage;
-	std::unique_ptr<VulkanImageView> OutputView;
-	int TraceWidth = 0;
-	int TraceHeight = 0;
-	int OutputWidth = 0;
-	int OutputHeight = 0;
-	// The images are laid out for Ray Reconstruction: the trace writes its
-	// picture into RrColorImage at the render size rather than into Output.
-	bool TracingForRr = false;
+	// The screen's view, or a headset's left and right eyes, and how many of
+	// them the last frame traced.
+	View Views[MaxViews];
+	int ActiveViews = 1;
+	bool TracedEyes = false;
+	// With the eyes, the picture the device is handed: the left eye's, at the
+	// size it asked for, with the HUD's windows' views in it.
+	std::unique_ptr<VulkanImage> MirrorImage;
+	int MirrorWidth = 0;
+	int MirrorHeight = 0;
+	bool MirrorFresh = true;
 
-	// A denoiser's inputs, written by the trace at bindings 9 to 15 when asked
-	// for, the fog at 17, what mirrors show at 18 and 19, and the glossy
-	// reflection off a surface and its colour at 21 and 22: see the trace
-	// shader.
-	static const int GuideImageCount = 12;
-	static int GuideBinding(int i) { return i < 7 ? 9 + i : (i < 10 ? 10 + i : 11 + i); }
-	static bool GuideIsDepth(int i) { return i == 1 || i == 9; }
-	std::unique_ptr<VulkanImage> GuideImages[GuideImageCount];
-	std::unique_ptr<VulkanImageView> GuideViews[GuideImageCount];
-	// The depth and motion images again, their motion moved to where NRD
-	// reads it: the surfaces seen, and those seen in mirrors.
-	std::unique_ptr<VulkanImageView> MotionView;
-	std::unique_ptr<VulkanImageView> ReflectionMotionView;
-
-	std::unique_ptr<Denoiser> Denoise;
 	bool DenoiseFailed = false;
-	bool DenoiseRestart = true;
 	std::unique_ptr<VulkanDescriptorSetLayout> CompositeLayout;
 	std::unique_ptr<VulkanDescriptorPool> CompositePool;
-	std::unique_ptr<VulkanDescriptorSet> CompositeSet;
 	std::unique_ptr<VulkanPipelineLayout> CompositePipelineLayout;
 	std::unique_ptr<VulkanShader> CompositeShader;
 	std::unique_ptr<VulkanPipeline> CompositePipeline;
@@ -191,21 +265,9 @@ private:
 	// only tried the once: where it cannot run, NRD stands in.
 	std::unique_ptr<RayReconstruction> Rr;
 	bool RrTried = false;
-	// Its inputs that NRD's images cannot carry - the picture at the render
-	// size, the depth and the motion each on their own - and its output.
-	// The depth and motion are always there, since the trace binds them.
-	std::unique_ptr<VulkanImage> RrColorImage;
-	std::unique_ptr<VulkanImageView> RrColorView;
-	std::unique_ptr<VulkanImage> RrDepthImage;
-	std::unique_ptr<VulkanImageView> RrDepthView;
-	std::unique_ptr<VulkanImage> RrMotionImage;
-	std::unique_ptr<VulkanImageView> RrMotionView;
-	std::unique_ptr<VulkanImage> RrOutputImage;
-	std::unique_ptr<VulkanImageView> RrOutputView;
 	std::unique_ptr<VulkanSampler> FogSampler;
 	std::unique_ptr<VulkanDescriptorSetLayout> FinishLayout;
 	std::unique_ptr<VulkanDescriptorPool> FinishPool;
-	std::unique_ptr<VulkanDescriptorSet> FinishSet;
 	std::unique_ptr<VulkanPipelineLayout> FinishPipelineLayout;
 	std::unique_ptr<VulkanShader> FinishShader;
 	std::unique_ptr<VulkanPipeline> FinishPipeline;
@@ -216,11 +278,6 @@ private:
 
 	// What each frame in flight stages for the GPU, and what it retires.
 	std::unique_ptr<FrameUploads> Uploads[GpuContext::FramesInFlight];
-
-	// Last frame's camera and each instance's last placement, for motion
-	// vectors. Rewritten every frame.
-	std::unique_ptr<VulkanBuffer> MotionBuffer;
-	size_t MotionCapacity = 0;
 
 	// Each fog light's shadow cube, in floats: see Shaders::FogShadows. The
 	// size and the most lights given one are the shader's own.

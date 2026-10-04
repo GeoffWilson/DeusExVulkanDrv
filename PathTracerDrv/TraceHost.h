@@ -5,7 +5,9 @@
 #include <memory>
 
 class TraceRenderer;
+class HeadsetOutput;
 class VulkanDevice;
+class VulkanImageView;
 class VulkanCommandPool;
 class VulkanCommandBuffer;
 class VulkanFence;
@@ -26,9 +28,10 @@ class TraceHost : public GpuContext
 {
 public:
 	// exportTo is the process the image and semaphores are handed to, or null
-	// when this host is in that process and on its device. Throws when the
-	// device cannot trace.
-	TraceHost(VulkanDevice* device, TraceProtocol::Header* status, HANDLE exportTo);
+	// when this host is in that process and on its device. headset is the
+	// one frames may be traced for, whose session is open on device, or
+	// null. Throws when the device cannot trace.
+	TraceHost(VulkanDevice* device, TraceProtocol::Header* status, HANDLE exportTo, HeadsetOutput* headset = nullptr);
 	~TraceHost();
 
 	VulkanDevice* GetDevice() const override { return Device; }
@@ -48,9 +51,15 @@ public:
 
 private:
 	VkSemaphore MakeSemaphore(uint64_t& handleInParent);
+	// An image the device's process shares, its memory handed there when it
+	// goes to another process: the frame's, or the HUD's.
+	void MakeSharedImage(VkFormat format, VkImageUsageFlags usage, uint32_t width, uint32_t height, VkImage& image, VkDeviceMemory& memory, uint64_t& handle, uint64_t& size);
 	void EnsureOutput(uint32_t width, uint32_t height);
 	void DestroyOutput();
+	void EnsureHud(uint32_t width, uint32_t height);
+	void DestroyHud();
 	void TraceFrame(const TraceProtocol::TraceCommand& frame);
+	void ReportHeadset();
 	void WaitForSlot(int slot);
 
 	VulkanDevice* Device = nullptr;
@@ -100,4 +109,32 @@ private:
 
 	std::unique_ptr<TraceRenderer> Renderer;
 	bool Quit = false;
+
+	// The headset, when there is one, and the HUD the device draws for it,
+	// which comes back the other way: drawn by the device in the frame it
+	// takes one of ours, after Ready, and read here in the next one, after
+	// Released.
+	HeadsetOutput* Headset = nullptr;
+	VkImage HudImage = VK_NULL_HANDLE;
+	VkDeviceMemory HudMemory = VK_NULL_HANDLE;
+	std::unique_ptr<VulkanImageView> HudView;
+	uint32_t HudWidth = 0, HudHeight = 0;
+	// The HUD image has been handed back here at least once, and so comes
+	// from the device's queue family rather than from nowhere.
+	bool HudTaken = false;
+	// The eyes' last cameras, for their motion; none after a frame without
+	// them.
+	vec4 LastEyeCameras[2][4] = {};
+	vec2 LastEyeShifts[2];
+	bool HaveLastEyes = false;
+	// Which way the view the device describes - the way the player aims -
+	// faces from the seat: the last a frame with a world had.
+	float AimOrientation[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	// How far out, in metres, the coronas' panel is: one panel for every
+	// light, so a distance most of them are about as far as, past where the
+	// eyes still turn in much to meet on something.
+	static constexpr float CoronaDistance = 10.0f;
+	// The sizes the headset's pictures were last given it at.
+	uint32_t HeadsetEyeSize[2] = {}, HeadsetHudSize[2] = {};
+	bool IsSimulatedHeadset() const;
 };

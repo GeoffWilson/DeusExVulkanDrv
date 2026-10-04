@@ -64,30 +64,38 @@ public:
 		Target Output;          // output size, written
 	};
 
-	// Records one frame's denoise and upscale, made (again) first if the sizes
-	// or the quality have changed - the caller must have waited for the
-	// frames in flight when they have. jitter is the offset the primary rays
-	// were given within their pixels, in render pixels; DLSS is told the
-	// picture moved the other way.
-	bool Evaluate(VulkanCommandBuffer* commands, const Inputs& inputs,
+	// Each view has a feature of its own, with its own history: the screen's
+	// one, or a headset's two eyes.
+	static const int MaxViews = 2;
+
+	// Records one frame's denoise and upscale for a view, its feature made
+	// (again) first if the sizes or the quality have changed - the caller
+	// must have waited for the frames in flight when they have. jitter is the
+	// offset the primary rays were given within their pixels, in render
+	// pixels; DLSS is told the picture moved the other way.
+	bool Evaluate(VulkanCommandBuffer* commands, int view, const Inputs& inputs,
 		uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, int quality,
 		vec2 jitter, bool reset, float frameMs);
 
-	// Whether Evaluate would have to make the feature again for these.
-	bool NeedsFeature(uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, int quality) const;
+	// Whether Evaluate would have to make the view's feature again for these.
+	bool NeedsFeature(int view, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, int quality) const;
 
 	// The Halton (2, 3) sequence it expects the jitter to follow, in -0.5..0.5.
 	static vec2 Jitter(uint32_t frame);
 
 private:
-	void ReleaseFeature();
+	void ReleaseFeature(int view);
 
 	VulkanDevice* Device = nullptr;
 	void* Params = nullptr;    // NVSDK_NGX_Parameter*
-	void* Handle = nullptr;    // NVSDK_NGX_Handle*
 	bool Initialised = false;
-	uint32_t FeatureRender[2] = {}, FeatureOutput[2] = {};
-	int FeatureQuality = -1;
+	struct Feature
+	{
+		void* Handle = nullptr;    // NVSDK_NGX_Handle*
+		uint32_t Render[2] = {}, Output[2] = {};
+		int Quality = -1;
+	};
+	Feature Features[MaxViews];
 	std::string StatusText = "not started";
 	bool LoggedEvaluateFailure = false;
 };

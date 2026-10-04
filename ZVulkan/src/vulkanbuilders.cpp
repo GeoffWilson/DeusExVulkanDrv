@@ -1699,6 +1699,12 @@ VulkanDeviceBuilder& VulkanDeviceBuilder::OptionalExtension(const std::string& e
 	return *this;
 }
 
+VulkanDeviceBuilder& VulkanDeviceBuilder::PassThroughExtension(const std::string& extensionName)
+{
+	passThroughDeviceExtensions.insert(extensionName);
+	return *this;
+}
+
 VulkanDeviceBuilder& VulkanDeviceBuilder::OptionalRayQuery()
 {
 	OptionalExtension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
@@ -1758,6 +1764,7 @@ std::vector<VulkanCompatibleDevice> VulkanDeviceBuilder::FindDevices(const std::
 		VulkanCompatibleDevice dev;
 		dev.Device = &instance->PhysicalDevices[idx];
 		dev.EnabledDeviceExtensions = requiredDeviceExtensions;
+		dev.EnabledDeviceExtensions.insert(passThroughDeviceExtensions.begin(), passThroughDeviceExtensions.end());
 
 		// Enable optional extensions we are interested in, if they are available on this device
 		for (const auto& ext : dev.Device->Extensions)

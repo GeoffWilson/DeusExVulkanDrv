@@ -23,6 +23,11 @@ struct TileBatch
 	CachedTexture* Texture = nullptr;
 	int BlendMode = 0;      // 0 alpha, 1 additive, 2 modulated
 	int SamplerMode = 0;    // TileSamplers' index
+	// For a headset: 0 the HUD, which follows the head, 1 what aims with the
+	// mouse - the crosshair, the accuracy reticle - and 2 the coronas the
+	// engine draws over the world, each drawn into its own layer of the HUD's
+	// image (HudLayers).
+	int Layer = 0;
 	int FirstVertex = 0;
 	int VertexCount = 0;
 };
@@ -246,6 +251,40 @@ public:
 	BITFIELD Hdr;
 	INT HdrPeakNits;
 	INT HdrPaperWhite;
+	// A headset through OpenXR ("VR" in the ini, off by default): each eye
+	// traced from where it is, in a room that is the player's view - its
+	// middle straight ahead, the mouse turning the player and the room with
+	// them - and the HUD on a panel spanning that view HeadsetHudDistance
+	// metres ahead, so what it marks lines up with the world behind it. The
+	// screen shows the left eye. HeadsetUnitsPerMetre is the world's scale,
+	// for how far apart the eyes are and how far a lean moves them; Deus
+	// Ex's is 52.5, a player 94 units tall. HeadsetResolution is the eyes'
+	// size in percent of what the headset asks for. PT VR switches it for the
+	// session, which starts the helper again (see HeadsetOutput).
+	BITFIELD UseHeadset;
+	FLOAT HeadsetUnitsPerMetre;
+	INT HeadsetResolution;
+	FLOAT HeadsetHudDistance;
+	// How wide the HUD's box is in the headset, in degrees: it follows the
+	// head, and the game projects what it marks in the world through where
+	// the head looks, while the crosshair stays with the mouse (see
+	// SetSceneNode and DrawTile).
+	FLOAT HeadsetHudSize;
+	// Whether the HUD shows in the headset ("VRShowHud", off by default):
+	// off, the parts the game itself can hide - the object belt, the health
+	// display, the ammo, the augmentations' icons, the compass - are hidden
+	// while the headset shows the game, and put back as it stops, leaving
+	// the crosshair, the messages, conversations and menus. PT VR SHOWHUD
+	// switches it for the session (UpdateHeadsetHud).
+	BITFIELD HeadsetShowHud;
+	// What the headset's pictures are traced with in place of DLSSQuality
+	// and Bounces ("VRDLSSQuality", performance by default, and
+	// "VRBounces", 1): two eyes, each bigger than the screen, at the
+	// headset's refresh, want far fewer samples' worth of work a pixel.
+	// Kept apart from the screen's own, which come back as VR goes off. PT
+	// DLSS and PT BOUNCES set these while VR is on.
+	INT HeadsetDlssQuality;
+	INT HeadsetBounces;
 
 private:
 	// The switches in DisableBits the ini sets rather than PT alone: the
@@ -259,7 +298,27 @@ private:
 	void CreateSwapChainResources();
 	void ReleaseSwapChainResources();
 	void CreateTilePipeline();
-	void RenderTiles(VulkanCommandBuffer* commands);
+	// The frame's tiles, drawn into target through framebuffer with one of
+	// the sets of pipelines: over the picture, or into the HUD's own image
+	// for the headset.
+	void RenderTiles(VulkanCommandBuffer* commands, VulkanImage* target, VulkanFramebuffer* framebuffer, std::unique_ptr<VulkanPipeline>* pipelines, bool layered = false);
+	// A tile of what aims with the mouse rather than looks with the head.
+	bool AimsWithMouse(const FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL) const;
+	// The tangent of half the HUD's box's width in the headset.
+	float HeadsetHudTangent() const;
+	// With the headset: the HUD drawn on its own, into the image the helper
+	// shares for it (see TraceProtocol.h).
+	void EnsureHudImage();
+	void DrawHud(VulkanCommandBuffer* commands);
+	// The game's own HUD parts hidden as VRShowHud and the headset ask, and
+	// shown again after: see HeadsetShowHud. The player's settings for them
+	// are never left changed.
+	void UpdateHeadsetHud();
+	bool HeadsetShowHudNow = false;
+	bool HudPartsHidden = false;
+	// PT VR: the helper started again, with or without the headset.
+	void SwitchHeadset(bool on, FOutputDevice& Ar);
+	FString DescribeHeadset() const;
 	void CreateBrightnessPipeline();
 	void DescribeLightingOf(AActor* target);
 	void DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar);
@@ -342,6 +401,10 @@ private:
 	bool DenoiseEnabled = false;
 	bool DlssEnabled = true;
 	int DlssQualityNow = 1;
+	// What a frame is traced with: VR's own (HeadsetDlssQuality,
+	// HeadsetBounces) while it is on, otherwise the screen's.
+	int DlssQualityInUse() const { return Clamp(HeadsetNow ? (int)HeadsetDlssQuality : DlssQualityNow, 0, 4); }
+	int BouncesInUse() const { return Clamp(HeadsetNow ? (int)HeadsetBounces : (int)Bounces, 1, 255); }
 	bool MaterialsEnabled = true;
 	bool WidescreenFovEnabled = true;
 	float PinnedAspect = 4.0f / 3.0f;
@@ -388,6 +451,41 @@ private:
 	std::unique_ptr<VulkanFramebuffer> TileFramebuffer;
 	std::unique_ptr<VulkanBuffer> TileVertexBuffer;
 	size_t TileVertexCapacity = 0;
+	bool TilesUploaded = false;
+	// The HUD on its own for the headset: the tiles drawn into a clear image
+	// the trace's size, premultiplied, and copied to the helper's. Modulated
+	// and translucent tiles blend differently there, having no picture to
+	// blend over (Shaders::TileFragmentModulatedHud).
+	std::unique_ptr<VulkanImage> HudImage;
+	std::unique_ptr<VulkanImageView> HudView;
+	std::unique_ptr<VulkanFramebuffer> HudFramebuffer;
+	std::unique_ptr<VulkanShader> HudModulatedShader;
+	std::unique_ptr<VulkanPipeline> HudTilePipelines[4];
+	// The helper's image last drawn into, which the next frame tells it, and
+	// which way the head faced when the HUD drawn into it was projected.
+	uint32_t HudDrawnGeneration = 0;
+	bool HudDrawn = false;
+	float HudDrawnHead[4] = {};
+	// Which way the head faced when this frame's HUD was projected through
+	// it, when it was (SetSceneNode).
+	float ProjectedHead[4] = {};
+	bool HeadProjected = false;
+	// The HUD image's layers: the HUD, what aims with the mouse, the coronas.
+	static const int HudLayers = 3;
+	// The engine drawing the player's view, from its scene node until the
+	// depth is cleared once that view has drawn something of its own: the
+	// sky's view, drawn first, ends with a clear too. Tiles drawn meanwhile
+	// are the lights' coronas, Render.dll drawing them through the canvas
+	// once the world is done; the weapon and the HUD come after the clear.
+	bool WorldPass = false;
+	bool WorldPassDrawn = false;
+	FSceneNode* WorldPassFrame = nullptr;
+	// PT VR, for the session; PT VR RECENTER, for the next frame; and
+	// whether the last frame went to a headset showing it, when the screen's
+	// vsync and FPSLimit step aside for the headset's own pace.
+	bool HeadsetNow = false;
+	bool HeadsetRecenterAsked = false;
+	bool HeadsetShowing = false;
 	std::vector<TileVertex> TileVertices;
 	std::vector<TileBatch> TileBatches;
 

@@ -518,6 +518,49 @@ back, which the harness measured within a fifth of a level of the SDR curve.
 In HDR the tone curve is always the neutral one; Reinhard's has no part that
 SDR and HDR could share.
 
+**Headsets.** With `VR` on, the helper opens a session with the OpenXR
+runtime - SteamVR, or the headset's own software - and traces each frame
+twice, once from each eye, each eye with its own history and its own
+denoiser. The room the headset tracks is fitted to the player: the eyes are
+where the player's eyes are, `VRUnitsPerMetre` world units to the metre, and
+straight ahead is the way the player faces, but level. The mouse still turns
+the player and aims, and the room turns with them; looking up and down with
+it leaves the horizon where it is rather than tilting the world, which is the
+surest way to make a headset's wearer ill. The head looks round inside the
+room, and a lean moves the eyes. The seat is put where the head is as the
+headset starts showing the game, since a runtime's own origin can be
+anywhere - at the floor, or at standing height - and anything but the head
+there would put the eyes above or below the player's; `PT VR RECENTER` puts
+it there again. Each eye is traced from exactly where the
+runtime says it will be when the frame is shown, and sees further to its own
+side than across the nose, as a headset's eyes do, which the trace, the
+motion it hands the denoiser and NRD's projection all follow. The HUD is drawn
+on its own, with how much of the world it covers kept beside its colour, and
+shown on a panel `VRHudDistance` metres out that follows the head,
+`VRHudSize` degrees across. What it marks in the world - the brackets round
+what can be used, the augmentations' target boxes - the game places through
+a view the device turns to where the head looks, so they land on the world
+behind them wherever the head turns, and the panel is put where the head
+was when they were placed rather than where it is a moment later, so they
+stay on it while it turns. What aims with the mouse - the crosshair, and the
+accuracy reticle round it - is drawn into a layer of its own and shown on a
+second panel along the aim, so it is where the shot goes. The lights'
+coronas, which the engine draws over the world, go on a third panel, placed
+through the head as the HUD is but 10 metres out, so the eyes meet on them
+out where the lights are rather than at the HUD; the screen's copy of the
+left eye leaves them out. The runtime sets the pace: the helper waits
+for the moment to start each frame, which holds the game to the headset's
+refresh, and where a frame is late the runtime turns the last one as the head
+turns. The screen's VSync and `FPSLimit` step aside meanwhile. A menu with no
+level behind it goes on the panel over the last picture, which the runtime
+keeps turning as the head turns. The screen shows the left eye, cut to its
+shape, under the HUD, which is drawn there as the headset's panel has it, so
+it lines up with the picture only roughly. Each eye is traced at the size the
+headset asks for, times `VRResolution`, with `VRDLSSQuality` and `VRBounces`
+in place of the screen's `DLSSQuality` and `Bounces`. The
+Brightness setting is put on the headset's pictures as it is on the screen's;
+HDR is the screen's alone.
+
 **2D.** The HUD, menus and console are rasterised over the traced picture, so
 the game is fully playable. Each piece is sampled as the other devices sample
 it - nearest where its art asks for no smoothing, clamped at the edges of art
@@ -737,6 +780,44 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   tone curve levels off. `PT HDRPEAK n`.
 - `HDRPaperWhite`: how bright the SDR picture's white is drawn in HDR, 200
   nits by default - the HUD, a white wall in daylight. `PT HDRWHITE n`.
+- `VR`: the game in a headset, through OpenXR, False by default (see
+  Headsets). The runtime has to be running and the headset connected when
+  the game starts: on Windows SteamVR, with a Quest over Link or Air Link,
+  or the headset's own OpenXR runtime; under Proton the Linux one, reached
+  through Proton's wineopenxr - played with WiVRn and a Quest 2 under
+  Proton-CachyOS, with `PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1` in the
+  game's launch options so Steam's container can see it, and with
+  `PROTON_ENABLE_WAYLAND=1` for HDR on the screen as well - where Proton
+  leaves the runtime's Vulkan extensions for the helper to look up itself,
+  since winevulkan does not expand its stand-in for them under its Wayland
+  driver. Proton asks the
+  runtime about the headset once, as the game starts, so connect the
+  headset first; `PT VR` can then switch it on and off. Where there is none,
+  or it cannot draw on the game's GPU, the log says why and the game carries
+  on on the screen. `openxr_loader.dll` goes beside the helper.
+- `VRUnitsPerMetre`: the world's scale, 52.5 by default - Deus Ex's, in which
+  JC is 94 units tall. Smaller makes the world feel bigger. `PT VR SCALE n`.
+- `VRResolution`: each eye's picture as a percentage of the size the headset
+  asks for, 100 by default. `PT VR RES n`.
+- `VRHudDistance`: how far ahead the HUD's panels are, in metres, 1.5 by
+  default. Their size in the view is the same whatever the distance; nearer
+  they are sharper, but further in depth from what they mark. `PT VR HUD n`.
+- `VRHudSize`: how wide the HUD is in the headset, in degrees across the
+  box it is laid out in, 60 by default. `PT VR HUDSIZE n`.
+- `VRShowHud`: the HUD in the headset, False by default: the parts the game
+  can hide itself - the object belt, the health display, the ammo, the
+  augmentations' icons and the compass, as its own Toggle commands do - are
+  hidden while the headset shows the game, leaving the crosshair, the
+  messages, conversations and menus, and shown again as it stops. Only the
+  HUD's windows are hidden: the game's own settings for them, which it
+  saves, are left as they are. `PT VR SHOWHUD`
+  switches it, and can be bound to a key: `set input H PT VR SHOWHUD`.
+- `VRDLSSQuality`, `VRBounces`: what the headset's pictures are traced with
+  instead of `DLSSQuality` and `Bounces`: Ray Reconstruction at 3,
+  performance (0 DLAA to 4 ultra performance), and one bounce by default.
+  Two eyes at the headset's size and refresh are several times the work of
+  the screen. The screen's own come back as VR goes off; while it is on,
+  `PT DLSS quality` and `PT BOUNCES n` set these.
 - `FPSLimit`: frames per second to hold the game to, 120 by default and 0 for
   no limit. Deus Ex cuts conversation audio short when left to run at a few
   hundred frames a second, the intro included. Unlike VulkanDrv's it does not wait
@@ -782,7 +863,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
 - `PT DENOISE`: denoising on or off. Says what denoises.
 - `PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE]`: DLSS
   Ray Reconstruction on or off, or on at that quality; turns denoising on with
-  it. Says whether it is running, and why not when NRD stands in.
+  it. Says whether it is running, and why not when NRD stands in. With VR on,
+  the quality is the headset's (`VRDLSSQuality`).
 - `PT LIGHTING [ENGINE | LINEAR]`: the level lit as `Lighting` says, or the
   other way.
 - `PT EXPOSURE n`, `PT TONEMAP`: the exposure, as `Exposure`, and the tone
@@ -837,10 +919,18 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   switches materials on or off (`PT NOMATERIALS` still works).
 - `PT HDR`, `PT HDRPEAK n`, `PT HDRWHITE n`: HDR output on or off, and its
   peak and its white in nits, for the session (see `HDR`).
+- `PT VR`: the headset on or off for the session, which starts the helper
+  again and sends it the level anew. `PT VR SHOWHUD` shows or hides the HUD
+  in it (see `VRShowHud`). `PT VR RECENTER` makes wherever the head
+  is now straight ahead; `PT VR STATUS` says what the helper found; `PT VR
+  SCALE n`, `PT VR RES n`, `PT VR HUD n` and `PT VR HUDSIZE n` set
+  `VRUnitsPerMetre`, `VRResolution`, `VRHudDistance` and `VRHudSize` for the
+  session.
 - `PT ALLLIGHTS`: weighs every light in reach at every point, as it used to,
   rather than drawing from a crowded cell's lights (see Crowded lights), to
   compare the two by eye or by frame rate.
-- `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`.
+- `PT BOUNCES n`, `PT GLOSSBOUNCES n`, `PT RESET`. With VR on, `PT BOUNCES`
+  sets the headset's (`VRBounces`).
 - `PT BENCH`: hold still for about half a minute while it switches the
   costlier features off one at a time - the engine's lighting, the baked
   shadow masks, mipmaps, anisotropic filtering, detail textures, the engine's
@@ -872,6 +962,11 @@ The game's own `ShowHud 0` (and `ShowHud 1`) hides the HUD, for screenshots.
   which.
 - Some lockers come out about three times as bright as in the rasterised
   game; not yet looked into.
+- In a headset: no motion controllers - the mouse and keyboard play it, and
+  the head only looks. A scope or the binoculars do not magnify, since the
+  headset's view is the headset's. A conversation's camera cuts move the whole
+  room. Photo mode is for the screen. Under upstream wine there is no
+  headset: wineopenxr is Proton's.
 
 ### Building it on Windows
 

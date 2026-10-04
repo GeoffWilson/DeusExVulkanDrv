@@ -30,9 +30,10 @@ public:
 	~TraceClient();
 
 	// Starts the helper at helperPath, in workingDirectory - where it writes
-	// its log - for the GPU device is on. False, with Error() saying why,
-	// when it cannot.
-	bool Start(VulkanDevice* device, const std::string& helperPath, const std::string& workingDirectory, bool vkDebug);
+	// its log - for the GPU device is on, and with headset 1 for a headset
+	// through OpenXR, 2 for the test harness's simulated one. False, with
+	// Error() saying why, when it cannot.
+	bool Start(VulkanDevice* device, const std::string& helperPath, const std::string& workingDirectory, bool vkDebug, int headset = 0);
 
 #ifdef PATHTRACER_LOCAL
 	// Traces here instead, on device, which must have been made with ray
@@ -77,6 +78,21 @@ public:
 	VkImage Output() const { return OutputImage; }
 	uint32_t OutputWidth() const { return ImportedWidth; }
 	uint32_t OutputHeight() const { return ImportedHeight; }
+	// Whether the frame handed over put a new picture in Output. With a
+	// headset every frame is handed over, for the HUD to go back, traced or
+	// not.
+	bool OutputFresh() const { return Shared && Shared->OutputFresh != 0; }
+
+	// The HUD's image for the headset, which goes the other way: drawn into
+	// here, in the submission that waits on Ready, and handed back as the
+	// output is, a transfer to VK_QUEUE_FAMILY_EXTERNAL. Null until a frame
+	// asks for it with a size. Its generation changes when it is made anew,
+	// and a new one has never been anywhere: taken as undefined, not from
+	// the helper.
+	VkImage Hud() const { return HudImage; }
+	uint32_t HudWidth() const { return HudImported[0]; }
+	uint32_t HudHeight() const { return HudImported[1]; }
+	uint32_t HudGeneration() const { return ImportedHudGeneration; }
 	VkSemaphore Ready() const { return ReadySemaphore; }
 	VkSemaphore Released() const { return ReleasedSemaphore; }
 
@@ -85,6 +101,10 @@ private:
 	bool Send();
 	bool ImportOutput();
 	void ReleaseOutput();
+	bool ImportHud();
+	void ReleaseHud();
+	// The same image as the helper's over memory it handed over.
+	bool ImportImage(VkFormat format, VkImageUsageFlags usage, uint32_t width, uint32_t height, uint64_t handle, uint64_t size, VkImage& image, VkDeviceMemory& memory);
 	void Stop();
 	bool Die(const std::string& why);
 
@@ -111,4 +131,8 @@ private:
 	VkDeviceMemory OutputMemory = VK_NULL_HANDLE;
 	uint32_t ImportedGeneration = 0;
 	uint32_t ImportedWidth = 0, ImportedHeight = 0;
+	VkImage HudImage = VK_NULL_HANDLE;
+	VkDeviceMemory HudMemory = VK_NULL_HANDLE;
+	uint32_t ImportedHudGeneration = 0;
+	uint32_t HudImported[2] = {};
 };

@@ -59,6 +59,12 @@ if [ -f "$BUILD_DIR/PathTracerDrv.dll" ]; then
 			cp "$HELPER_DIR/nvngx_dlssd.dll" "$SYSTEM_DIR/"
 			installed+=("nvngx_dlssd")
 		fi
+		# The OpenXR loader, when the helper was built for headsets: the
+		# helper opens it from beside itself when VR is asked for.
+		if [ -f "$HELPER_DIR/openxr_loader.dll" ]; then
+			cp "$HELPER_DIR/openxr_loader.dll" "$SYSTEM_DIR/"
+			installed+=("openxr_loader")
+		fi
 	else
 		echo "No PathTracerHelper.exe in $HELPER_DIR: PathTracerDrv will not start without it" >&2
 	fi

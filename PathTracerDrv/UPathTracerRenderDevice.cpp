@@ -3,6 +3,7 @@
 #include "Shaders.h"
 #include "Materials.h"
 #include "TraceProtocol.h"
+#include "HeadsetSeat.h"
 #ifdef PATHTRACER_LOCAL
 #include "RayReconstruction.h"
 #include <cstdarg>
@@ -384,6 +385,14 @@ void UPathTracerRenderDevice::StaticConstructor()
 	Hdr = 0;
 	HdrPeakNits = 1000;
 	HdrPaperWhite = 200;
+	UseHeadset = 0;
+	HeadsetUnitsPerMetre = 52.5f;
+	HeadsetResolution = 100;
+	HeadsetHudDistance = 1.5f;
+	HeadsetHudSize = 60.0f;
+	HeadsetShowHud = 0;
+	HeadsetDlssQuality = 3;
+	HeadsetBounces = 1;
 
 	new(GetClass(), TEXT("Bounces"), RF_Public) UIntProperty(CPP_PROPERTY(Bounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
@@ -422,6 +431,14 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("HDR"), RF_Public) UBoolProperty(CPP_PROPERTY(Hdr), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("HDRPeakNits"), RF_Public) UIntProperty(CPP_PROPERTY(HdrPeakNits), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("HDRPaperWhite"), RF_Public) UIntProperty(CPP_PROPERTY(HdrPaperWhite), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VR"), RF_Public) UBoolProperty(CPP_PROPERTY(UseHeadset), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRUnitsPerMetre"), RF_Public) UFloatProperty(CPP_PROPERTY(HeadsetUnitsPerMetre), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRResolution"), RF_Public) UIntProperty(CPP_PROPERTY(HeadsetResolution), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRHudDistance"), RF_Public) UFloatProperty(CPP_PROPERTY(HeadsetHudDistance), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRHudSize"), RF_Public) UFloatProperty(CPP_PROPERTY(HeadsetHudSize), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRShowHud"), RF_Public) UBoolProperty(CPP_PROPERTY(HeadsetShowHud), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRDLSSQuality"), RF_Public) UIntProperty(CPP_PROPERTY(HeadsetDlssQuality), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRBounces"), RF_Public) UIntProperty(CPP_PROPERTY(HeadsetBounces), TEXT("Display"), CPF_Config);
 
 	unguard;
 }
@@ -440,6 +457,8 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	LightSizeNow = Clamp(LightSize, 0, 255);
 	EngineLightingNow = Lighting != 0;
 	NeutralToneMapNow = NeutralToneMap != 0;
+	HeadsetNow = UseHeadset != 0;
+	HeadsetShowHudNow = HeadsetShowHud != 0;
 	DisableBits = (DisableBits & ~ConfiguredMask) | ConfiguredBits();
 
 	// Started afresh once per run: the engine can make a new device mid
@@ -866,11 +885,26 @@ void UPathTracerRenderDevice::CreateTilePipeline()
 		.DebugName("PathTracerTileFragment")
 		.Create("PathTracerTileFragment", Device.get());
 
+	HudModulatedShader = ShaderBuilder()
+		.Type(ShaderType::Fragment)
+		.AddSource("shaders/TileModulatedHud.frag", Shaders::TileFragmentModulatedHud())
+		.DebugName("PathTracerTileModulatedHud")
+		.Create("PathTracerTileModulatedHud", Device.get());
+
+	// Two sets: over the traced picture, and into the HUD's own image for
+	// the headset, which holds the HUD premultiplied - its colour, and in
+	// alpha how much of the world behind it it covers - for the headset's
+	// compositor to put over the world. The HUD's is the same but for the
+	// tiles that blend with what is under them: a translucent tile adds its
+	// colour and covers nothing, and a modulated one darkens what is there
+	// and covers the world as much as it darkens (TileFragmentModulatedHud).
+	for (int set = 0; set < 2; set++)
 	for (int mode = 0; mode < 4; mode++)
 	{
+		const bool hud = set == 1;
 		GraphicsPipelineBuilder builder;
 		builder.AddVertexShader(TileVertexShader.get());
-		builder.AddFragmentShader(TileFragmentShader.get());
+		builder.AddFragmentShader(hud && mode == 2 ? HudModulatedShader.get() : TileFragmentShader.get());
 		builder.AddVertexBufferBinding(0, sizeof(TileVertex));
 		builder.AddVertexAttribute(0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(TileVertex, Position));
 		builder.AddVertexAttribute(1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(TileVertex, TexCoord));
@@ -918,59 +952,82 @@ void UPathTracerRenderDevice::CreateTilePipeline()
 			blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
 			blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 		}
+		if (hud && mode == 1)
+		{
+			blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+			blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		}
+		else if (hud && mode == 2)
+		{
+			blend.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+			blend.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR;
+		}
 		builder.AddColorBlendAttachment(blend);
 
-		builder.DebugName("PathTracerTilePipeline");
-		TilePipelines[mode] = builder.Create(Device.get());
+		builder.DebugName(hud ? "PathTracerHudTilePipeline" : "PathTracerTilePipeline");
+		(hud ? HudTilePipelines : TilePipelines)[mode] = builder.Create(Device.get());
 	}
 }
 
-// Draw the frame's collected tiles over the traced image.
-void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
+// Draw the frame's collected tiles over the traced image, or into the HUD's.
+void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands, VulkanImage* target, VulkanFramebuffer* framebuffer, std::unique_ptr<VulkanPipeline>* pipelines, bool layered)
 {
-	if (TileVertices.empty() || !TileFramebuffer)
+	if (TileVertices.empty() || !framebuffer)
 		return;
 
+	// Once a frame, however many images they go into.
 	const size_t byteSize = TileVertices.size() * sizeof(TileVertex);
-	if (!TileVertexBuffer || TileVertexCapacity < byteSize)
+	if (!TilesUploaded)
 	{
-		// Grown rather than sized exactly, so a busy menu does not reallocate
-		// every frame.
-		TileVertexCapacity = byteSize * 2;
-		TileVertexBuffer = BufferBuilder()
-			.Size(TileVertexCapacity)
-			.Usage(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
-			.DebugName("PathTracerTileVertices")
-			.Create(Device.get());
+		if (!TileVertexBuffer || TileVertexCapacity < byteSize)
+		{
+			// Grown rather than sized exactly, so a busy menu does not
+			// reallocate every frame.
+			TileVertexCapacity = byteSize * 2;
+			TileVertexBuffer = BufferBuilder()
+				.Size(TileVertexCapacity)
+				.Usage(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU)
+				.DebugName("PathTracerTileVertices")
+				.Create(Device.get());
+		}
+
+		void* mapped = TileVertexBuffer->Map(0, byteSize);
+		memcpy(mapped, TileVertices.data(), byteSize);
+		TileVertexBuffer->Unmap();
+		TilesUploaded = true;
 	}
 
-	void* mapped = TileVertexBuffer->Map(0, byteSize);
-	memcpy(mapped, TileVertices.data(), byteSize);
-	TileVertexBuffer->Unmap();
-
-	// The helper's frame was copied into this image; the tiles are about to
-	// read and blend over it. The layout does not change - only the ordering
-	// and visibility do.
+	// The helper's frame was copied into this image, or it was cleared; the
+	// tiles are about to read and blend over it. The layout does not change
+	// - only the ordering and visibility do.
 	PipelineBarrier()
-		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+		.AddImage(target, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
 	RenderPassBegin()
 		.RenderPass(TileRenderPass.get())
-		.Framebuffer(TileFramebuffer.get())
-		.RenderArea(0, 0, TraceWidth, TraceHeight)
+		.Framebuffer(framebuffer)
+		.RenderArea(0, 0, TraceWidth, layered ? HudLayers * TraceHeight : TraceHeight)
 		.Execute(commands);
 
-	VkViewport viewport = {};
-	viewport.width = (float)TraceWidth;
-	viewport.height = (float)TraceHeight;
-	viewport.maxDepth = 1.0f;
-	commands->setViewport(0, 1, &viewport);
-
-	VkRect2D scissor = {};
-	scissor.extent.width = TraceWidth;
-	scissor.extent.height = TraceHeight;
-	commands->setScissor(0, 1, &scissor);
+	// Laid out over the trace's size; layered, each layer into its own half
+	// of the image, one above the other.
+	auto toLayer = [&](int layer)
+	{
+		VkViewport viewport = {};
+		viewport.y = (float)(layer * TraceHeight);
+		viewport.width = (float)TraceWidth;
+		viewport.height = (float)TraceHeight;
+		viewport.maxDepth = 1.0f;
+		commands->setViewport(0, 1, &viewport);
+		VkRect2D scissor = {};
+		scissor.offset.y = layer * TraceHeight;
+		scissor.extent.width = TraceWidth;
+		scissor.extent.height = TraceHeight;
+		commands->setScissor(0, 1, &scissor);
+	};
+	int boundLayer = 0;
+	toLayer(0);
 
 	VkBuffer vertexBuffers[] = { TileVertexBuffer->buffer };
 	VkDeviceSize offsets[] = { 0 };
@@ -982,11 +1039,20 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 		VulkanDescriptorSet* set = batch.Texture ? batch.Texture->Sets[batch.SamplerMode].get() : nullptr;
 		if (!set || batch.VertexCount == 0)
 			continue;
+		// The coronas, projected for the headset's HUD, would land beside
+		// their lights on the screen's copy of the left eye.
+		if (!layered && batch.Layer == 2 && HeadsetShowing)
+			continue;
 
 		if (batch.BlendMode != boundMode)
 		{
-			commands->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, TilePipelines[batch.BlendMode].get());
+			commands->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[batch.BlendMode].get());
 			boundMode = batch.BlendMode;
+		}
+		if (layered && batch.Layer != boundLayer)
+		{
+			toLayer(batch.Layer);
+			boundLayer = batch.Layer;
 		}
 
 		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, TilePipelineLayout.get(), 0, set);
@@ -996,8 +1062,98 @@ void UPathTracerRenderDevice::RenderTiles(VulkanCommandBuffer* commands)
 	commands->endRenderPass();
 
 	PipelineBarrier()
-		.AddImage(OutputImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+		.AddImage(target, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
 		.Execute(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+}
+
+// The HUD's own image for the headset, the trace's size, made when first
+// wanted after the size changes.
+void UPathTracerRenderDevice::EnsureHudImage()
+{
+	if (HudImage || !TileRenderPass || TraceWidth <= 0 || TraceHeight <= 0)
+		return;
+	// The layers one above the other: the HUD, what aims with the mouse, and
+	// the coronas.
+	HudImage = ImageBuilder()
+		.Format(VK_FORMAT_R16G16B16A16_SFLOAT)
+		.Size(TraceWidth, HudLayers * TraceHeight)
+		.Usage(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+		.DebugName("PathTracerHud")
+		.Create(Device.get());
+	HudView = ImageViewBuilder().Image(HudImage.get(), VK_FORMAT_R16G16B16A16_SFLOAT).DebugName("PathTracerHudView").Create(Device.get());
+	HudFramebuffer = FramebufferBuilder()
+		.RenderPass(TileRenderPass.get())
+		.Size(TraceWidth, HudLayers * TraceHeight)
+		.AddAttachment(HudView.get())
+		.DebugName("PathTracerHudFramebuffer")
+		.Create(Device.get());
+	VulkanImage* image = HudImage.get();
+	ExecuteImmediate([image](VulkanCommandBuffer* cmd)
+	{
+		PipelineBarrier()
+			.AddImage(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
+			.Execute(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	});
+}
+
+// The HUD alone, for the headset: the tiles into a clear image, then copied
+// into the helper's, which it takes in its next frame, after Released. A new
+// one of the helper's has never been anywhere; otherwise it comes back from
+// the helper's queue, and goes back to it.
+void UPathTracerRenderDevice::DrawHud(VulkanCommandBuffer* commands)
+{
+	EnsureHudImage();
+	if (!HudImage || !Tracer || !Tracer->Hud())
+		return;
+
+	VkClearColorValue clear = {};
+	const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	PipelineBarrier()
+		.AddImage(HudImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	commands->clearColorImage(HudImage->image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+	PipelineBarrier()
+		.AddImage(HudImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	RenderTiles(commands, HudImage.get(), HudFramebuffer.get(), HudTilePipelines, true);
+
+	const bool fresh = Tracer->HudGeneration() != HudDrawnGeneration;
+	const uint32_t family = (uint32_t)Device->GraphicsFamily;
+	VkImageMemoryBarrier shared = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+	shared.image = Tracer->Hud();
+	shared.subresourceRange = range;
+	shared.oldLayout = fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+	shared.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	shared.srcQueueFamilyIndex = fresh ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_EXTERNAL;
+	shared.dstQueueFamilyIndex = fresh ? VK_QUEUE_FAMILY_IGNORED : family;
+	shared.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &shared);
+	PipelineBarrier()
+		.AddImage(HudImage.get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	VkImageCopy copy = {};
+	copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+	copy.dstSubresource = copy.srcSubresource;
+	copy.extent = { (uint32_t)Min(TraceWidth, (int)Tracer->HudWidth()), (uint32_t)Min(HudLayers * TraceHeight, (int)Tracer->HudHeight()), 1 };
+	vkCmdCopyImage(commands->buffer, HudImage->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shared.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	PipelineBarrier()
+		.AddImage(HudImage.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+		.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	shared.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	shared.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	shared.srcQueueFamilyIndex = family;
+	shared.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+	shared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	shared.dstAccessMask = 0;
+	vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &shared);
+	HudDrawnGeneration = Tracer->HudGeneration();
+	HudDrawn = true;
+	// Which way the head faced when it was projected, for the helper to put
+	// its panel there: through the head, or with nothing projected - a menu
+	// - wherever the head is.
+	const TraceProtocol::Header& status = Tracer->Status();
+	for (int i = 0; i < 4; i++)
+		HudDrawnHead[i] = HeadProjected ? ProjectedHead[i] : status.HeadValid ? status.HeadOrientation[i] : (i == 3 ? 1.0f : 0.0f);
 }
 
 void UPathTracerRenderDevice::CreateBrightnessPipeline()
@@ -1365,6 +1521,9 @@ void UPathTracerRenderDevice::CreateSwapChainResources()
 	vkDeviceWaitIdle(Device->device);
 
 	TileFramebuffer.reset();
+	HudFramebuffer.reset();
+	HudView.reset();
+	HudImage.reset();
 	PresentView.reset();
 	PresentImage.reset();
 	SdrView.reset();
@@ -1631,7 +1790,7 @@ void UPathTracerRenderDevice::LogBench()
 	char line[512];
 	snprintf(line, sizeof(line), "PT BENCH: %s, %dx%d traced at %ux%u, denoiser %s, materials %s, bounces %d, %d instances, %d lights, vsync %s",
 		Narrow(map).c_str(), TraceWidth, TraceHeight, status ? status->RenderWidth : 0u, status ? status->RenderHeight : 0u,
-		denoisers[Min<uint32_t>(status ? status->DenoisedWith : 0u, 2)], MaterialsEnabled ? "on" : "off", (int)Bounces,
+		denoisers[Min<uint32_t>(status ? status->DenoisedWith : 0u, 2)], MaterialsEnabled ? "on" : "off", BouncesInUse(),
 		(int)Scene.Instances.size(), (int)Scene.Lights.size(), UsingVsync ? "on" : "off");
 	WriteTimingLine(line);
 	WriteTimingLine("PT BENCH:                                     GPU ms (trace)   collect ms   frame ms   fps    change: GPU, frame");
@@ -1832,6 +1991,8 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	// which the trace of this level has nothing to show for.
 	if (Viewport && Frame->X > 0 && Frame->Y > 0 && Frame->X < Viewport->SizeX)
 	{
+		// Only ever drawn with the HUD, so the player's view is done.
+		WorldPass = false;
 #if defined(DEUSEX)
 		// Photo mode leaves the HUD, and the views in its windows, out.
 		if (!Frame->Parent && !Photo.Active)
@@ -1935,7 +2096,38 @@ void UPathTracerRenderDevice::SetSceneNode(FSceneNode* Frame)
 	Camera.Up = vec4(c.YAxis.X, c.YAxis.Y, c.YAxis.Z, 0.0f) * halfHeight;
 	Camera.Forward = vec4(c.ZAxis.X, c.ZAxis.Y, c.ZAxis.Z, 0.0f);
 
+	// With a headset showing, the HUD follows the head rather than the mouse,
+	// so what it marks in the world - the brackets round what can be used,
+	// the augmentations' target boxes - has to be placed through where the
+	// head looks for it to land on the world behind it. The game places them
+	// through this node, as it is when the HUD is drawn: turned the way the
+	// head faced in the last frame the headset showed (in the seat fitted to
+	// this view, HeadsetSeat), with the focal length of the box the HUD is
+	// shown in. The trace's own camera above is the mouse's: the eyes are
+	// placed around it, and the crosshair aims along it (DrawTile).
+	HeadProjected = false;
+	if (HeadsetShowing && Tracer && Tracer->Alive() && Tracer->Status().HeadValid && Viewport && Viewport->SizeX > 0)
+	{
+		const float* head = Tracer->Status().HeadOrientation;
+		vec3 right, down, ahead;
+		HeadsetSeat::HeadView(vec3(c.XAxis.X, c.XAxis.Y, c.XAxis.Z), vec3(c.YAxis.X, c.YAxis.Y, c.YAxis.Z), vec3(c.ZAxis.X, c.ZAxis.Y, c.ZAxis.Z),
+			head, right, down, ahead);
+		Frame->Coords.XAxis = FVector(right.x, right.y, right.z);
+		Frame->Coords.YAxis = FVector(down.x, down.y, down.z);
+		Frame->Coords.ZAxis = FVector(ahead.x, ahead.y, ahead.z);
+		Frame->Uncoords = Frame->Coords.Inverse();
+		const float focal = (float)Viewport->SizeX * 0.5f / HeadsetHudTangent();
+		Frame->Proj.Z = focal;
+		Frame->RProj.Z = 1.0f / focal;
+		for (int i = 0; i < 4; i++)
+			ProjectedHead[i] = head[i];
+		HeadProjected = true;
+	}
+
 	HaveCamera = true;
+	WorldPass = true;
+	WorldPassDrawn = false;
+	WorldPassFrame = Frame;
 
 	unguardSlow;
 }
@@ -1965,11 +2157,15 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 
 		CreateSwapChainResources();
 		CheckPhoto();
+		UpdateHeadsetHud();
 		HaveCamera = false;
 		FlashScale = InFlashScale;
 		FlashFog = InFlashFog;
 		TileVertices.clear();
 		TileBatches.clear();
+		TilesUploaded = false;
+		HeadProjected = false;
+		WorldPass = false;
 		InsetViews.clear();
 		CollectedThisFrame = false;
 		if (Textures)
@@ -1989,8 +2185,11 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 // Starts the helper that traces, from beside this DLL, on this device's GPU.
 bool UPathTracerRenderDevice::StartTracer()
 {
-	// A new client counts its refusals from none.
+	// A new client counts its refusals from none, and has made no HUD image.
 	RefusedSeen = 0;
+	HudDrawnGeneration = 0;
+	HudDrawn = false;
+	HeadsetShowing = false;
 #ifdef PATHTRACER_LOCAL
 	// A 64-bit game traces in its own process, on this device.
 	Tracer.reset(new TraceClient());
@@ -2028,7 +2227,7 @@ bool UPathTracerRenderDevice::StartTracer()
 	const std::string helper = directory + "\\PathTracerHelper.exe";
 
 	Tracer.reset(new TraceClient());
-	if (!Tracer->Start(Device.get(), helper, directory, VkDebug != 0))
+	if (!Tracer->Start(Device.get(), helper, directory, VkDebug != 0, HeadsetNow ? 1 : 0))
 	{
 		const std::string why = Tracer->Error();
 		PathTracerEvent("helper did not start: %s", why.c_str());
@@ -2043,6 +2242,8 @@ bool UPathTracerRenderDevice::StartTracer()
 	debugf(TEXT("PathTracer: tracing in PathTracerHelper.exe on %s%s"), *Widen(status.DeviceName),
 		status.CanSampleTextures ? TEXT("") : TEXT(", which cannot index textures: surfaces will use one averaged colour each"));
 	PathTracerEvent("helper started on %s", status.DeviceName);
+	if (HeadsetNow)
+		debugf(TEXT("PathTracer %s"), *DescribeHeadset());
 	if (LogTimings)
 	{
 		char line[256];
@@ -2340,12 +2541,19 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// rather than idling while the frame is described and recorded.
 		// Without a world to trace the output image keeps the last one, which
 		// is what the engine expects behind a menu or a conversation.
-		if ((HaveCamera || !InsetViews.empty()) && Tracer && Tracer->Alive() && !Scene.IsEmpty())
+		//
+		// With a headset every frame goes to the helper, world or not: the
+		// headset is shown something at its own pace whatever the game draws,
+		// and the HUD - the menus, with no world - goes back with it.
+		const bool world = (HaveCamera || !InsetViews.empty()) && Tracer && Tracer->Alive() && !Scene.IsEmpty();
+		const bool headset = HeadsetNow && Tracer && Tracer->Alive() && Tracer->Status().Headset >= TraceProtocol::HeadsetIdle;
+		if (world || headset)
 		{
 			// UT's weapon, now that RenderOverlays has placed it.
-			Scene.FinishViewModel();
+			if (world)
+				Scene.FinishViewModel();
 			const double sendStart = NowMs();
-			if (SendScene())
+			if (!world || SendScene())
 			{
 				TraceProtocol::TraceCommand frame = {};
 				frame.Width = (uint32_t)TraceWidth;
@@ -2353,7 +2561,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.Frame = FrameIndex++;
 				frame.AccumulatedFrames = AccumulatedFrames;
 				frame.MaxSamples = (uint32_t)Max(MaxAccumulatedFrames, 1);
-				frame.Bounces = (uint32_t)Clamp(Bounces, 1, 255);
+				frame.Bounces = (uint32_t)BouncesInUse();
 				frame.GlossBounces = (uint32_t)Clamp(GlossBounces, 0, 255);
 				// A photo being refined: the samples averaged as they come,
 				// no denoiser, and paths given more bounces than a frame can
@@ -2376,7 +2584,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				// making its images again every time the camera stops.
 				if (Photo.Active && !Photo.Accumulating && DenoiseEnabled)
 					frame.Denoise = TraceProtocol::DenoiseNrd;
-				frame.DlssQuality = (uint32_t)DlssQualityNow;
+				frame.DlssQuality = (uint32_t)DlssQualityInUse();
 				frame.LightSize = (uint32_t)LightSizeNow;
 				frame.MaxAnisotropy = (uint32_t)Clamp(appRound(MaxAnisotropy), 0, 16);
 				frame.Lighting = EngineLightingNow ? 1 : 0;
@@ -2453,7 +2661,43 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 					if (InsetAccumulated[i] < (uint32_t)Max(MaxAccumulatedFrames, 1))
 						InsetAccumulated[i]++;
 				}
+				// For the headset, each eye traced from where it is around the
+				// view, the HUD drawn last frame, and the Brightness, which
+				// the helper puts on the headset's pictures as ApplyBrightness
+				// puts it on the screen's. HDR is the screen's: the headset
+				// takes SDR.
+				if (headset)
+				{
+					const float brightness = Clamp(Viewport->GetOuterUClient()->Brightness * 2.0f, 0.05f, 2.99f);
+					frame.Headset = 1;
+					frame.NoWorld = world ? 0 : 1;
+					frame.UnitsPerMetre = HeadsetUnitsPerMetre > 0.0f ? HeadsetUnitsPerMetre : 52.5f;
+					frame.HeadsetResolution = Clamp(HeadsetResolution, 25, 200) / 100.0f;
+					frame.HudDistance = Clamp(HeadsetHudDistance, 0.3f, 20.0f);
+					frame.HeadsetGamma = 1.0f / brightness;
+					// The HUD's image, HudLayers high, and the box of each the
+					// headset shows: the engine's, where the HUD and the menus
+					// are laid out, HeadsetHudSize across.
+					frame.HudWidth = (uint32_t)TraceWidth;
+					frame.HudHeight = (uint32_t)(HudLayers * TraceHeight);
+					frame.HudLayers = (uint32_t)HudLayers;
+					frame.HudRect[0] = (uint32_t)UiOffsetX;
+					frame.HudRect[1] = 0;
+					frame.HudRect[2] = (uint32_t)Max((int)Viewport->SizeX, 1);
+					frame.HudRect[3] = (uint32_t)TraceHeight;
+					frame.HudTangents[0] = HeadsetHudTangent();
+					frame.HudTangents[1] = HeadsetHudTangent() * TraceHeight / (float)frame.HudRect[2];
+					frame.HudDrawn = HudDrawn ? 1 : 0;
+					frame.HudDrawnGeneration = HudDrawnGeneration;
+					for (int i = 0; i < 4; i++)
+						frame.HudHead[i] = HudDrawnHead[i];
+					frame.HeadsetRecenter = HeadsetRecenterAsked ? 1 : 0;
+					frame.ToneCeiling = 1.0f;
+					HeadsetRecenterAsked = false;
+				}
+				HudDrawn = false;
 				owed = Tracer->Trace(frame);
+				HeadsetShowing = headset && Tracer->Alive() && Tracer->Status().Headset == TraceProtocol::HeadsetShowing;
 				if (Tracer->Alive())
 				{
 					const TraceProtocol::Header& status = Tracer->Status();
@@ -2501,14 +2745,18 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// with its semaphore.
 		WaitForPreviousFrame();
 
-		if (SwapChain->Lost() || SwapChain->Width() != windowWidth || SwapChain->Height() != windowHeight || UsingVsync != UseVSync || UsingHdr != Hdr)
+		// The screen's vsync steps aside while a headset is showing the
+		// frames, which it paces itself: waiting for the monitor as well only
+		// makes the headset miss its own.
+		const UBOOL vsync = UseVSync && !HeadsetShowing;
+		if (SwapChain->Lost() || SwapChain->Width() != windowWidth || SwapChain->Height() != windowHeight || UsingVsync != vsync || UsingHdr != Hdr)
 		{
 			PathTracerEvent("swap chain %dx%d -> %dx%d%s", SwapChain->Width(), SwapChain->Height(), windowWidth, windowHeight,
 				SwapChain->Lost() ? " (lost)" : "");
-			UsingVsync = UseVSync;
+			UsingVsync = vsync;
 			const bool hdrAsked = Hdr != 0, hdrChanged = UsingHdr != Hdr;
 			UsingHdr = Hdr;
-			SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, hdrAsked, false);
+			SwapChain->Create(windowWidth, windowHeight, vsync ? 2 : 3, vsync, hdrAsked, false);
 
 			// What it took: scRGB where the compositor offers it (Windows),
 			// HDR10 where it does not (a Wayland compositor). The picture is
@@ -2524,7 +2772,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				{
 					debugf(TEXT("PathTracer HDR: the swap chain's format %d cannot be blitted to; staying SDR"), (int)format.format);
 					mode = 0;
-					SwapChain->Create(windowWidth, windowHeight, UseVSync ? 2 : 3, UseVSync, false, false);
+					SwapChain->Create(windowWidth, windowHeight, vsync ? 2 : 3, vsync, false, false);
 				}
 			}
 			if (mode != HdrMode || (hdrChanged && hdrAsked))
@@ -2566,8 +2814,9 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 
 		// The helper's frame, taken over from its queue as a transfer from
 		// VK_QUEUE_FAMILY_EXTERNAL, copied into the output image and handed
-		// back the same way.
-		if (owed)
+		// back the same way. A headset's frame with nothing traced has no
+		// new picture in it.
+		if (owed && Tracer->OutputFresh())
 		{
 			const uint32_t family = (uint32_t)Device->GraphicsFamily;
 			VkImageMemoryBarrier barriers[2] = {};
@@ -2646,7 +2895,11 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// that draw themselves, now the last frame is done with them.
 		if (Textures)
 			Textures->RecordChanges(commands.get());
-		RenderTiles(commands.get());
+		RenderTiles(commands.get(), OutputImage.get(), TileFramebuffer.get(), TilePipelines);
+		// And on its own for the headset, into the helper's image, while
+		// this frame holds it.
+		if (owed && headset)
+			DrawHud(commands.get());
 		ApplyBrightness(commands.get());
 
 		// In HDR, the picture encoded for the swap chain, and a photo being
@@ -2753,7 +3006,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 		// Not while benchmarking, whose frame times would be the limit's.
 		// Nor while a photo refines, whose samples come a frame at a time.
 		const double limitStart = NowMs();
-		if (Bench.Step < 0 && !Photo.Accumulating)
+		if (Bench.Step < 0 && !Photo.Accumulating && !HeadsetShowing)
 			LimitFrameRate();
 		Timings.Limit += NowMs() - limitStart;
 		if (HaveCamera)
@@ -2802,7 +3055,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 					snprintf(line, sizeof(line), "PathTracer GPU ms/frame (helper): build %.2f trace %.2f denoise %.2f composite %.2f | total %.2f at %dx%d traced at %ux%u, bounces %d, glossy bounces %d, materials %s, denoiser %s",
 						Timings.GpuBuild / g, Timings.GpuTrace / g, Timings.GpuDenoise / g, Timings.GpuComposite / g,
 						(Timings.GpuBuild + Timings.GpuTrace + Timings.GpuDenoise + Timings.GpuComposite) / g,
-						TraceWidth, TraceHeight, status.RenderWidth, status.RenderHeight, (int)Bounces, (int)GlossBounces,
+						TraceWidth, TraceHeight, status.RenderWidth, status.RenderHeight, BouncesInUse(), (int)GlossBounces,
 						MaterialsEnabled ? "on" : "off", denoisers[Min<uint32_t>(status.DenoisedWith, 2)]);
 					WriteTimingLine(line);
 				}
@@ -2828,6 +3081,171 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 	unguard;
 }
 
+// Deus Ex's HUD parts that its player can hide and show (DeusExPlayer's
+// ToggleObjectBelt and the rest, which the HUD's options menu sets): by the
+// player's flag for each, and the window of DeusExHUD's that shows it - the
+// hit display's flag shows the damage display too.
+//
+// The flags are the player's saved settings, and the game writes them out
+// whenever it saves its configuration - which hid the HUD on the screen too,
+// for good, when it was the flags the headset changed. So they never are,
+// past the moment the HUD reads them: DeusExHUD's UpdateSettings shows and
+// hides every part from them, so for the headset they are turned off, the
+// HUD made to read them, and turned straight back, which leaves the windows
+// hidden and the settings as they were. Anything that has the HUD read them
+// again - a menu closing - shows the parts again, so they are looked at every
+// frame.
+static const struct { const TCHAR* Flag; const TCHAR* Window; } HudParts[] = {
+	{ TEXT("bObjectBeltVisible"), TEXT("belt") },
+	{ TEXT("bHitDisplayVisible"), TEXT("hit") },
+	{ TEXT("bHitDisplayVisible"), TEXT("damageDisplay") },
+	{ TEXT("bAmmoDisplayVisible"), TEXT("ammo") },
+	{ TEXT("bAugDisplayVisible"), TEXT("activeItems") },
+	{ TEXT("bCompassVisible"), TEXT("compass") },
+};
+
+// Looked up once a class: a class has thousands of fields to search by
+// name, and these are wanted every frame. The names are the table's own
+// strings, so the same pointer each time.
+template <class T> static T* CachedField(UObject* object, const TCHAR* name)
+{
+	if (!object)
+		return nullptr;
+	static std::map<std::pair<UClass*, const TCHAR*>, T*> found;
+	const auto key = std::make_pair(object->GetClass(), name);
+	auto it = found.find(key);
+	if (it == found.end())
+		it = found.emplace(key, FindField<T>(object->GetClass(), name)).first;
+	return it->second;
+}
+
+static UObject* ObjectField(UObject* object, const TCHAR* name)
+{
+	UObjectProperty* field = CachedField<UObjectProperty>(object, name);
+	return field ? *(UObject**)((BYTE*)object + field->Offset) : nullptr;
+}
+
+static UBoolProperty* BoolField(UObject* object, const TCHAR* name)
+{
+	return CachedField<UBoolProperty>(object, name);
+}
+
+static bool GetBool(UObject* object, UBoolProperty* field)
+{
+	return (*(BITFIELD*)((BYTE*)object + field->Offset) & field->BitMask) != 0;
+}
+
+static void SetBool(UObject* object, UBoolProperty* field, bool on)
+{
+	BITFIELD& bits = *(BITFIELD*)((BYTE*)object + field->Offset);
+	bits = on ? (bits | field->BitMask) : (bits & ~field->BitMask);
+}
+
+void UPathTracerRenderDevice::UpdateHeadsetHud()
+{
+	const bool hide = HeadsetShowing && !HeadsetShowHudNow;
+	if (!hide && !HudPartsHidden)
+		return;
+	APlayerPawn* player = Viewport ? Viewport->Actor : nullptr;
+	UObject* hud = ObjectField(ObjectField(player, TEXT("rootWindow")), TEXT("hud"));
+	// ToggleCrosshair, twice, is what has the HUD read the flags: the
+	// crosshair ends as it was.
+	UBoolProperty* crosshair = BoolField(player, TEXT("bCrosshairVisible"));
+	if (!hud || !crosshair)
+		return;
+	if (!hide)
+	{
+		// Shown again as the player has them.
+		if (HudPartsHidden)
+		{
+			Viewport->Exec(TEXT("ToggleCrosshair"), *GLog);
+			Viewport->Exec(TEXT("ToggleCrosshair"), *GLog);
+			HudPartsHidden = false;
+		}
+		return;
+	}
+
+	const int count = (int)(sizeof(HudParts) / sizeof(HudParts[0]));
+	UBoolProperty* flags[count] = {};
+	bool showing = false;
+	for (int i = 0; i < count; i++)
+	{
+		flags[i] = BoolField(player, HudParts[i].Flag);
+		UObject* window = ObjectField(hud, HudParts[i].Window);
+		UBoolProperty* visible = BoolField(window, TEXT("bIsVisible"));
+		if (flags[i] && visible && GetBool(window, visible))
+			showing = true;
+	}
+	HudPartsHidden = true;
+	if (!showing)
+		return;
+	bool was[count] = {};
+	for (int i = 0; i < count; i++)
+		if (flags[i])
+		{
+			was[i] = GetBool(player, flags[i]);
+			SetBool(player, flags[i], false);
+		}
+	Viewport->Exec(TEXT("ToggleCrosshair"), *GLog);
+	Viewport->Exec(TEXT("ToggleCrosshair"), *GLog);
+	for (int i = 0; i < count; i++)
+		if (flags[i])
+			SetBool(player, flags[i], was[i]);
+}
+
+// PT VR: the headset is the helper's, and asked for as it starts - the
+// runtime has Vulkan extensions of its own to ask for before there is a
+// device - so switching it starts the helper again, and the level is sent
+// to it anew.
+void UPathTracerRenderDevice::SwitchHeadset(bool on, FOutputDevice& Ar)
+{
+#ifdef PATHTRACER_LOCAL
+	Ar.Logf(TEXT("PT: this build traces in the game's own process, which has no headset"));
+	return;
+#else
+	if (Photo.Active && on)
+	{
+		Ar.Logf(TEXT("PT: photo mode is for the screen; end it first (PT PHOTO)"));
+		return;
+	}
+	HeadsetNow = on;
+	HeadsetShowing = false;
+	WaitForPreviousFrame();
+	if (Device)
+		vkDeviceWaitIdle(Device->device);
+	Tracer.reset();
+	DenoiseRestart = true;
+	AccumulatedFrames = 0;
+	if (!StartTracer())
+	{
+		Ar.Logf(TEXT("PT: the helper did not start again; PathTracerHelper.log says why"));
+		return;
+	}
+	Ar.Logf(TEXT("PT: %s"), *DescribeHeadset());
+#endif
+}
+
+FString UPathTracerRenderDevice::DescribeHeadset() const
+{
+	if (!HeadsetNow)
+		return TEXT("no headset (PT VR shows the game in one)");
+	if (!Tracer || !Tracer->Alive())
+		return TEXT("a headset asked for, but the helper is not running");
+	const TraceProtocol::Header& status = Tracer->Status();
+	switch (status.Headset)
+	{
+	case TraceProtocol::HeadsetShowing:
+		return FString::Printf(TEXT("headset showing: %s; each eye traced at %ux%u, %d bounces, %s"), *Widen(status.HeadsetStatus),
+			status.HeadsetEyeWidth, status.HeadsetEyeHeight, BouncesInUse(), *DescribeDenoiser());
+	case TraceProtocol::HeadsetIdle:
+		return FString::Printf(TEXT("headset ready, waiting for it to show the game (on the head, awake?): %s"), *Widen(status.HeadsetStatus));
+	case TraceProtocol::HeadsetMissing:
+		return FString::Printf(TEXT("no headset: %s"), *Widen(status.HeadsetStatus));
+	default:
+		return TEXT("the helper has no headset");
+	}
+}
+
 // What PT DENOISE and PT DLSS have asked for, as the next frame will be
 // denoised: NRD, Ray Reconstruction at a quality, or nothing - and NRD in Ray
 // Reconstruction's place, with the helper's reason, where it cannot run.
@@ -2839,7 +3257,7 @@ FString UPathTracerRenderDevice::DescribeDenoiser() const
 		return TEXT("denoising off");
 	if (!DlssEnabled)
 		return FString::Printf(TEXT("denoising with NRD (%s)"), helper ? *Widen(Tracer->Status().DenoiserStatus) : TEXT("no helper"));
-	const FString quality = qualityNames[Clamp(DlssQualityNow, 0, 4)];
+	const FString quality = qualityNames[DlssQualityInUse()];
 	if (!helper)
 		return FString::Printf(TEXT("denoising with DLSS Ray Reconstruction, %s (no helper)"), *quality);
 	const char* status = Tracer->Status().DlssStatus;
@@ -3203,7 +3621,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		}
 		if (ParseCommand(&Cmd, TEXT("BOUNCES")))
 		{
-			Bounces = Max(appAtoi(Cmd), 1);
+			(HeadsetNow ? HeadsetBounces : Bounces) = Max(appAtoi(Cmd), 1);
 			handled = true;
 		}
 		if (ParseCommand(&Cmd, TEXT("MATERIALS")) || ParseCommand(&Cmd, TEXT("NOMATERIALS")))
@@ -3334,6 +3752,53 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 		if (ParseCommand(&Cmd, TEXT("PHOTO")))
 		{
 			PhotoCommand(Cmd, Ar);
+			return 1;
+		}
+		// The headset on or off (UseHeadset), which starts the helper again;
+		// or with a word after it, where straight ahead is, the world's
+		// scale in units a metre, the eyes' resolution in percent, the HUD's
+		// distance in metres, or how it stands.
+		if (ParseCommand(&Cmd, TEXT("VR")))
+		{
+			if (ParseCommand(&Cmd, TEXT("RECENTER")) || ParseCommand(&Cmd, TEXT("RECENTRE")))
+			{
+				HeadsetRecenterAsked = true;
+				Ar.Logf(TEXT("PT: straight ahead is where the head is now"));
+			}
+			else if (ParseCommand(&Cmd, TEXT("SCALE")))
+			{
+				if (appAtof(Cmd) > 0.0f)
+					HeadsetUnitsPerMetre = Clamp((FLOAT)appAtof(Cmd), 5.0f, 500.0f);
+				Ar.Logf(TEXT("PT: %.1f world units a metre"), (float)HeadsetUnitsPerMetre);
+			}
+			else if (ParseCommand(&Cmd, TEXT("RES")))
+			{
+				if (appAtoi(Cmd) > 0)
+					HeadsetResolution = Clamp(appAtoi(Cmd), 25, 200);
+				Ar.Logf(TEXT("PT: each eye traced at %d%% of the size the headset asks for"), (int)HeadsetResolution);
+			}
+			else if (ParseCommand(&Cmd, TEXT("HUDSIZE")))
+			{
+				if (appAtof(Cmd) > 0.0f)
+					HeadsetHudSize = Clamp((FLOAT)appAtof(Cmd), 20.0f, 120.0f);
+				Ar.Logf(TEXT("PT: the HUD %.0f degrees across"), (float)HeadsetHudSize);
+			}
+			else if (ParseCommand(&Cmd, TEXT("HUD")))
+			{
+				if (appAtof(Cmd) > 0.0f)
+					HeadsetHudDistance = Clamp((FLOAT)appAtof(Cmd), 0.3f, 20.0f);
+				Ar.Logf(TEXT("PT: the HUD %.2f metres ahead"), (float)HeadsetHudDistance);
+			}
+			else if (ParseCommand(&Cmd, TEXT("SHOWHUD")))
+			{
+				HeadsetShowHudNow = !HeadsetShowHudNow;
+				Ar.Logf(TEXT("PT: %s"), HeadsetShowHudNow ? TEXT("the HUD shows in the headset")
+					: TEXT("the headset shows the crosshair, the messages and the menus, not the rest of the HUD"));
+			}
+			else if (ParseCommand(&Cmd, TEXT("STATUS")))
+				Ar.Logf(TEXT("PT: %s"), *DescribeHeadset());
+			else
+				SwitchHeadset(!HeadsetNow, Ar);
 			return 1;
 		}
 		// The flashlight on or off, or with a number its brightness, in
@@ -3479,7 +3944,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			for (const auto& q : qualities)
 				if (ParseCommand(&Cmd, q.Name))
 				{
-					DlssQualityNow = q.Quality;
+					(HeadsetNow ? HeadsetDlssQuality : DlssQualityNow) = q.Quality;
 					DlssEnabled = true;
 					named = true;
 				}
@@ -3522,7 +3987,7 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			(DisableBits & 1u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 2u) ? TEXT("OFF") : TEXT("on"),
 			(DisableBits & 4u) ? TEXT("OFF") : TEXT("on"), (DisableBits & 8u) ? TEXT("OFF") : TEXT("on"),
 			MaterialsEnabled ? TEXT("on") : TEXT("off"),
-			(int)Bounces, (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | ALLLIGHTS | HDR | HDRPEAK n | HDRWHITE n | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | BUMP n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
+			BouncesInUse(), (int)GlossBounces, handled ? TEXT("") : TEXT("  (PT BENCH | LIGHTS | FOG | WEAPON | LOOK | HIGHLIGHT | NOLIGHTS | ALLLIGHTS | HDR | HDRPEAK n | HDRWHITE n | NOSHADOWS | NOSKY | NOFOG | FOGSHADOWS | FLASHLIGHT [n] | BEAM n | GLOW n | GLOWSAMPLING | GLASS | WET n | BUMP n | PHOTO | NOGLOW | MATERIALS | MESHLIGHT | DETAIL | MIPS | BAKEDSHADOWS | ANISOTROPY n | WIDESCREEN | PINNEDUI 16:9|4:3|OFF | LIGHTSIZE n | OPAQUE | DENOISE | DLSS [quality] | VIEW name | GUIDES | BOUNCES n | GLOSSBOUNCES n | RESET)"));
 		return 1;
 	}
 
@@ -3589,6 +4054,11 @@ void UPathTracerRenderDevice::Exit()
 	InsetSource.reset();
 
 	TileFramebuffer.reset();
+	HudFramebuffer.reset();
+	HudView.reset();
+	HudImage.reset();
+	for (auto& p : HudTilePipelines) p.reset();
+	HudModulatedShader.reset();
 	TileVertexBuffer.reset();
 	for (auto& p : TilePipelines) p.reset();
 	TileFragmentShader.reset();
@@ -3638,6 +4108,9 @@ void UPathTracerRenderDevice::Exit()
 // for the surface, which is the ground truth PT LOOK compares the trace with.
 void UPathTracerRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet)
 {
+	if (Frame == WorldPassFrame)
+		WorldPassDrawn = true;
+
 	// PT LOOK TIME: the texel at the spot, once a frame, with the level's
 	// clock and the real one, and whether the engine rebuilt the lightmap -
 	// how fast the engine's own lighting effects really run.
@@ -3769,6 +4242,8 @@ void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo
 			Info.Texture ? Info.Texture->GetFullName() : TEXT("none"), NumPts, NumPts > 0 ? Pts[0]->ScreenX : 0.0f, NumPts > 0 ? Pts[0]->ScreenY : 0.0f,
 			(int)PolyFlags, Span ? TEXT(", in the level") : TEXT(""));
 
+	if (Frame == WorldPassFrame)
+		WorldPassDrawn = true;
 	if (Span || !Textures || TraceWidth <= 0 || TraceHeight <= 0 || NumPts < 3 || !Info.Texture)
 		return;
 	static const FName whiteStatic(TEXT("WhiteStatic")), virus(TEXT("Virus_SFX")), rifle(TEXT("Wepn_Prifle_SFX"));
@@ -3806,7 +4281,7 @@ void UPathTracerRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo
 	};
 
 	if (TileBatches.empty() || TileBatches.back().Texture != texture || TileBatches.back().BlendMode != blendMode ||
-		TileBatches.back().SamplerMode != samplerMode)
+		TileBatches.back().SamplerMode != samplerMode || TileBatches.back().Layer != 0)
 	{
 		TileBatch batch;
 		batch.Texture = texture;
@@ -3841,6 +4316,47 @@ static bool IsSolidFill(const FTextureInfo& Info)
 // Collected here rather than drawn, because the traced image does not exist yet
 // when these arrive - the whole frame is traced in Unlock. Batches are merged
 // while the texture and blend mode hold, which for a menu is most of it.
+// What aims with the mouse in Deus Ex's HUD: the crosshair, a window whose
+// background is CrossSquare, and the accuracy reticle drawn round it
+// (AugmentationDisplayWindow's DrawTargetAugmentation), lines a pixel thick
+// and at most a corner long, each centred on one of the lines through the
+// middle of the view, at most 80 pixels from it. The brackets and boxes the
+// HUD draws round things in the world are placed through the head
+// (SetSceneNode), and stay with the HUD.
+//
+// Those pixels are the HUD's own, which Extension's root window scales up by
+// a whole number on a big screen (XRootWindow::ResizeRoot): by the times 640
+// across and 480 down fit, whichever is fewer, so three at 3440x1440. The
+// tile is measured in them.
+bool UPathTracerRenderDevice::AimsWithMouse(const FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL) const
+{
+	static const FName crosshair(TEXT("CrossSquare"));
+	if (!Info.Texture || !Viewport)
+		return false;
+	if (Info.Texture->GetFName() == crosshair)
+		return true;
+	if (!IsSolidFill(Info))
+		return false;
+	const float scale = (float)Max(1, Min(Viewport->SizeX / 640, Viewport->SizeY / 480));
+	X /= scale; Y /= scale; XL /= scale; YL /= scale;
+	if (Min(XL, YL) > 1.5f || Max(XL, YL) > 41.0f)
+		return false;
+	// The script's middle, int(width * 0.5) - 1, and the pixel after it, the
+	// reticle being drawn twice, a pixel apart, its shadow under it.
+	const float cx = (float)(int)(Viewport->SizeX / scale * 0.5f) - 0.5f;
+	const float cy = (float)(int)(Viewport->SizeY / scale * 0.5f) - 0.5f;
+	const float x = X + XL * 0.5f, y = Y + YL * 0.5f;
+	const float reach = 80.0f + 42.0f;
+	if (Abs(x - cx) > reach || Abs(y - cy) > reach)
+		return false;
+	return Abs(x - cx) <= 1.6f || Abs(y - cy) <= 1.6f;
+}
+
+float UPathTracerRenderDevice::HeadsetHudTangent() const
+{
+	return (float)appTan(Clamp(HeadsetHudSize, 20.0f, 120.0f) * (PI / 360.0f));
+}
+
 void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags)
 {
 	guardSlow(UPathTracerRenderDevice::DrawTile);
@@ -3969,13 +4485,19 @@ void UPathTracerRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info, FL
 	if (!TileSet(texture, samplerMode))
 		return;
 
+	// With a headset, what aims with the mouse goes on a layer of its own,
+	// shown along the aim while the rest of the HUD follows the head; and so
+	// do the coronas, which belong out in the world rather than at the HUD.
+	const int layer = !HeadsetNow ? 0 : WorldPass ? 2 : AimsWithMouse(Info, X, Y, XL, YL) ? 1 : 0;
+
 	if (TileBatches.empty() || TileBatches.back().Texture != texture || TileBatches.back().BlendMode != blendMode ||
-		TileBatches.back().SamplerMode != samplerMode)
+		TileBatches.back().SamplerMode != samplerMode || TileBatches.back().Layer != layer)
 	{
 		TileBatch batch;
 		batch.Texture = texture;
 		batch.BlendMode = blendMode;
 		batch.SamplerMode = samplerMode;
+		batch.Layer = layer;
 		batch.FirstVertex = (int)TileVertices.size();
 		batch.VertexCount = 0;
 		TileBatches.push_back(batch);
@@ -4001,7 +4523,9 @@ void UPathTracerRenderDevice::Draw2DPoint(FSceneNode* Frame, FPlane Color, DWORD
 void UPathTracerRenderDevice::ClearZ(FSceneNode* Frame)
 {
 	if (LogDraws && LoggedDraws++ < 400)
-		debugf(TEXT("PT TILES: clear depth"));
+		debugf(TEXT("PT TILES: clear depth%s"), WorldPass ? (WorldPassDrawn ? TEXT(", the world done") : TEXT(", the sky done")) : TEXT(""));
+	if (WorldPass && WorldPassDrawn)
+		WorldPass = false;
 }
 #if defined(OLDUNREAL469SDK)
 // What the 2D's textures can come as: what TextureCache decodes. The engine

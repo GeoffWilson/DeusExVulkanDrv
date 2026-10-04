@@ -48,10 +48,13 @@ public:
 
 	// The camera as the trace sees it: eye position, and the right, up and
 	// forward vectors scaled to the edges of the view, with "up" pointing down
-	// the screen.
+	// the screen - and where the middle of the view is off the forward axis,
+	// in half widths and heights, as a headset's eye has it (the trace
+	// shader's viewShift).
 	struct Camera
 	{
 		vec3 Origin, Right, Up, Forward;
+		vec2 Shift = vec2(0.0f, 0.0f);
 	};
 
 	// The trace's images for one signal, all in GENERAL layout.

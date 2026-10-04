@@ -155,6 +155,11 @@ bool UPathTracerRenderDevice::StartPhoto(FOutputDevice& Ar)
 		Ar.Logf(TEXT("PT: photo mode is for a game played alone, not a network one"));
 		return false;
 	}
+	if (HeadsetNow)
+	{
+		Ar.Logf(TEXT("PT: photo mode is for the screen, not the headset (PT VR switches it off)"));
+		return false;
+	}
 	if (pawn->Level->Pauser.Len() || pawn->bShowMenu)
 	{
 		Ar.Logf(TEXT("PT: photo mode cannot start while the game is paused"));

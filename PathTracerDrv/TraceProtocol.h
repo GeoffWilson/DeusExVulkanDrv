@@ -22,7 +22,11 @@
 //   - an image the helper traces into and the device presents from, and two
 //     binary semaphores ordering them on the GPU: Ready, signalled by the helper
 //     once a frame is in the image, and Released, signalled by the device once
-//     it has copied it out.
+//     it has copied it out;
+//   - with a headset, a second image going the other way: the device draws
+//     the HUD into it after taking a frame, before signalling Released, and
+//     the helper puts it on the headset's panel in its next frame, after
+//     waiting for Released.
 //
 // Everything here has the same layout in a 32-bit and a 64-bit build: fixed
 // size fields, 64-bit ones on 8 byte boundaries, and the checks at the end to
@@ -31,7 +35,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 19;
+	static const uint32_t Version = 22;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -46,6 +50,20 @@ namespace TraceProtocol
 	// be valid in both.
 	static const VkFormat OutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 	static const VkImageUsageFlags OutputUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	// The HUD image likewise: the device copies the HUD in, and the helper
+	// reads it in a compute pass on its way to the headset. Premultiplied
+	// alpha, gamma encoded as the picture is.
+	static const VkFormat HudFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+	static const VkImageUsageFlags HudUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+	// Header::Headset.
+	enum HeadsetState : uint32_t
+	{
+		HeadsetOff = 0,         // not asked for: the helper was started without one
+		HeadsetMissing = 1,     // asked for, but there is none to show on (HeadsetStatus says why)
+		HeadsetIdle = 2,        // there is one, but it is not showing this program: asleep, or off the head
+		HeadsetShowing = 3,     // frames are going to it
+	};
 
 	// How long the device waits on the helper before giving up on it. Loading a
 	// level uploads every texture and builds the static world, which is
@@ -89,8 +107,33 @@ namespace TraceProtocol
 		uint32_t OutputHeight;
 
 		// The last batch submitted a traced frame: Ready will be signalled, and
-		// the device must wait on it and signal Released in return.
+		// the device must wait on it and signal Released in return. With a
+		// headset every frame is handed over like that, traced or not, to
+		// carry the HUD back; OutputFresh says whether the output image holds
+		// a new picture to copy out.
 		uint32_t Traced;
+		uint32_t OutputFresh;
+		// The headset, a HeadsetState.
+		uint32_t Headset;
+
+		// The HUD image, made by the helper when a frame asks for it at a new
+		// size, as the output image is.
+		uint64_t HudMemory;
+		uint64_t HudAllocationSize;
+		uint32_t HudGeneration;
+		uint32_t HudWidth;
+		uint32_t HudHeight;
+
+		// Each eye's picture's size, with the headset showing.
+		uint32_t HeadsetEyeWidth;
+		uint32_t HeadsetEyeHeight;
+		// Which way the head faced in the seat's space at the last frame the
+		// headset showing - a quaternion, x, y, z, w, in OpenXR's terms -
+		// for the device to have the HUD projected through; HeadValid 1 once
+		// there has been one.
+		float HeadOrientation[4];
+		uint32_t HeadValid;
+		uint32_t HeadPad;
 
 		// About the last traced frame, for the device's log.
 		uint32_t LightCount;
@@ -124,6 +167,7 @@ namespace TraceProtocol
 		char Error[512];
 		char DenoiserStatus[128];
 		char DlssStatus[160];       // "ready", or why Ray Reconstruction cannot run
+		char HeadsetStatus[256];    // what it is and runs at, or why there is none
 	};
 #pragma pack(pop)
 
@@ -341,6 +385,56 @@ namespace TraceProtocol
 		// curve squeezed into the last fifth below white spreads out above
 		// it. 0 is taken as 1.
 		float ToneCeiling;
+
+		// For the headset, when the helper was started with one: 1 to trace
+		// the frame for it rather than the screen, each eye from where it is
+		// in the room around the view Camera describes, whose middle is
+		// straight ahead where the player's seat faces. The screen is then
+		// sent the left eye's picture, at Width x Height. NoWorld is a frame
+		// with nothing to trace - a menu over no level - when the headset
+		// keeps the last one, turned as the head turns, under the HUD.
+		uint32_t Headset;
+		uint32_t NoWorld;
+		// How many world units make a metre, for how far apart the eyes are
+		// and how far the head moves the view.
+		float UnitsPerMetre;
+		// The eyes' pictures as a share of the size the headset asks for.
+		float HeadsetResolution;
+		// The HUD's panel: how far in front of the seat, in metres. It spans
+		// the view Camera describes, so what the HUD marks lines up with the
+		// world behind it.
+		float HudDistance;
+		// The game's Brightness, as the gamma the device puts over the
+		// screen's picture: the headset's pictures have it put on by the
+		// helper.
+		float HeadsetGamma;
+		// The HUD image the device drew into last frame: its generation, and 1
+		// when it did draw into it (Header's HudGeneration). HudWidth and
+		// HudHeight are the size it wants from now on, 0 for none.
+		uint32_t HudDrawnGeneration;
+		uint32_t HudDrawn;
+		uint32_t HudWidth;
+		uint32_t HudHeight;
+		// The HUD comes in HudLayers layers, one above the other in its
+		// image: the HUD itself at the top, which goes on a panel in front of
+		// the head; below it what aims with the mouse - the crosshair and the
+		// accuracy reticle - on a panel along the view Camera describes; and
+		// below that, where there are three, the lights' coronas, projected
+		// through the head as the HUD is, but on a panel far out, so the eyes
+		// meet on them out where the lights are rather than at the HUD.
+		// HudRect is the part of each layer to show, in pixels from the top
+		// of its layer, and HudTangents the tangents of its half extents
+		// across and down, which every panel spans. HudHead is which way the
+		// head faced when the HUD drawn last frame was projected (Header's
+		// HeadOrientation), which its panels are placed along, so what the
+		// HUD marks lines up with the world behind it.
+		uint32_t HudRect[4];
+		float HudTangents[2];
+		float HudHead[4];
+		// 1 to make wherever the head is now straight ahead, at the middle of
+		// the view (PT VR RECENTER).
+		uint32_t HeadsetRecenter;
+		uint32_t HudLayers;
 		TraceInset Insets[MaxInsets];
 	};
 
@@ -348,7 +442,7 @@ namespace TraceProtocol
 
 	static_assert(sizeof(vec4) == 16 && sizeof(vec3) == 12, "vector types must be plain floats");
 	static_assert(sizeof(TriangleAttributes) == 128 && sizeof(SceneLight) == 80, "scene records must match in both builds");
-	static_assert(offsetof(Header, ReadySemaphore) % 8 == 0 && offsetof(Header, OutputMemory) % 8 == 0, "64-bit fields must be aligned alike");
+	static_assert(offsetof(Header, ReadySemaphore) % 8 == 0 && offsetof(Header, OutputMemory) % 8 == 0 && offsetof(Header, HudMemory) == 96, "64-bit fields must be aligned alike");
 	static_assert(sizeof(Header) % 8 == 0, "header must keep the command area aligned");
 	static_assert(sizeof(WireInstance) == 128, "instance record must match in both builds");
 	static_assert(sizeof(TraceInset) == 96, "inset record must match in both builds");

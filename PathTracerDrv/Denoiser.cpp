@@ -94,14 +94,16 @@ namespace
 	}
 
 	// The projection the trace's rays amount to: a point at view (x, y, z)
-	// lands at x / (z * |right|) across the screen, both ways from the middle.
-	// Depth is a conventional left handed range; NRD only needs it to be one.
+	// lands at x / (z * |right|) across the screen, both ways from the middle
+	// - less the shift, for a view whose middle is off to one side. Screen y
+	// runs down and view y up, so the shift's y goes the other way. Depth is
+	// a conventional left handed range; NRD only needs it to be one.
 	void ViewToClip(const Denoiser::Camera& camera, float* out)
 	{
 		const float n = 1.0f, f = 100000.0f;
 		const float m[4][4] = {
-			{ 1.0f / Length(camera.Right), 0.0f, 0.0f, 0.0f },
-			{ 0.0f, 1.0f / Length(camera.Up), 0.0f, 0.0f },
+			{ 1.0f / Length(camera.Right), 0.0f, -camera.Shift.x, 0.0f },
+			{ 0.0f, 1.0f / Length(camera.Up), camera.Shift.y, 0.0f },
 			{ 0.0f, 0.0f, f / (f - n), -n * f / (f - n) },
 			{ 0.0f, 0.0f, 1.0f, 0.0f },
 		};

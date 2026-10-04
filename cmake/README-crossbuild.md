@@ -88,7 +88,14 @@ both, everything below the curve's shoulder should come out exactly as
 `--neutral` alone gives it. `--sprites n` hangs a plume of n overlapping
 puffs of smoke before the box, drawn as the device draws sprites: however
 many overlap, their edges should never show, and the scene behind should come
-out as it does without them, with the smoke added. The Windows SDK that `xwin` fetches carries the Direct3D
+out as it does without them, with the smoke added. `--headset` traces for
+the helper's simulated headset rather than the screen - two eyes 64 mm apart,
+each seeing further out than in, the head turning slowly - and writes the two
+eyes side by side, while a test HUD, a crosshair and a translucent bar, goes
+back every frame as the device's does; the helper also writes
+`headset-left.ppm`, `headset-right.ppm` and `headset-hud.ppm` beside itself,
+what a real headset would have been handed, the HUD's colour over grey
+beside its coverage. The Windows SDK that `xwin` fetches carries the Direct3D
 headers and import libraries, so the two Direct3D devices need nothing extra;
 their OpenXR support does, and is stubbed out (see `D3D11DRV_OPENXR`).
 
@@ -126,6 +133,23 @@ build copies `nvngx_dlssd.dll` beside `PathTracerHelper.exe` and
 `deploy-deusex.sh` installs it with the helper, since NGX looks for it there.
 `cmake --build build-x64 --target ngxcheck` builds the spike that asks whether
 it runs at all on a given setup; see `spike/README.md`.
+
+### Headsets
+
+The helper shows the game in a headset through OpenXR (the device's `VR`
+setting) when Khronos's loader and headers are there. Fetch them once,
+before configuring:
+
+```sh
+cmake/fetch-openxr.sh       # into ../.openxr, beside .xwin
+```
+
+The script takes the pinned release's Windows loader, `openxr_loader.dll`
+(64 bit, static CRT), and its headers, and nothing else. Configure `build-x64`
+afterwards and CMake reports `PathTracerHelper: headsets through OpenXR`; the
+build copies the loader beside the helper, which opens it only when a headset
+is asked for. Without it the helper builds without headsets, and `PT VR`
+says so.
 
 ### Unreal Tournament 469
 

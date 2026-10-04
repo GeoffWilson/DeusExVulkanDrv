@@ -98,6 +98,10 @@ set(PATHTRACER_NRD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.nrd" CACHE PATH "Output 
 # SDK. Its runtime, nvngx_dlssd.dll, goes beside the executable, where NGX
 # looks.
 set(PATHTRACER_DLSS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.dlss" CACHE PATH "Output of cmake/fetch-dlss.sh")
+# Khronos's OpenXR loader and headers, when cmake/fetch-openxr.sh has fetched
+# them, for a headset. The loader, openxr_loader.dll, goes beside the helper,
+# which opens it only when a headset is asked for.
+set(PATHTRACER_OPENXR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.openxr" CACHE PATH "Output of cmake/fetch-openxr.sh")
 set(PATHTRACERDRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/PathTracerDrv")
 
 # The tracing: everything that turns the scene into a picture on the GPU, and
@@ -144,15 +148,26 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT PATHTRACER_GAME STREQUAL "UT469")
 # helper: see below.
 add_executable(PathTracerHelper
 	${PATHTRACER_TRACE_SOURCES}
+	"${PATHTRACERDRV_DIR}/HeadsetOutput.cpp"
 	"${PATHTRACERDRV_DIR}/HelperMain.cpp"
 	"${PATHTRACERDRV_DIR}/mat.cpp"
 	"${PATHTRACERDRV_DIR}/Shaders.cpp")
 target_include_directories(PathTracerHelper PRIVATE "${PATHTRACERDRV_DIR}")
-target_compile_definitions(PathTracerHelper PRIVATE PATHTRACER_HELPER WIN32 NDEBUG _CONSOLE)
+# PATHTRACER_HEADSET: the trace sources built here, and only here, can show on a headset.
+target_compile_definitions(PathTracerHelper PRIVATE PATHTRACER_HELPER PATHTRACER_HEADSET WIN32 NDEBUG _CONSOLE)
 target_compile_options(PathTracerHelper PRIVATE /MT /EHsc /Zi)
 target_link_options(PathTracerHelper PRIVATE /DEBUG)
 target_link_libraries(PathTracerHelper PRIVATE zvulkan user32 advapi32)
 link_trace_libraries(PathTracerHelper)
+if(EXISTS "${PATHTRACER_OPENXR_DIR}/include/openxr/openxr.h")
+	message(STATUS "PathTracerHelper: headsets through OpenXR from ${PATHTRACER_OPENXR_DIR}")
+	target_include_directories(PathTracerHelper PRIVATE "${PATHTRACER_OPENXR_DIR}/include")
+	target_compile_definitions(PathTracerHelper PRIVATE PATHTRACER_OPENXR)
+	add_custom_command(TARGET PathTracerHelper POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PATHTRACER_OPENXR_DIR}/openxr_loader.dll" "$<TARGET_FILE_DIR:PathTracerHelper>")
+else()
+	message(STATUS "PathTracerHelper: no OpenXR SDK at ${PATHTRACER_OPENXR_DIR}, building without headsets")
+endif()
 
 endif()
 

@@ -127,8 +127,9 @@ static std::string TraceCommon()
 		// Wetness in w, the flashlight (see
 		// flashlightAt), which way the sky zone faces (TraceCommand's
 		// SkyAxes), photo mode's lens (PhotoLens), the relief's depth in x
-		// (BumpMapping), then each instance's last placement as three rows.
-		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 skyAxes[3]; vec4 photoLens; vec4 surfaceRelief; vec4 previousRows[]; };
+		// (BumpMapping), where the middle of the view is (viewShift), then
+		// each instance's last placement as three rows.
+		layout(binding = 16, std430) readonly buffer Motion { vec4 previousCamera[4]; vec4 frameJitter; vec4 flashlight[3]; vec4 skyAxes[3]; vec4 photoLens; vec4 surfaceRelief; vec4 frustumShift; vec4 previousRows[]; };
 		// Each fog light's shadow cube, written by the pass before the trace
 		// (Shaders::FogShadows) and read by volumetricFog.
 		layout(binding = 26, std430) buffer FogShadows { float fogShadow[]; };
@@ -159,6 +160,9 @@ static std::string TraceCommon()
 			uint Disable;         // diagnostic switches: 2097152 every light in a cell weighed, 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
+	)";
+
+	source += R"(
 
 		#define GlossBounces ((Counts.z >> 8u) & 255u)
 		// How much a glowing surface gives what it lights: GlowLighting.
@@ -168,6 +172,11 @@ static std::string TraceCommon()
 		// Where the tone curve levels off: 1, or an HDR display's peak over
 		// the SDR picture's white (toneMap).
 		#define ToneCeiling surfaceRelief.y
+		// Where the middle of this view is, off the axis CameraForward points
+		// along, in the view's half widths and heights: 0 but for a headset's
+		// eye, whose view reaches further to one side than the other. xy this
+		// frame's, zw last frame's. A view in a window of the HUD's has none.
+		#define viewShift ((Disable & 32768u) != 0u ? vec4(0.0) : frustumShift)
 		#define LightRadius float((Counts.z >> 16u) & 255u)
 		#define MipBias (float(int(Counts.z) >> 24) / 16.0)
 		// Whether the level's surfaces take their lights as the engine's
@@ -1966,9 +1975,9 @@ static std::string TraceCommon()
 			if (nowZ <= 0.0 || thenZ <= 0.0)
 				return vec2(0.0);
 			vec2 nowUv = vec2(dot(now, CameraRight.xyz) / dot(CameraRight.xyz, CameraRight.xyz),
-				dot(now, CameraUp.xyz) / dot(CameraUp.xyz, CameraUp.xyz)) / nowZ;
+				dot(now, CameraUp.xyz) / dot(CameraUp.xyz, CameraUp.xyz)) / nowZ - viewShift.xy;
 			vec2 thenUv = vec2(dot(then, previousCamera[1].xyz) / dot(previousCamera[1].xyz, previousCamera[1].xyz),
-				dot(then, previousCamera[2].xyz) / dot(previousCamera[2].xyz, previousCamera[2].xyz)) / thenZ;
+				dot(then, previousCamera[2].xyz) / dot(previousCamera[2].xyz, previousCamera[2].xyz)) / thenZ - viewShift.zw;
 			return (thenUv - nowUv) * 0.5;
 		}
 
@@ -2311,7 +2320,7 @@ std::string Shaders::Trace()
 			vec2 uv = (vec2(pixel) + jitter) / vec2(size) * 2.0 - 1.0;
 
 			vec3 origin = CameraOrigin.xyz;
-			vec3 direction = normalize(CameraForward.xyz + CameraRight.xyz * uv.x + CameraUp.xyz * uv.y);
+			vec3 direction = normalize(CameraForward.xyz + CameraRight.xyz * (uv.x + viewShift.x) + CameraUp.xyz * (uv.y + viewShift.y));
 			vec3 viewDirection = direction;
 
 			// Photo mode's depth of field: a thin lens, each sample's ray from
@@ -3624,6 +3633,37 @@ std::string Shaders::TileFragment()
 	)";
 }
 
+// A modulated tile drawn into the HUD's image for the headset, whose world
+// is put under the HUD by the headset's compositor rather than drawn first.
+// The image holds colour premultiplied by how much it covers, and the
+// compositor shows colour + (1 - alpha) * world. Modulating by m (2x the
+// tile, as on the screen) takes both to m times themselves: the colour
+// blended by the tile's own colour, the coverage as 1 - m + m * alpha, which
+// with the tile's alpha 1 - m and the blend "over" is what alpha comes to.
+// Only darkening can be carried that way: m is held to 1, which a modulated
+// tile's neutral grey is.
+std::string Shaders::TileFragmentModulatedHud()
+{
+	return R"(
+		#version 460
+
+		layout(binding = 0) uniform sampler2D texSampler;
+
+		layout(location = 0) in vec2 vTexCoord;
+		layout(location = 1) in vec4 vColor;
+		layout(location = 0) out vec4 outColor;
+
+		void main()
+		{
+			vec4 tile = texture(texSampler, vTexCoord) * vColor;
+			if (tile.a < 0.01)
+				discard;
+			vec3 m = min(2.0 * tile.rgb, vec3(1.0));
+			outColor = vec4(m, 1.0 - (m.r + m.g + m.b) / 3.0);
+		}
+	)";
+}
+
 std::string Shaders::Brightness()
 {
 	return R"(
@@ -3748,6 +3788,52 @@ std::string Shaders::Encode()
 			else
 				result = pow(clamp(toSdr(linear, max(Params.z, 1.0)), 0.0, 1.0), vec3(1.0 / 2.2));
 			imageStore(encoded, pixel, vec4(result, 1.0));
+		}
+	)";
+}
+
+// What the headset is given: the eyes' pictures and the HUD, both gamma
+// encoded as the screen takes them, in linear light for the headset's
+// swap chains, which encode them again as their format asks. The Brightness
+// the device puts over the screen's picture goes on here, before.
+//
+// The HUD is premultiplied: colour already multiplied by how much of what is
+// behind it it covers. Its gamma comes off the colour as it would be alone,
+// then the coverage goes back on. What is added over and above that - the
+// translucent tiles, which cover nothing - comes off on its own.
+std::string Shaders::HeadsetEncode()
+{
+	return R"(
+		#version 460
+
+		layout(local_size_x = 8, local_size_y = 8) in;
+		layout(binding = 0, rgba16f) uniform readonly image2D picture;
+		layout(binding = 1, rgba16f) uniform writeonly image2D linear;
+		layout(push_constant) uniform HeadsetConstants
+		{
+			vec4 Params;    // x the Brightness's exponent, y 1 for the HUD
+			ivec4 Size;     // xy the size to write
+		};
+
+		void main()
+		{
+			ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+			if (pixel.x >= Size.x || pixel.y >= Size.y)
+				return;
+			vec4 c = max(imageLoad(picture, pixel), vec4(0.0));
+			float g = Params.x * 2.2;
+			if (Params.y < 0.5)
+			{
+				imageStore(linear, pixel, vec4(pow(c.rgb, vec3(g)), 1.0));
+				return;
+			}
+			float a = min(c.a, 1.0);
+			vec3 covered = min(c.rgb, vec3(a));
+			vec3 added = c.rgb - covered;
+			vec3 result = pow(added, vec3(g));
+			if (a > 1.0e-4)
+				result += a * pow(covered / a, vec3(g));
+			imageStore(linear, pixel, vec4(result, a));
 		}
 	)";
 }

@@ -50,6 +50,10 @@ public:
 
 	VulkanDeviceBuilder& RequireExtension(const std::string& extensionName);
 	VulkanDeviceBuilder& OptionalExtension(const std::string& extensionName);
+	// Handed to vkCreateDevice as it is, without asking whether the device
+	// offers it: a layer's placeholder, which the layer replaces with real
+	// extensions - Proton's VK_WINE_openxr_device_extensions.
+	VulkanDeviceBuilder& PassThroughExtension(const std::string& extensionName);
 	VulkanDeviceBuilder& OptionalRayQuery();
 	VulkanDeviceBuilder& OptionalDescriptorIndexing();
 	VulkanDeviceBuilder& Surface(std::shared_ptr<VulkanSurface> surface);
@@ -61,6 +65,7 @@ public:
 private:
 	std::set<std::string> requiredDeviceExtensions;
 	std::set<std::string> optionalDeviceExtensions;
+	std::set<std::string> passThroughDeviceExtensions;
 	std::shared_ptr<VulkanSurface> surface;
 	int deviceIndex = 0;
 };

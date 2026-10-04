@@ -13,7 +13,7 @@
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
 //                            [--decal] [--decal-lift units]
 //                            [--bump percent] [--lights n] [--every-light]
-//                            [--hdr ceiling] [--neutral] [--sprites n]
+//                            [--hdr ceiling] [--neutral] [--sprites n] [--headset] [--headset-real]
 //   (helper beside it)
 //
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
@@ -36,6 +36,17 @@
 // a texture that fades to black at its edges, each overlapping the next.
 // Their edges should never show, however many overlap: the picture behind
 // them should come out as it does without them, with the smoke added.
+//
+// --headset traces for the helper's simulated headset instead of the screen:
+// two eyes 64 mm apart, each seeing further out than in, the head turning
+// slowly one way and back. The picture written is the two eyes side by side,
+// which the helper sends back in the headset's place, each a little to its
+// own side of the other, the box nearer the middle in each than the wall.
+// A HUD goes the other way every frame, as the device draws one - a
+// crosshair and a translucent bar - which the helper puts on the simulated
+// headset's panel. --headset-real does the same with the OpenXR runtime's
+// headset rather than a simulated one; with 0 frames it only says what the
+// helper found.
 //
 // --still holds everything still instead - no animation, nothing arriving, no
 // change of size - and reports how much the picture changes from one frame
@@ -219,6 +230,7 @@ int main(int argc, char** argv)
 	float toneCeiling = 1.0f;
 	bool neutral = false;
 	int sprites = 0;
+	bool headset = false, realHeadset = false;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "--dlss") && i + 1 < argc)
@@ -275,6 +287,10 @@ int main(int argc, char** argv)
 			neutral = true;
 		else if (!strcmp(argv[i], "--sprites") && i + 1 < argc)
 			sprites = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--headset"))
+			headset = true;
+		else if (!strcmp(argv[i], "--headset-real"))
+			headset = realHeadset = true;
 		else if (!strcmp(argv[i], "--photo") && i + 1 < argc)
 		{
 			photoAperture = (float)atof(argv[++i]);
@@ -322,7 +338,7 @@ int main(int argc, char** argv)
 #ifdef PATHTRACER_LOCAL
 		if (!client.StartLocal(device.get()))
 #else
-		if (!client.Start(device.get(), dir + "\\PathTracerHelper.exe", dir, false))
+		if (!client.Start(device.get(), dir + "\\PathTracerHelper.exe", dir, false, realHeadset ? 1 : headset ? 2 : 0))
 #endif
 		{
 			printf("FAIL %s\n", client.Error().c_str());
@@ -330,6 +346,8 @@ int main(int argc, char** argv)
 		}
 		printf("helper: %s, ray tracing %s, textures %s\n", client.Status().DeviceName,
 			client.Status().RayTracing ? "yes" : "no", client.Status().CanSampleTextures ? "yes" : "no");
+		if (headset)
+			printf("headset: state %u, %s\n", client.Status().Headset, client.Status().HeadsetStatus);
 
 		// The scene: a checkered glossy floor, a red box, a grey wall.
 		SceneGeometry world;
@@ -765,6 +783,26 @@ int main(int argc, char** argv)
 		frame.ViewMode = view;
 		frame.BumpMapping = bump / 100.0f;
 		frame.Timing = 1;
+		if (headset)
+		{
+			frame.Headset = 1;
+			frame.UnitsPerMetre = 52.5f;
+			frame.HeadsetResolution = 1.0f;
+			frame.HudDistance = 1.5f;
+			frame.HeadsetGamma = 1.0f;
+			// Three layers, one above the other: the HUD's, which follows the
+			// head, the crosshair's, which follows the aim, and the coronas',
+			// each the whole picture and 60 degrees across, as the device's
+			// default.
+			frame.HudWidth = width;
+			frame.HudHeight = height * 3;
+			frame.HudLayers = 3;
+			frame.HudRect[2] = width;
+			frame.HudRect[3] = height;
+			frame.HudTangents[0] = std::tan(30.0f * 3.14159265f / 180.0f);
+			frame.HudTangents[1] = frame.HudTangents[0] * height / width;
+			frame.HudHead[3] = 1.0f;
+		}
 		frame.Exposure = 0.2f + 128 * (2.0f / 255.0f);
 		frame.SkyIntensity = dark ? 0.0f : 128 * (2.0f / 255.0f);
 		frame.Camera[0] = vec4(eye.x, eye.y, eye.z, 1.0f);     // w: the flash's scale, neutral
@@ -815,6 +853,39 @@ int main(int argc, char** argv)
 		const size_t bytes = (size_t)(width * 3 / 2) * (height * 3 / 2) * 8;
 		auto readback = BufferBuilder().Size(bytes).Usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU).Create(device.get());
 
+		// --headset's HUD, as the device would draw it, premultiplied, in
+		// half floats: a bar along the bottom of the HUD's layer, black at
+		// half coverage, a white crosshair in the middle of the aim's layer
+		// below it, and an orange corona up and to the right in the
+		// coronas' layer below that.
+		std::unique_ptr<VulkanBuffer> hudPixels;
+		uint32_t hudGeneration = 0;
+		if (headset)
+		{
+			const size_t hudBytes = (size_t)width * height * 3 * 8;
+			hudPixels = BufferBuilder().Size(hudBytes).Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY).Create(device.get());
+			uint16_t* texels = (uint16_t*)hudPixels->Map(0, hudBytes);
+			const uint16_t one = 0x3c00, half = 0x3800, zero = 0;
+			for (uint32_t row = 0; row < height * 3; row++)
+				for (uint32_t x = 0; x < width; x++)
+				{
+					uint16_t* t = texels + ((size_t)row * width + x) * 4;
+					const uint32_t layer = row / height;
+					const uint32_t y = row - layer * height;
+					const bool aim = layer == 1;
+					const bool cross = aim && ((std::abs((int)x - (int)width / 2) < 2 && std::abs((int)y - (int)height / 2) < 12) ||
+						(std::abs((int)y - (int)height / 2) < 2 && std::abs((int)x - (int)width / 2) < 12));
+					const bool bar = layer == 0 && y > height - height / 10;
+					const int cx = (int)x - (int)(width * 3 / 4), cy = (int)y - (int)(height / 4);
+					const bool corona = layer == 2 && cx * cx + cy * cy < 100;
+					t[0] = cross || corona ? one : zero;
+					t[1] = cross ? one : corona ? half : zero;
+					t[2] = cross ? one : zero;
+					t[3] = cross || corona ? one : bar ? half : zero;
+				}
+			hudPixels->Unmap();
+		}
+
 		int arrived = 0;
 		double sendMs = 0.0, helperWait = 0.0, helperApply = 0.0, helperRecord = 0.0;
 		uint32_t stalls = 0;
@@ -848,6 +919,9 @@ int main(int argc, char** argv)
 			frame.AccumulatedFrames = (uint32_t)i;
 			frame.Insets[0].AccumulatedFrames = (uint32_t)i;
 			frame.RestartDenoiser = i == 0;
+			// The HUD drawn last frame, into the image as it then was.
+			frame.HudDrawn = headset && hudGeneration != 0 && hudGeneration == client.HudGeneration() ? 1 : 0;
+			frame.HudDrawnGeneration = hudGeneration;
 			LARGE_INTEGER a, b, f;
 			QueryPerformanceCounter(&a);
 			const bool traced = client.Trace(frame);
@@ -880,28 +954,65 @@ int main(int argc, char** argv)
 			// Taken over from the helper exactly as the render device takes it.
 			auto commands = pool->createBuffer();
 			commands->begin();
-			VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-			barrier.image = client.Output();
-			barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-			barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-			// Traced here, on this queue, it has no hands to change.
-			const bool handOver = !client.IsLocal();
-			barrier.srcQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
-			barrier.dstQueueFamilyIndex = handOver ? (uint32_t)device->GraphicsFamily : VK_QUEUE_FAMILY_IGNORED;
-			barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-			VkBufferImageCopy region = {};
-			region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-			region.imageExtent = { client.OutputWidth(), client.OutputHeight(), 1 };
-			vkCmdCopyImageToBuffer(commands->buffer, client.Output(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &region);
-			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-			barrier.srcQueueFamilyIndex = handOver ? (uint32_t)device->GraphicsFamily : VK_QUEUE_FAMILY_IGNORED;
-			barrier.dstQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
-			barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			barrier.dstAccessMask = 0;
-			vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			// The HUD, drawn as the device draws it for the headset: into the
+			// helper's image, which a new generation of has never been
+			// anywhere and otherwise comes back from the helper, and handed
+			// back to it.
+			if (headset && client.Hud())
+			{
+				const bool fresh = client.HudGeneration() != hudGeneration;
+				VkImageMemoryBarrier hud = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+				hud.image = client.Hud();
+				hud.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+				hud.oldLayout = fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+				hud.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				hud.srcQueueFamilyIndex = fresh ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_EXTERNAL;
+				hud.dstQueueFamilyIndex = fresh ? VK_QUEUE_FAMILY_IGNORED : (uint32_t)device->GraphicsFamily;
+				hud.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &hud);
+				VkBufferImageCopy region = {};
+				region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+				region.imageExtent = { std::min(width, client.HudWidth()), std::min(height * 3, client.HudHeight()), 1 };
+				region.bufferRowLength = width;
+				vkCmdCopyBufferToImage(commands->buffer, hudPixels->buffer, client.Hud(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+				hud.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				hud.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+				hud.srcQueueFamilyIndex = (uint32_t)device->GraphicsFamily;
+				hud.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+				hud.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				hud.dstAccessMask = 0;
+				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &hud);
+				hudGeneration = client.HudGeneration();
+			}
+
+			// A frame handed over with nothing new in the picture - the
+			// headset's, with nothing to trace - leaves it as it was.
+			if (client.OutputFresh())
+			{
+				VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+				barrier.image = client.Output();
+				barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+				barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+				barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+				// Traced here, on this queue, it has no hands to change.
+				const bool handOver = !client.IsLocal();
+				barrier.srcQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+				barrier.dstQueueFamilyIndex = handOver ? (uint32_t)device->GraphicsFamily : VK_QUEUE_FAMILY_IGNORED;
+				barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+				VkBufferImageCopy region = {};
+				region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+				region.imageExtent = { client.OutputWidth(), client.OutputHeight(), 1 };
+				vkCmdCopyImageToBuffer(commands->buffer, client.Output(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &region);
+				barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+				barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+				barrier.srcQueueFamilyIndex = handOver ? (uint32_t)device->GraphicsFamily : VK_QUEUE_FAMILY_IGNORED;
+				barrier.dstQueueFamilyIndex = handOver ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+				barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+				barrier.dstAccessMask = 0;
+				vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			}
 			commands->end();
 
 			VkSemaphore ready = client.Ready(), released = client.Released();

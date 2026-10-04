@@ -21,9 +21,16 @@ namespace Shaders
 	// without them the game renders but cannot be used.
 	std::string TileVertex();
 	std::string TileFragment();
+	// The modulated tiles as the HUD's own image for a headset takes them,
+	// which has no picture under it to darken: see CreateTilePipeline.
+	std::string TileFragmentModulatedHud();
 
 	// The game's Brightness setting, applied over the finished picture - the
 	// 2D and all - as a gamma curve.
 	std::string Brightness();
 	std::string Encode();
+
+	// The eyes' pictures and the HUD as a headset takes them: in linear
+	// light, with the Brightness on. See HeadsetOutput.
+	std::string HeadsetEncode();
 }
