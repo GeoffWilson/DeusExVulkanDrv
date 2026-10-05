@@ -1117,7 +1117,7 @@ static std::string TraceCommon()
 			return 2.0 * mix(top, bottom, p.f.y) / 255.0;
 		}
 
-		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir, uint lightmapSurface, bool masked,
+		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir, uint lightmapSurface, vec3 lightmapPosition, bool masked,
 			out vec3 value, out vec3 base, out vec3 dir, out float distance, out bool behind)
 		{
 			value = vec3(0.0);
@@ -1278,7 +1278,7 @@ static std::string TraceCommon()
 				float x = reach / radius;
 				float mask = 1.0;
 				if (light.Flags.y > 1.5)
-					mask = masked ? bakedScale(lightmapPoint(lightmapSurface, position), uint(light.Flags.y * 0.5)) : 2.0;
+					mask = masked ? bakedScale(lightmapPoint(lightmapSurface, lightmapPosition), uint(light.Flags.y * 0.5)) : 2.0;
 				float lit = shade * (1.0 - x * x * (3.0 - 2.0 * x)) * mask;
 				base = pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) * lit;
 				value = min(base * response, vec3(1.0));
@@ -1361,8 +1361,11 @@ static std::string TraceCommon()
 		// was worth. shownAmbient is the zone's ambient on a level surface as
 		// displayed, which with the engine's lighting goes into the sum with
 		// the lights, and what it then gives is left in lightmapAmbient.
+		// lightmapPosition is the point where its surface's lightmap is laid
+		// out: the world for the level, and a mover's own brush for one of
+		// its faces, whose lightmap moves with it.
 		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, vec3 shownAmbient, uint strongest, uint surface,
-			out vec3 lightDirection, out vec3 lightBase)
+			vec3 lightmapPosition, out vec3 lightDirection, out vec3 lightBase)
 		{
 			lightDirection = normal;
 			lightBase = vec3(0.0);
@@ -1520,7 +1523,7 @@ static std::string TraceCommon()
 				vec3 value, base, dir;
 				float distance;
 				bool behind;
-				bool lit = lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, masked, value, base, dir, distance, behind);
+				bool lit = lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, lightmapPosition, masked, value, base, dir, distance, behind);
 
 				if (phase == 0u)
 				{
@@ -2810,7 +2813,8 @@ std::string Shaders::Trace()
 								vec3 surroundings = linearAmbient(attr, rayQueryGetIntersectionInstanceIdEXT(rq, true));
 								vec3 unusedDirection, unusedBase;
 								contribution = attr.Albedo.rgb * directLight(position, normal, mod(attr.Ambient.w, 2.0) > 0.5, true, -1.0, direction,
-									pow(surroundings, vec3(1.0 / 2.2)), 0u, uint(attr.Emission.z + 0.5), unusedDirection, unusedBase);
+									pow(surroundings, vec3(1.0 / 2.2)), 0u, uint(attr.Emission.z + 0.5),
+									rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(position, 1.0), unusedDirection, unusedBase);
 								contribution += attr.Albedo.rgb * (EngineLighting ? lightmapAmbient : surroundings);
 								// The flashlight on it too, with no shadow ray,
 								// as for the lights.
@@ -3065,7 +3069,8 @@ std::string Shaders::Trace()
 					}
 					vec3 ambient = linearAmbient(attr, hitInstance);
 					vec3 lit = directLight(lifted, normal, mod(attr.Ambient.w, 2.0) > 0.5, false, meshGlow, direction,
-						pow(ambient, vec3(1.0 / 2.2)), firstSurface ? 4u : 1u, uint(attr.Emission.z + 0.5), lightDirection, lightBase);
+						pow(ambient, vec3(1.0 / 2.2)), firstSurface ? 4u : 1u, uint(attr.Emission.z + 0.5),
+						rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(lifted, 1.0), lightDirection, lightBase);
 					if (meshGlow >= 0.0)
 						lit = meshLight(lit, instanceAmbient[hitInstance].rgb);
 					// The flashlight, on meshes and flat surfaces alike by the

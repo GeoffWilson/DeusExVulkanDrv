@@ -329,7 +329,8 @@ private:
 	FString DescribeHeadset() const;
 	void CreateBrightnessPipeline();
 	void DescribeLightingOf(AActor* target);
-	void DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar);
+	void DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar,
+		UModel* lightmapModel = nullptr, const FVector* lightmapPoint = nullptr);
 	void ApplyBrightness(VulkanCommandBuffer* commands);
 	void CreateEncodePipeline();
 	void EnsureEncodeImages();

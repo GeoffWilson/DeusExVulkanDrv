@@ -720,8 +720,13 @@ void UPathTracerRenderDevice::DescribeLightingOf(AActor* target)
 // own geometry is in the way, and what the trace takes from it: the
 // engine's own figure with its lighting, linear light with the linear.
 // Written to the log, strongest first.
-void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar)
+// lightmapModel and lightmapPoint, for a mover's face: the brush whose
+// lightmap iSurf is on, and the point on it in the brush's own space.
+void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& point, const FVector& normal, UTexture* texture, bool specialLit, INT iSurf, FOutputDevice& Ar,
+	UModel* lightmapModel, const FVector* lightmapPoint)
 {
+	UModel* masks = lightmapModel ? lightmapModel : level->Model;
+	const FVector& maskPoint = lightmapPoint ? *lightmapPoint : point;
 	struct Entry { AActor* Light; float Engine[3]; float Traced[3]; float Distance, Radius, Cosine, Mask; bool Clear, Baked; };
 	std::vector<Entry> entries;
 	const FVector from = point + normal * 2.0f;
@@ -729,6 +734,8 @@ void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& p
 	std::unordered_set<AActor*> baked;
 	for (INT i = 0; level->Model && i < level->Model->Lights.Num(); i++)
 		baked.insert(level->Model->Lights(i));
+	for (INT i = 0; lightmapModel && i < lightmapModel->Lights.Num(); i++)
+		baked.insert(lightmapModel->Lights(i));
 	for (INT i = 0; i < level->Actors.Num(); i++)
 	{
 		AActor* light = level->Actors(i);
@@ -763,7 +770,7 @@ void UPathTracerRenderDevice::DescribeLightingAt(ULevel* level, const FVector& p
 		// A baked light's shadow mask on this surface, which the trace holds
 		// it to as well unless PT BAKEDSHADOWS has it left out; -1 where the
 		// surface has no lightmap.
-		const float bakedMask = baked.count(light) ? LevelScene::BakedMaskAt(level->Model, iSurf, light, point) : -1.0f;
+		const float bakedMask = baked.count(light) ? LevelScene::BakedMaskAt(masks, iSurf, light, maskPoint) : -1.0f;
 		const float mask = baked.count(light) ? 2.0f * (bakedMask >= 0.0f ? bakedMask : 1.0f) : 1.0f;
 		const float tracedMask = (baked.count(light) && bakedMask >= 0.0f && (DisableBits & 16384u)) ? 2.0f : mask;
 		const FPlane c = FGetHSV(light->LightHue, light->LightSaturation, 255);
@@ -3418,6 +3425,85 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			{
 				DescribeActor(hit.Actor, hit.Actor->Mesh);
 				DescribeLightingOf(hit.Actor);
+				// A mover's face has no lightmap in the trace, so it takes
+				// every baked light in reach, held back only by the trace's
+				// own shadows: the lights at the point aimed at, and which the
+				// level's geometry blocks. And whether the engine baked the
+				// brush lightmaps of its own.
+				if (hit.Actor->DrawType == DT_Brush && hit.Actor->Brush)
+				{
+					UModel* brush = hit.Actor->Brush;
+					// The face aimed at, in the brush's own space: the surface
+					// whose plane the point lies on, facing the same way.
+					const FCoords toLocal = hit.Actor->ToLocal();
+					const FVector local = hit.Location.TransformPointBy(toLocal);
+					const FVector localNormal = hit.Normal.TransformVectorBy(toLocal).SafeNormal();
+					INT iSurf = INDEX_NONE;
+					float nearest = 4.0f;
+					for (INT s = 0; s < brush->Surfs.Num(); s++)
+					{
+						const FBspSurf& surf = brush->Surfs(s);
+						if (surf.vNormal < 0 || surf.vNormal >= brush->Vectors.Num() || surf.pBase < 0 || surf.pBase >= brush->Points.Num())
+							continue;
+						const FVector& n = brush->Vectors(surf.vNormal);
+						const float off = Abs((local - brush->Points(surf.pBase)) | n);
+						if ((n | localNormal) > 0.9f && off < nearest)
+						{
+							nearest = off;
+							iSurf = s;
+						}
+					}
+					debugf(TEXT("PT: %s's brush: %d surfaces, %d lightmaps, %d baked lights; aimed at its surface %d, %s"), hit.Actor->GetName(),
+						brush->Surfs.Num(), brush->LightMap.Num(), brush->Lights.Num(), iSurf,
+						(iSurf != INDEX_NONE && brush->Surfs(iSurf).Texture) ? brush->Surfs(iSurf).Texture->GetName() : TEXT("none"));
+					// Each surface's lightmap as the brush holds it, for finding
+					// out why one is not taken.
+					debugf(TEXT("  brush arrays: %d points, %d vectors, %d nodes, %d verts, %d light bits, %d polys"),
+						brush->Points.Num(), brush->Vectors.Num(), brush->Nodes.Num(), brush->Verts.Num(), brush->LightBits.Num(),
+						brush->Polys ? brush->Polys->Element.Num() : -1);
+					for (INT s = 0; s < brush->Surfs.Num(); s++)
+					{
+						const FBspSurf& surf = brush->Surfs(s);
+						const FLightMapIndex* index = (surf.iLightMap != INDEX_NONE && surf.iLightMap >= 0 && surf.iLightMap < brush->LightMap.Num()) ? &brush->LightMap(surf.iLightMap) : nullptr;
+						debugf(TEXT("  surface %d %s flags 0x%x: pBase %d vNormal %d vTextureU %d vTextureV %d iLightMap %d%s"), s,
+							surf.Texture ? surf.Texture->GetName() : TEXT("none"), (DWORD)surf.PolyFlags, surf.pBase, surf.vNormal, surf.vTextureU, surf.vTextureV, surf.iLightMap,
+							index ? *FString::Printf(TEXT(": %dx%d, data %d, lights from %d, scale %.2f %.2f, pan %.1f %.1f %.1f"),
+								index->UClamp, index->VClamp, index->DataOffset, index->iLightActors, index->UScale, index->VScale,
+								index->Pan.X, index->Pan.Y, index->Pan.Z) : TEXT(""));
+					}
+					// Where each surface's corners land on the lightmap taken
+					// for it, reading the brush's own space and the world: the
+					// right one spans the lightmap's texels.
+					const FCoords toWorld = hit.Actor->ToWorld();
+					for (INT s = 0; s < brush->Surfs.Num(); s++)
+					{
+						FLightMapIndex* index = LevelScene::LightMapIndexOf(brush, s);
+						if (!index)
+							continue;
+						float range[2][4] = { { 1e9f, -1e9f, 1e9f, -1e9f }, { 1e9f, -1e9f, 1e9f, -1e9f } };
+						for (INT p = 0; brush->Polys && p < brush->Polys->Element.Num(); p++)
+						{
+							const FPoly& poly = brush->Polys->Element(p);
+							if (LevelScene::SurfaceOfPoly(brush, poly) != s)
+								continue;
+							for (INT k = 0; k < poly.NumVertices; k++)
+								for (int space = 0; space < 2; space++)
+								{
+									float x, y;
+									if (!LevelScene::LightmapCoords(brush, s, space ? poly.Vertex[k].TransformPointBy(toWorld) : poly.Vertex[k], x, y))
+										continue;
+									range[space][0] = Min(range[space][0], x); range[space][1] = Max(range[space][1], x);
+									range[space][2] = Min(range[space][2], y); range[space][3] = Max(range[space][3], y);
+								}
+						}
+						debugf(TEXT("  surface %d's lightmap %dx%d, lights from %d, data %d: corners in the brush's space %.1f..%.1f, %.1f..%.1f; in the world %.1f..%.1f, %.1f..%.1f"),
+							s, index->UClamp, index->VClamp, index->iLightActors, index->DataOffset,
+							range[0][0], range[0][1], range[0][2], range[0][3], range[1][0], range[1][1], range[1][2], range[1][3]);
+					}
+					DescribeLightingAt(player->XLevel, hit.Location, hit.Normal,
+						iSurf != INDEX_NONE ? brush->Surfs(iSurf).Texture : nullptr,
+						iSurf != INDEX_NONE && (brush->Surfs(iSurf).PolyFlags & PF_SpecialLit) != 0, iSurf, Ar, brush, &local);
+				}
 			}
 			// The level's own surface: its texture and what it counts as being
 			// made of, which is the name to use for an override in the ini.

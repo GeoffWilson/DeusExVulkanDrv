@@ -38,6 +38,13 @@ public:
 	// the light is clear all round, 0 where the surface's lightmap does not
 	// have the light at all. -1 when the surface has no lightmap. For PT LOOK.
 	static float BakedMaskAt(UModel* model, INT iSurf, AActor* light, const FVector& point);
+	// A surface's lightmap. A mover's brush keeps one for each of its
+	// surfaces, in order, without the surfaces naming theirs.
+	static FLightMapIndex* LightMapIndexOf(UModel* model, INT iSurf);
+	// Where a point lands on a surface's lightmap, in texels.
+	static bool LightmapCoords(UModel* model, INT iSurf, const FVector& point, float& x, float& y);
+	// Which of a brush's surfaces a polygon of it is, or INDEX_NONE.
+	static INT SurfaceOfPoly(UModel* brush, const FPoly& poly);
 
 	// Called as a window of the HUD's draws its view: see the definition.
 	void HideFromWindows();
@@ -191,6 +198,8 @@ private:
 		}
 	};
 	int MirroredSurfaces = 0;
+	// Movers whose brush is scaled or mirrored, each named in the log once.
+	std::unordered_set<AActor*> ScaledBrushesLogged;
 	// The lights the level's build baked into its lightmaps, with a shadow
 	// mask on each surface they reach, which the engine counts at twice the
 	// brightness of a light without one. Numbered from 1, as the shader
@@ -201,7 +210,8 @@ private:
 	// Each lightmapped surface of the level's, by its index, as its record's
 	// number plus one; and the records, light lists and masks as they are
 	// gathered, put together into Lightmaps once the level is built.
-	std::unordered_map<INT, uint32_t> LightmapRecords;
+	// Keyed by model and surface: the level's, and each mover's brush's own.
+	std::unordered_map<uint64_t, uint32_t> LightmapRecords;
 	UModel* LightmappedModel = nullptr;
 	std::vector<uint32_t> LightmapRecordWords;
 	std::vector<uint32_t> LightmapLightWords;

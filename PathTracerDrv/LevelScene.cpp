@@ -151,6 +151,34 @@ namespace
 		out[2 * 4 + 3] = location.Z + offset.Z;
 	}
 
+	// A brush placed exactly as the engine places it: ABrush::ToWorld, with
+	// its MainScale and PostScale - sheer and all - as well as its rotation
+	// and pre-pivot, taken from where it sends the origin and the three unit
+	// points. A pair of doors is often one door and its mirror image, a
+	// MainScale of -1 across: taken as rotation alone, the mirrored one
+	// swung out on the wrong side of its hinge, into the wall or into the
+	// other door. A mirror keeps the outward faces outward, as the engine's
+	// own does, so the normals the trace turns by this still face out.
+	void BrushTransform(AActor* actor, float out[12])
+	{
+		const FCoords toWorld = actor->ToWorld();
+		const FVector origin = FVector(0.0f, 0.0f, 0.0f).TransformPointBy(toWorld);
+		const FVector axes[3] = {
+			FVector(1.0f, 0.0f, 0.0f).TransformPointBy(toWorld) - origin,
+			FVector(0.0f, 1.0f, 0.0f).TransformPointBy(toWorld) - origin,
+			FVector(0.0f, 0.0f, 1.0f).TransformPointBy(toWorld) - origin,
+		};
+		for (int col = 0; col < 3; col++)
+		{
+			out[0 * 4 + col] = axes[col].X;
+			out[1 * 4 + col] = axes[col].Y;
+			out[2 * 4 + col] = axes[col].Z;
+		}
+		out[0 * 4 + 3] = origin.X;
+		out[1 * 4 + 3] = origin.Y;
+		out[2 * 4 + 3] = origin.Z;
+	}
+
 	void MakeIdentity(float out[12])
 	{
 		for (int i = 0; i < 12; i++)
@@ -191,6 +219,7 @@ void LevelScene::Clear()
 	SourceLevel = nullptr;
 	SourceNodeCount = 0;
 	MirroredSurfaces = 0;
+	ScaledBrushesLogged.clear();
 	BakedLightIds.clear();
 	LightmapRecords.clear();
 	LightmapRecordWords.clear();
@@ -221,16 +250,38 @@ bool LevelScene::BuildStatic(ULevel* level)
 	// are in the slow half.
 	// The lights baked into the lightmaps, numbered, before the surfaces
 	// that list them.
-	for (INT i = 0; i < level->Model->Lights.Num(); i++)
+	// Movers' brushes carry lightmaps of their own, baked where each stood
+	// in the editor, which the engine goes on drawing them with wherever
+	// they move to - their lights numbered with the level's.
+	std::vector<UModel*> moverBrushes;
+	for (INT i = 0; i < level->Actors.Num(); i++)
 	{
-		AActor* light = level->Model->Lights(i);
-		if (light && !BakedLightIds.count(light))
-			BakedLightIds[light] = (uint32_t)BakedLightIds.size() + 1;
+		AActor* actor = level->Actors(i);
+		if (actor && actor->DrawType == DT_Brush && actor->Brush && actor->Brush != level->Model && actor->IsA(AMover::StaticClass()))
+			moverBrushes.push_back(actor->Brush);
 	}
+	auto numberLights = [&](UModel* model)
+	{
+		for (INT i = 0; i < model->Lights.Num(); i++)
+		{
+			AActor* light = model->Lights(i);
+			if (light && !BakedLightIds.count(light))
+				BakedLightIds[light] = (uint32_t)BakedLightIds.size() + 1;
+		}
+	};
+	numberLights(level->Model);
+	for (UModel* brush : moverBrushes)
+		numberLights(brush);
 
 	SceneGeometry all;
 	LightmappedModel = level->Model;
 	AddBspSurfaces(level->Model, all, true);
+	int moverLightmaps = 0;
+	for (UModel* brush : moverBrushes)
+		for (INT s = 0; s < brush->Surfs.Num(); s++)
+			moverLightmaps += AddLightmap(brush, s) != 0 ? 1 : 0;
+	if (!moverBrushes.empty())
+		debugf(TEXT("PathTracer: %d movers, %d of their surfaces with lightmaps"), (int)moverBrushes.size(), moverLightmaps);
 	FinishLightmaps();
 
 	Geometries.emplace_back();
@@ -343,9 +394,20 @@ static void LightmapAxes(UModel* model, const FBspSurf& surf, const FLightMapInd
 	v[0] = tv.X * vs; v[1] = tv.Y * vs; v[2] = tv.Z * vs; v[3] = (-(base | tv) - index.Pan.Y) * vs;
 }
 
+FLightMapIndex* LevelScene::LightMapIndexOf(UModel* model, INT iSurf)
+{
+	if (!model || iSurf < 0 || iSurf >= model->Surfs.Num())
+		return nullptr;
+	if (FLightMapIndex* index = model->GetLightMapIndex(iSurf))
+		return index;
+	if (model->Surfs(iSurf).iLightMap == INDEX_NONE && model->LightMap.Num() == model->Surfs.Num())
+		return &model->LightMap(iSurf);
+	return nullptr;
+}
+
 static bool LightmapUsable(UModel* model, INT iSurf, FLightMapIndex*& index)
 {
-	index = (iSurf >= 0 && iSurf < model->Surfs.Num()) ? model->GetLightMapIndex(iSurf) : nullptr;
+	index = LevelScene::LightMapIndexOf(model, iSurf);
 	if (!index || index->UClamp <= 0 || index->VClamp <= 0 || index->UClamp > 65535 || index->VClamp > 65535 || index->iLightActors < 0)
 		return false;
 	const FBspSurf& surf = model->Surfs(iSurf);
@@ -358,7 +420,8 @@ static bool LightmapUsable(UModel* model, INT iSurf, FLightMapIndex*& index)
 // one's filtered mask. Its number plus one, or 0 for a surface without one.
 uint32_t LevelScene::AddLightmap(UModel* model, INT iSurf)
 {
-	auto found = LightmapRecords.find(iSurf);
+	const uint64_t key = ((uint64_t)(uintptr_t)model << 20) ^ (uint64_t)(uint32_t)iSurf;
+	auto found = LightmapRecords.find(key);
 	if (found != LightmapRecords.end())
 		return found->second;
 	uint32_t record = 0;
@@ -393,7 +456,7 @@ uint32_t LevelScene::AddLightmap(UModel* model, INT iSurf)
 		LightmapRecordWords.push_back((uint32_t)LightmapLightWords.size() - lightStart);
 		record = (uint32_t)(LightmapRecordWords.size() / 12);
 	}
-	LightmapRecords[iSurf] = record;
+	LightmapRecords[key] = record;
 	return record;
 }
 
@@ -422,6 +485,41 @@ void LevelScene::FinishLightmaps()
 	LightmapRecordWords.clear();
 	LightmapLightWords.clear();
 	LightmapMaskBytes.clear();
+}
+
+bool LevelScene::LightmapCoords(UModel* model, INT iSurf, const FVector& point, float& x, float& y)
+{
+	FLightMapIndex* index = nullptr;
+	if (!model || !LightmapUsable(model, iSurf, index))
+		return false;
+	float u[4], v[4];
+	LightmapAxes(model, model->Surfs(iSurf), *index, u, v);
+	x = u[0] * point.X + u[1] * point.Y + u[2] * point.Z + u[3];
+	y = v[0] * point.X + v[1] * point.Y + v[2] * point.Z + v[3];
+	return true;
+}
+
+// A brush's polygon's surface: the one its iLink names where that is the
+// same texture on the same plane, else the first that is. A polygon's
+// iLink can also be another polygon's index, so it is checked.
+INT LevelScene::SurfaceOfPoly(UModel* brush, const FPoly& poly)
+{
+	auto matches = [&](INT s)
+	{
+		if (s < 0 || s >= brush->Surfs.Num())
+			return false;
+		const FBspSurf& surf = brush->Surfs(s);
+		if (surf.Texture != poly.Texture || surf.vNormal < 0 || surf.vNormal >= brush->Vectors.Num() || surf.pBase < 0 || surf.pBase >= brush->Points.Num())
+			return false;
+		const FVector& n = brush->Vectors(surf.vNormal);
+		return (n | poly.Normal) > 0.999f && Abs((poly.Vertex[0] - brush->Points(surf.pBase)) | n) < 1.0f;
+	};
+	if (matches(poly.iLink))
+		return poly.iLink;
+	for (INT s = 0; s < brush->Surfs.Num(); s++)
+		if (matches(s))
+			return s;
+	return INDEX_NONE;
 }
 
 float LevelScene::BakedMaskAt(UModel* model, INT iSurf, AActor* light, const FVector& point)
@@ -1027,6 +1125,17 @@ void LevelScene::AddBrushPolys(UModel* brush, SceneGeometry& out)
 		attr.Normal = vec4(normal.x, normal.y, normal.z, 0.0f);
 		attr.Albedo = vec4(albedo.x, albedo.y, albedo.z, TextureAnimates(poly.Texture) ? 1.0f : 0.0f);
 		attr.Emission = vec4(0.0f, 0.0f, 0.0f, unlit ? 1.0f : 0.0f);
+		// z: its surface's lightmap, made when the level was (Build), for
+		// the engine's shadow masks on it - read where the point lies on the
+		// brush, which moves with it.
+		if (!unlit)
+		{
+			const INT iSurf = SurfaceOfPoly(brush, poly);
+			const uint64_t key = ((uint64_t)(uintptr_t)brush << 20) ^ (uint64_t)(uint32_t)iSurf;
+			auto record = iSurf != INDEX_NONE ? LightmapRecords.find(key) : LightmapRecords.end();
+			if (record != LightmapRecords.end())
+				attr.Emission.z = (float)record->second;
+		}
 		// A mover is instanced into whatever room it stands in, so its ambient
 		// comes from the instance. w: special lit, as for the level's surfaces.
 		attr.Ambient = vec4(0.0f, 0.0f, 0.0f, (poly.PolyFlags & PF_SpecialLit) ? 1.0f : 0.0f);
@@ -2448,6 +2557,18 @@ void LevelScene::PlaceActor(AActor* actor, uint32_t mask, bool iterated, PlaceCo
 	const FVector prePivot = isBrush ? -actor->PrePivot : actor->PrePivot;
 	if (isSprite)
 		memcpy(instance.Transform, spriteTransform, sizeof(instance.Transform));
+	else if (isBrush)
+	{
+		BrushTransform(actor, instance.Transform);
+		ABrush* brush = (ABrush*)actor;
+		const bool scaled = brush->MainScale.Scale != FVector(1.0f, 1.0f, 1.0f) || brush->PostScale.Scale != FVector(1.0f, 1.0f, 1.0f) ||
+			brush->MainScale.SheerRate != 0.0f || brush->PostScale.SheerRate != 0.0f;
+		if (scaled && ScaledBrushesLogged.insert(actor).second)
+			debugf(TEXT("PathTracer: mover %s scaled by %.2f %.2f %.2f then %.2f %.2f %.2f%s"), actor->GetName(),
+				brush->MainScale.Scale.X, brush->MainScale.Scale.Y, brush->MainScale.Scale.Z,
+				brush->PostScale.Scale.X, brush->PostScale.Scale.Y, brush->PostScale.Scale.Z,
+				brush->MainScale.SheerRate != 0.0f || brush->PostScale.SheerRate != 0.0f ? TEXT(", sheered") : TEXT(""));
+	}
 	else
 		MakeTransform(actor->Location, actor->Rotation, scale, prePivot, instance.Transform);
 	// A sprite is lit by nothing, so its instance carries its glow where
