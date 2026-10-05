@@ -213,6 +213,9 @@ private:
 	// Keyed by model and surface: the level's, and each mover's brush's own.
 	std::unordered_map<uint64_t, uint32_t> LightmapRecords;
 	UModel* LightmappedModel = nullptr;
+	// The zone the engine takes for a node whose zone has no ZoneInfo: the
+	// level's LevelInfo (ULevel::GetZoneActor), with its own ambient.
+	AZoneInfo* LevelZone = nullptr;
 	std::vector<uint32_t> LightmapRecordWords;
 	std::vector<uint32_t> LightmapLightWords;
 	std::vector<uint8_t> LightmapMaskBytes;

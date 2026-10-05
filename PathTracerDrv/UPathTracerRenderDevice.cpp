@@ -3554,15 +3554,21 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 				}
 				// Its zone's ambient: FGetHSV at the zone's brightness, of
 				// which a lightmap starts at half.
-				AZoneInfo* zone = node.iZone[1] < FBspNode::MAX_ZONES ? model->Zones[node.iZone[1]].ZoneActor : nullptr;
+				AZoneInfo* zone = node.iZone[1] < FBspNode::MAX_ZONES ? player->XLevel->GetZoneActor(node.iZone[1]) : nullptr;
 				if (zone && zone->AmbientBrightness)
 				{
 					const FPlane a = FGetHSV(zone->AmbientHue, zone->AmbientSaturation, zone->AmbientBrightness);
 					Ar.Logf(TEXT("PT: zone %s ambient brightness %d hue %d saturation %d: %.3f %.3f %.3f on a mesh, half that on a lightmap"),
 						zone->GetName(), (int)zone->AmbientBrightness, (int)zone->AmbientHue, (int)zone->AmbientSaturation, a.X, a.Y, a.Z);
+					debugf(TEXT("PT: zone %s ambient brightness %d hue %d saturation %d: %.3f %.3f %.3f on a mesh, half that on a lightmap (%.1f %.1f %.1f of a lightmap's 127)"),
+						zone->GetName(), (int)zone->AmbientBrightness, (int)zone->AmbientHue, (int)zone->AmbientSaturation, a.X, a.Y, a.Z,
+						a.X * 64.0f, a.Y * 64.0f, a.Z * 64.0f);
 				}
 				else
+				{
 					Ar.Logf(TEXT("PT: zone %s has no ambient"), zone ? zone->GetName() : TEXT("none"));
+					debugf(TEXT("PT: zone %s has no ambient"), zone ? zone->GetName() : TEXT("none"));
+				}
 				DescribeLightingAt(player->XLevel, hit.Location, hit.Normal, texture,
 					node.iSurf < model->Surfs.Num() && (model->Surfs(node.iSurf).PolyFlags & PF_SpecialLit) != 0, node.iSurf, Ar);
 				LightmapProbeSurf = node.iSurf;

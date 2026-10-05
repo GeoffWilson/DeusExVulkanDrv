@@ -237,6 +237,7 @@ bool LevelScene::BuildStatic(ULevel* level)
 	guard(LevelScene::BuildStatic);
 
 	Clear();
+	LevelZone = level ? level->GetLevelInfo() : nullptr;
 
 	if (!level || !level->Model)
 		return false;
@@ -642,10 +643,13 @@ void LevelScene::AddBspSurfaces(UModel* model, SceneGeometry& out, bool skipPort
 		if (surf.PolyFlags & PF_Unlit)
 			unlit = true;
 
-		// The zone in front of this node is the one the surface faces into.
+		// The zone in front of this node is the one the surface faces into;
+		// where that has no ZoneInfo, the LevelInfo, as the engine takes it,
+		// with whatever ambient the level was given. Taken as no zone at all,
+		// a level's own ambient - Helibase's faint green - went missing.
 		AZoneInfo* zone = nullptr;
 		if (node.iZone[1] < FBspNode::MAX_ZONES)
-			zone = model->Zones[node.iZone[1]].ZoneActor;
+			zone = model->Zones[node.iZone[1]].ZoneActor ? model->Zones[node.iZone[1]].ZoneActor : LevelZone;
 		const vec3 ambient = LightmapAmbient(zone);
 
 		TriangleAttributes attr;
