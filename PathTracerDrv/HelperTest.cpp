@@ -233,6 +233,7 @@ int main(int argc, char** argv)
 	int wetness = 0;
 	uint32_t view = 0;
 	int bump = 0;
+	int materials = 1;
 	int crowd = 0;
 	bool everyLight = false;
 	float toneCeiling = 1.0f;
@@ -295,6 +296,8 @@ int main(int argc, char** argv)
 			view = (uint32_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--bump") && i + 1 < argc)
 			bump = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--materials") && i + 1 < argc)
+			materials = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--lights") && i + 1 < argc)
 			crowd = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--every-light"))
@@ -796,7 +799,7 @@ int main(int argc, char** argv)
 		frame.Lighting = engineLighting;
 		frame.DlssQuality = (uint32_t)std::max(fsr >= 0 ? fsr : dlss, 0);
 		frame.Upscaler = fsr >= 0 ? TraceProtocol::UpscaleAlways : TraceProtocol::UpscaleNone;
-		frame.Materials = 1;
+		frame.Materials = (uint32_t)materials;
 		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u) | (everyLight ? 2097152u : 0u) | (neutral ? 8192u : 0u);
 		frame.ToneCeiling = toneCeiling;
 		if (photoAperture >= 0.0f)

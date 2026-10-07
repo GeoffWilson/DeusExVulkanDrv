@@ -54,6 +54,14 @@ static std::string TraceCommon()
 
 		layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+		// How many translucent layers lying in one plane a ray refuses by
+		// name as it passes through them (passedLayers in the trace); past
+		// that many it steps on. Eight, and four on AMD's GPUs, where the
+		// trace is a few registers short of another wave a SIMD and that
+		// is worth more than the fifth coplanar decal: TraceRenderer
+		// rewrites this line for them (ForDevice).
+		const uint MaxPassedLayers = 8u;
+
 		layout(binding = 0) uniform accelerationStructureEXT topLevel;
 		// The view's own images, a set of their own so that the views the HUD
 		// draws in windows are traced with the same scene: the average so far,
@@ -62,6 +70,35 @@ static std::string TraceCommon()
 		layout(set = 1, binding = 0, rgba32f) uniform image2D accumImage;
 		layout(set = 1, binding = 1, rgba16f) uniform image2D outImage;
 		layout(set = 1, binding = 2, rgba32f) uniform image2D historyImage;
+		// The denoiser's surface - the first solid thing the view meets, and
+		// the first lit thing a mirror shows - as the trace captures it, kept
+		// here from the bounce it is found on to the end of the path rather
+		// than in registers. Every value carried through the path costs the
+		// whole trace in how many pixels the GPU keeps in flight, and these
+		// are some forty of them: on AMD's GPUs they were what kept the trace
+		// at four waves a SIMD and spilling. A pixel writes its own record
+		// and reads it back, so no ordering is needed. One array a field
+		// rather than a struct a pixel: a wave's pixels then write and read
+		// a field as one run of memory instead of a word every 224 bytes,
+		// which cost more than the registers saved. 14 vec4s a pixel
+		// (TraceRenderer::SurfaceRecordBytes).
+		const uint RecordDiffuseAlbedo = 0u;         // w: metalness
+		const uint RecordSpecularAlbedo = 1u;        // w: how wet the surface is
+		const uint RecordNormal = 2u;                // w: roughness
+		const uint RecordPosition = 3u;              // w: the instance
+		const uint RecordObject = 4u;                // the same point in its instance's own space; w: the cone's width there
+		const uint RecordEmission = 5u;              // w: how far behind the mirror the surface it shows is
+		const uint RecordSpecularOrigin = 6u;        // where the reflection's own pass starts; w: how far the view went to what it met
+		const uint RecordSpecularDirection = 7u;     // w: how far through the air, from the eye to the first solid thing or the sky
+		const uint RecordReflectionThroughput = 8u;  // what the reflection's ray carries; w: the wet patches' x until the light loop is done
+		const uint RecordReflectionEmission = 9u;    // what the surface in the mirror had in front of it; w: the wet patches' y, likewise
+		const uint RecordReflectionAlbedo = 10u;
+		const uint RecordReflectionNormal = 11u;     // w: how far the reflection pass's first ray off its surface went
+		const uint RecordDiffuseRadiance = 12u;      // the first pass's light, while the second traces; w: its hit distance
+		const uint RecordPrimary = 13u;              // what the view meets first, for the history; w: its instance
+		layout(set = 1, binding = 3, std430) restrict buffer SurfaceRecords { vec4 recordData[]; };
+		uint recordIndex, recordCount;
+		uint recordAt(uint field) { return field * recordCount + recordIndex; }
 
 		struct TriangleAttributes
 		{
@@ -157,7 +194,7 @@ static std::string TraceCommon()
 			uint TextureCount;    // 0 when the device cannot index the array
 			uint MaxSamples;      // ceiling on samples averaged into one pixel
 			float Time;           // the level's clock, for panning textures
-			uint Disable;         // diagnostic switches: 2097152 every light in a cell weighed, 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass, 4194304 the frame's jitter for an upscaler
+			uint DisableWord;     // the switches, read through Disable below: 2097152 every light in a cell weighed, 1 lights, 2 shadows, 4 sky, 8 per-triangle checks, 32 fog, 128 materials, 1024 meshes lit as flat surfaces, 2048 detail textures, 4096 mipmaps, 8192 the neutral tone curve, 512 glowing surfaces lighting nothing, 16384 the engine's shadow masks, 32768 a view in a window of the HUD's, 65536 fog's shadows, 131072 the flashlight, 262144 glowing surfaces sampled as lights; 64 write NRD's inputs, 256 Ray Reconstruction's, 524288 photo mode's accumulation, 1048576 light untinted by glass, 4194304 the frame's jitter for an upscaler
 			vec4 SkyOrigin;       // xyz the sky zone's viewpoint, w 1 when there is one
 		};
 	)";
@@ -183,6 +220,17 @@ static std::string TraceCommon()
 		// lightmaps do, or each by a straight line out to its radius in
 		// linear light: see directLight.
 		#define EngineLighting (Params.z > 0.5)
+
+		// Which of the switches are fixed when a pipeline is made, and what
+		// they are fixed to (TraceRenderer::TracePipelineFor). A pipeline is
+		// made for each setting of the mode switches the game actually uses,
+		// so the compiler leaves out what cannot run - with the materials
+		// off, every glossy path - and the registers it would have held:
+		// what the switches could be was costing a wave a SIMD on AMD's
+		// GPUs. Nothing fixed, as for the fog shadows, reads the word whole.
+		layout(constant_id = 0) const uint DisableFixed = 0u;
+		layout(constant_id = 1) const uint DisableMask = 0u;
+		#define Disable ((DisableWord & ~DisableMask) | DisableFixed)
 
 		// How far a ray starts from the surface it leaves, in world units:
 		// these levels are big.
@@ -1358,18 +1406,24 @@ static std::string TraceCommon()
 		// none. The light is chosen by what it adds to the matte part, and
 		// the highlight is worked out by the caller for that light alone:
 		// weighing every light by its highlight cost more than the highlight
-		// was worth. shownAmbient is the zone's ambient on a level surface as
-		// displayed, which with the engine's lighting goes into the sum with
+		// was worth. ambient is the zone's ambient on a level surface, linear,
+		// which as displayed goes with the engine's lighting into the sum with
 		// the lights, and what it then gives is left in lightmapAmbient.
 		// lightmapPosition is the point where its surface's lightmap is laid
 		// out: the world for the level, and a mover's own brush for one of
 		// its faces, whose lightmap moves with it.
-		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, vec3 shownAmbient, uint strongest, uint surface,
+		vec3 directLight(vec3 position, vec3 normal, bool specialLit, bool everyLight, float meshGlow, vec3 viewDir, vec3 ambient, uint strongest, uint surface,
 			vec3 lightmapPosition, out vec3 lightDirection, out vec3 lightBase)
 		{
 			lightDirection = normal;
 			lightBase = vec3(0.0);
 			bool engineSum = EngineLighting && meshGlow < 0.0;
+			// The ambient as displayed, and what a lightmap's full gives,
+			// worked out where each is returned rather than first and held
+			// through every light's shadow ray: six registers, where AMD's
+			// GPUs have none to spare.
+#define SHOWN_AMBIENT pow(ambient, vec3(1.0 / 2.2))
+#define LIGHTMAP_AMBIENT (EngineLighting ? pow(2.0 * min(SHOWN_AMBIENT, vec3(1.0)), vec3(2.2)) : vec3(0.0))
 			// The engine's shadow masks, looked up only for the lights that
 			// are traced: the strongest are chosen by what they would give
 			// clear all round, and each pick weighed by that, which is what
@@ -1382,12 +1436,11 @@ static std::string TraceCommon()
 			// than the dozen reads.
 			uint lightmapSurface = engineSum ? surface : 0u;
 			// A lightmap's full is drawn at twice the texture's brightness.
-			lightmapAmbient = EngineLighting ? pow(2.0 * min(shownAmbient, vec3(1.0)), vec3(2.2)) : vec3(0.0);
-			if ((Disable & 1u) != 0u)
+			if ((Disable & 1u) != 0u || Counts.y == 0u)
+			{
+				lightmapAmbient = LIGHTMAP_AMBIENT;
 				return vec3(0.0);
-			uint count = Counts.y;
-			if (count == 0u)
-				return vec3(0.0);
+			}
 			// How many lights at the head of the cell's list - the heaviest,
 			// by the grid's ranking - are weighed exactly, and how many are
 			// drawn from the rest to stand for them: more where the view
@@ -1419,17 +1472,24 @@ static std::string TraceCommon()
 			ivec3 dims = ivec3(lightGrid[4], lightGrid[5], lightGrid[6]);
 			ivec3 cell = ivec3(floor((position - gridOrigin) / cellSize));
 			if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, dims)))
+			{
+				lightmapAmbient = LIGHTMAP_AMBIENT;
 				return vec3(0.0);
+			}
 			uint cellIndex = uint((cell.z * dims.y + cell.y) * dims.x + cell.x);
 			uint listStart = lightGrid[8u + cellIndex * 2u];
 			uint listCount = lightGrid[9u + cellIndex * 2u];
 			uint weighed = (everyLight || (Disable & 2097152u) != 0u) ? listCount : min(listCount, exactCount);
 
-			// One loop through four phases, so that lightAt and the shadow ray
-			// are each written once. Every call is inlined, and written once
-			// per phase this function came to ten times the code it needs:
-			// on AMD's GPUs, the registers it held at once overflowed into
-			// memory, and that cost more than the tracing. In order:
+			// Two loops through four phases: the weighing in one, the tracing
+			// in the other, so that lightAt is written twice and the shadow
+			// ray once. Every call is inlined, and written once per phase this
+			// function came to ten times the code it needs: on AMD's GPUs, the
+			// registers it held at once overflowed into memory, and that cost
+			// more than the tracing. One loop for all four kept the weighing's
+			// state - the strongest lights' weights, the tail, the counts -
+			// live through every shadow ray, where the registers are tightest;
+			// the second loop carries only what the tracing needs. In order:
 			//   0  the lights at the head of the cell's list, each weighed
 			//   1  the rest of a crowded cell, stood for by a few drawn from it
 			//   2  the strongest, each traced (not for everyLight)
@@ -1458,7 +1518,6 @@ static std::string TraceCommon()
 			{
 				// The next light, or on to the next phase.
 				uint i;
-				bool masked = true;
 				float drawChance = 0.0;
 				if (phase == 0u)
 				{
@@ -1469,18 +1528,11 @@ static std::string TraceCommon()
 						continue;
 					}
 					i = lightGrid[listStart + 2u * step];
-					masked = everyLight;
 				}
-				else if (phase == 1u)
+				else
 				{
 					if (weighed >= listCount || step >= drawCount || tail <= 0.0)
-					{
-						if (everyLight)
-							break;
-						phase = 2u;
-						step = 0u;
-						continue;
-					}
+						break;
 					float u = randomFloat() * tail;
 					uint lo = weighed, hi = listCount - 1u;
 					while (lo < hi)
@@ -1500,35 +1552,17 @@ static std::string TraceCommon()
 						continue;
 					}
 					i = lightGrid[listStart + 2u * lo];
-					masked = everyLight;
-				}
-				else if (phase == 2u)
-				{
-					if (step >= strongCount)
-					{
-						phase = 3u;
-						step = 0u;
-						continue;
-					}
-					i = strongIndex[step];
-				}
-				else
-				{
-					if (step > 0u || chosen < 0 || chosenTarget <= 0.0)
-						break;
-					i = uint(chosen);
 				}
 				step++;
 
 				vec3 value, base, dir;
 				float distance;
 				bool behind;
-				bool lit = lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, lightmapPosition, masked, value, base, dir, distance, behind);
+				if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, lightmapPosition, everyLight, value, base, dir, distance, behind))
+					continue;
 
 				if (phase == 0u)
 				{
-					if (!lit)
-						continue;
 					float weight = luminance(value);
 					total += value;
 					anyChanging = anyChanging || lights[i].Flags.z > 0.5;
@@ -1570,10 +1604,8 @@ static std::string TraceCommon()
 						}
 					}
 				}
-				else if (phase == 1u)
+				else
 				{
-					if (!lit)
-						continue;
 					float target = luminance(value);
 					float candidateWeight = target / (float(drawCount) * drawChance);
 					if (candidateWeight > 0.0)
@@ -1586,37 +1618,6 @@ static std::string TraceCommon()
 						}
 					}
 				}
-				else
-				{
-					if (lights[i].Flags.z > 0.5)
-						litByChangingLight = true;
-					float weight = luminance(value);
-					if (weight <= 0.0)
-						continue;
-					// Glass tints light as it is, linear; the engine's sum is of
-					// displayed values.
-					vec3 through = lightReaches(position, dir, distance, behind);
-					if (luminance(through) <= 0.0)
-						continue;
-					if (engineSum)
-						through = pow(through, vec3(1.0 / 2.2));
-					float scale = phase == 3u ? restWeight / chosenTarget : 1.0;
-					reaches += value * through * scale;
-					if (phase == 2u)
-					{
-						if (weight > highlightWeight)
-						{
-							highlightWeight = weight;
-							lightDirection = dir;
-							lightBase = base * through;
-						}
-					}
-					else if (highlightWeight <= 0.0)
-					{
-						lightDirection = dir;
-						lightBase = base * through * scale;
-					}
-				}
 			}
 
 			if (everyLight)
@@ -1625,6 +1626,7 @@ static std::string TraceCommon()
 					litByChangingLight = true;
 				if (engineSum)
 				{
+					vec3 shownAmbient = SHOWN_AMBIENT;
 					vec3 shown = shownAmbient + total;
 					vec3 made = pow(2.0 * min(shown, vec3(1.0)), vec3(2.2)) / max(shown, vec3(1.0e-6));
 					lightmapAmbient = made * shownAmbient;
@@ -1633,7 +1635,49 @@ static std::string TraceCommon()
 				// A mesh's is returned as the engine has it, in displayed terms
 				// and unclamped: its ambient goes on before the clamp
 				// (meshLight).
+				lightmapAmbient = LIGHTMAP_AMBIENT;
 				return total;
+			}
+
+			// Phases 2 and 3: the strongest, each traced, then the pick.
+			for (step = 0u; step <= strongCount; step++)
+			{
+				bool pick = step == strongCount;
+				if (pick && (chosen < 0 || chosenTarget <= 0.0))
+					break;
+				uint i = pick ? uint(chosen) : strongIndex[step];
+				vec3 value, base, dir;
+				float distance;
+				bool behind;
+				lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, lightmapPosition, true, value, base, dir, distance, behind);
+				if (lights[i].Flags.z > 0.5)
+					litByChangingLight = true;
+				float weight = luminance(value);
+				if (weight <= 0.0)
+					continue;
+				// Glass tints light as it is, linear; the engine's sum is of
+				// displayed values.
+				vec3 through = lightReaches(position, dir, distance, behind);
+				if (luminance(through) <= 0.0)
+					continue;
+				if (engineSum)
+					through = pow(through, vec3(1.0 / 2.2));
+				float scale = pick ? restWeight / chosenTarget : 1.0;
+				reaches += value * through * scale;
+				if (!pick)
+				{
+					if (weight > highlightWeight)
+					{
+						highlightWeight = weight;
+						lightDirection = dir;
+						lightBase = base * through;
+					}
+				}
+				else if (highlightWeight <= 0.0)
+				{
+					lightDirection = dir;
+					lightBase = base * through * scale;
+				}
 			}
 
 			// Added up as the engine does it: the ambient and the lights as
@@ -1641,6 +1685,7 @@ static std::string TraceCommon()
 			// brightness as every device draws a lightmap, and made linear.
 			if (engineSum)
 			{
+				vec3 shownAmbient = SHOWN_AMBIENT;
 				vec3 shown = shownAmbient + reaches;
 				vec3 made = pow(2.0 * min(shown, vec3(1.0)), vec3(2.2)) / max(shown, vec3(1.0e-6));
 				lightmapAmbient = made * shownAmbient;
@@ -1649,7 +1694,10 @@ static std::string TraceCommon()
 			}
 			// The estimate is the total in proportion, sampled by its weight,
 			// so for a mesh, clamping it clamps the total near enough.
+			lightmapAmbient = LIGHTMAP_AMBIENT;
 			return reaches;
+#undef SHOWN_AMBIENT
+#undef LIGHTMAP_AMBIENT
 		}
 
 		// A lit mesh's light as the engine finishes it: its ambient added to
@@ -2398,6 +2446,8 @@ std::string Shaders::Trace()
 			ivec2 size = imageSize(outImage);
 			if (pixel.x >= size.x || pixel.y >= size.y)
 				return;
+			recordIndex = uint(pixel.y * size.x + pixel.x);
+			recordCount = uint(size.x * size.y);
 
 			rngState = pcgHash(uint(pixel.x) + uint(pixel.y) * 9781u + Counts.x * 26699u);
 			// The pixel's offset into the steps the fog and the flashlight's
@@ -2441,7 +2491,6 @@ std::string Shaders::Trace()
 			float pixelSpread = 2.0 * length(CameraUp.xyz) / float(size.y) * exp2(MipBias);
 			float coneWidth = 0.0;
 			float coneSpread = pixelSpread;
-			float surfaceConeWidth = 0.0;
 
 			vec3 radiance = vec3(0.0);
 			vec3 throughput = vec3(1.0);
@@ -2460,22 +2509,23 @@ std::string Shaders::Trace()
 			float rayMin = RayEpsilon;
 
 			// What this pixel is looking at, recorded on the first bounce so the
-			// accumulated history can be checked against it.
-			vec3 primaryPosition = origin + direction * 100000.0;
-			float primaryInstance = -1.0;
+			// accumulated history can be checked against it: in the record,
+			// where it is, which instance, how far - and how far through the
+			// air, below - starting as nothing met.
+			recordData[recordAt(RecordPrimary)] = vec4(origin + direction * 100000.0, -1.0);
+			recordData[recordAt(RecordSpecularOrigin)].w = 100000.0;
+			recordData[recordAt(RecordSpecularDirection)].w = 100000.0;
 			// Set when the view ray passed through something that changed this
 			// frame - a new decal, say - on its way to what it finally hit.
 			bool primaryChanged = false;
 			// The first surface's light was cut by something that moved.
 			bool primaryMoverShadow = false;
 			bool inSky = false;
-			float primaryDistance = 100000.0;
 			// How far the view goes through the level's air before it meets
 			// something solid or goes out through a window onto the sky:
 			// what the fog and the flashlight's beam fill. Measured from the
-			// eye, where primaryDistance is from whatever glass the ray last
-			// passed and, beyond a sky window, a distance in the skybox.
-			float airDistance = 100000.0;
+			// eye, where the primary distance is from whatever glass the ray
+			// last passed and, beyond a sky window, a distance in the skybox.
 			// Whether what the eye meets is in a fog zone: the engine lays
 			// volumetric fog only over a surface or an actor in one - a
 			// level surface's Ambient.w carries 2 more there, an instance's
@@ -2485,45 +2535,30 @@ std::string Shaders::Trace()
 			// The first solid surface the eye meets, through any glass, decals
 			// and the like in front of it: what a denoiser works on. Its
 			// lighting is gathered as though it were white, and its colour -
-			// and whatever the glass in front did to it - is kept apart.
+			// and whatever the glass in front did to it - is kept apart. What
+			// is captured goes to the pixel's SurfaceRecord as it is found
+			// and is read back after the path; only these flags stay.
 			bool surfaceFound = false;
 			bool pendingSpecular = false;    // part mirror: its reflection is traced next
 			// The first lit surface seen in a mirror, captured the same way as
 			// the surface itself, for the denoiser's second pass.
 			bool reflectionFound = false;
-			vec3 reflectionThroughput = vec3(1.0);
-			vec3 reflectionEmission = vec3(0.0);
-			vec3 reflectionAlbedo = vec3(0.0);
-			vec3 reflectionNormal = vec3(0.0);
-			float reflectionDistance = 0.0;   // from the mirror to it
-			vec3 specularOrigin = vec3(0.0);
-			vec3 specularDirection = vec3(0.0);
-			vec3 surfaceThroughput = vec3(1.0);
-			vec3 emission = vec3(0.0);
-			vec3 diffuseAlbedo = vec3(0.0);
-			vec3 specularAlbedo = vec3(0.0);
-			vec3 surfaceNormal = vec3(0.0);
-			float surfaceRoughness = 1.0;
 			// A glossy first surface. Its reflection is traced in the second
 			// pass like a mirror's, but denoised as a reflection rather than as
 			// a surface of its own. A surface is never both, so the glossy one
-			// keeps its state in the mirror's variables rather than a set of
-			// its own: every value carried through the path costs the whole
-			// trace, glossy or not, in how many pixels the GPU can keep in
-			// flight. For a glossy surface:
-			//   specularOrigin, specularDirection  where its reflection starts
-			//   reflectionThroughput               what that ray carries
-			//   specularAlbedo                     the colour it goes back on with
-			//   reflectionEmission                 what the lights and the ambient
+			// keeps its state in the mirror's part of the record:
+			//   SpecularOrigin, SpecularDirection  where its reflection starts
+			//   ReflectionThroughput               what that ray carries
+			//   SpecularAlbedo                     the colour it goes back on with
+			//   ReflectionEmission                 what the lights and the ambient
 			//                                      give it directly
 			bool glossySurface = false;
 			bool pendingGloss = false;
-			float surfaceMetalness = 0.0;
-			vec3 surfacePosition = origin + direction * 100000.0;
-			vec3 surfaceObject = surfacePosition;   // the same point in its instance's own space
-			int surfaceInstance = -1;
+			// How far the first ray off the denoiser's surface goes, which it
+			// uses to judge how widely that light can be blurred: wanted
+			// after the next hit, and kept in the record (DiffuseRadiance.w
+			// for the view's pass, ReflectionNormal.w for the reflection's).
 			bool wantHitDistance = false;
-			float hitDistance = 0.0;
 
 			// The path's bounces in the low byte, and in the next how many a
 			// glossy surface's reflection is given: the push constants are at
@@ -2532,9 +2567,8 @@ std::string Shaders::Trace()
 			// Two passes on a surface that is part mirror, so that a denoiser
 			// has both its halves every frame: the path off the surface as
 			// usual, then the reflection on its own, from the surface on.
-			uint firstBounce = 0u;
-			vec3 diffuseRadiance = vec3(0.0);
-			float diffuseHitDistance = 0.0;
+			// The first bounce of a pass is its number: the view's pass starts
+			// at bounce 0, the reflection's at 1 (uint(lobePass) below).
 			for (int lobePass = 0; lobePass < 2; lobePass++)
 			{
 				glowWeights = 0.0;
@@ -2542,20 +2576,19 @@ std::string Shaders::Trace()
 				{
 					if (!pendingSpecular && !pendingGloss)
 						break;
-					diffuseRadiance = radiance;
-					diffuseHitDistance = hitDistance;
+					// The first pass's light waits in the record for the picture.
+					recordData[recordAt(RecordDiffuseRadiance)].xyz = radiance;
 					radiance = vec3(0.0);
-					throughput = pendingGloss ? reflectionThroughput : vec3(1.0);
-					origin = specularOrigin;
-					direction = specularDirection;
+					throughput = pendingGloss ? recordData[recordAt(RecordReflectionThroughput)].xyz : vec3(1.0);
+					origin = recordData[recordAt(RecordSpecularOrigin)].xyz;
+					direction = recordData[recordAt(RecordSpecularDirection)].xyz;
 					// A mirror keeps the view's cone; a glossy reflection spreads.
-					coneWidth = surfaceConeWidth;
+					coneWidth = recordData[recordAt(RecordObject)].w;
 					coneSpread = pendingGloss ? 0.1 : pixelSpread;
 					rayMin = LiftedRayMin;
 					passes = 0u;
-					hitDistance = 0.0;
+					recordData[recordAt(RecordReflectionNormal)].w = 0.0;
 					wantHitDistance = true;
-					firstBounce = 1u;
 				}
 
 				// The translucent layers already passed through on the way to the
@@ -2564,7 +2597,10 @@ std::string Shaders::Trace()
 				// plane - so rather than skip a little way past each one, which
 				// skipped the others too, the ray carries on from where it hit
 				// and refuses only the triangles it has already been through.
-				ivec2 passedLayers[8];
+				// Each an instance and a triangle in one word, the instance
+				// above bit 20: half the registers of a pair, through the
+				// whole path.
+				uint passedLayers[MaxPassedLayers];
 				uint passedCount = 0u;
 				bool passingThrough = false;
 	)";
@@ -2573,8 +2609,7 @@ std::string Shaders::Trace()
 				// A glossy reflection goes as far as its own budget allows:
 				// with one, what it shows is lit by the lights and the ambient
 				// but not by light bounced on from there.
-				uint lastBounce = (lobePass == 1 && pendingGloss) ? min(bounces, 1u + GlossBounces) : bounces;
-				for (uint bounce = firstBounce; bounce < lastBounce; bounce++)
+				for (uint bounce = uint(lobePass); bounce < ((lobePass == 1 && pendingGloss) ? min(bounces, 1u + GlossBounces) : bounces); bounce++)
 				{
 					if (!passingThrough)
 						passedCount = 0u;
@@ -2603,9 +2638,10 @@ std::string Shaders::Trace()
 								glowsMet = true;
 								continue;
 							}
+							uint candidateKey = (uint(candidate.x) << 20) | (uint(candidate.y) & 0xFFFFFu);
 							bool passed = false;
-							for (uint p = 0u; p < passedCount; p++)
-								passed = passed || passedLayers[p] == candidate;
+							for (uint p = 0u; p < MaxPassedLayers; p++)
+								passed = passed || (p < passedCount && passedLayers[p] == candidateKey);
 							if (!passed && confirmCandidate(
 									rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 									candidate.y,
@@ -2619,7 +2655,7 @@ std::string Shaders::Trace()
 					{
 						bool glowChanged = false;
 						float reach = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 100000.0 : rayQueryGetIntersectionTEXT(rq, true);
-						radiance += throughput * glowAlong(origin, direction, rayMin, reach, cullMask, coneWidth, coneSpread, bounce > firstBounce, glowChanged);
+						radiance += throughput * glowAlong(origin, direction, rayMin, reach, cullMask, coneWidth, coneSpread, bounce > uint(lobePass), glowChanged);
 						// The pixel records what lies behind them as what it
 						// sees, so one arriving would otherwise fade in.
 						if (bounce == 0u && glowChanged)
@@ -2629,7 +2665,7 @@ std::string Shaders::Trace()
 					if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
 					{
 						if (wantHitDistance)
-							hitDistance = 100000.0;
+							recordData[recordAt(lobePass == 0 ? RecordDiffuseRadiance : RecordReflectionNormal)].w = 100000.0;
 						// Out through the side of the skybox there is nothing: the
 						// engine shows black there. The stand-in sky is only for a
 						// level with no sky zone, and lighting the inside of the
@@ -2648,7 +2684,7 @@ std::string Shaders::Trace()
 					// uses to judge how widely that light can be blurred.
 					if (wantHitDistance)
 					{
-						hitDistance = t;
+						recordData[recordAt(lobePass == 0 ? RecordDiffuseRadiance : RecordReflectionNormal)].w = t;
 						wantHitDistance = false;
 					}
 					int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
@@ -2662,18 +2698,16 @@ std::string Shaders::Trace()
 					{
 						if (!inSky)
 						{
-							airDistance = distance(CameraOrigin.xyz, origin + direction * t);
+							recordData[recordAt(RecordSpecularDirection)].w = distance(CameraOrigin.xyz, origin + direction * t);
 							primaryFogged = mod(attr.Ambient.w, 4.0) > 1.5 || abs(instanceAmbient[rayQueryGetIntersectionInstanceIdEXT(rq, true)].w) > 32.0;
 						}
-						primaryDistance = t;
-						primaryPosition = origin + direction * t;
-						primaryInstance = float(rayQueryGetIntersectionInstanceIdEXT(rq, true));
+						recordData[recordAt(RecordSpecularOrigin)].w = t;
 						// A surface whose texture animates has nothing worth reusing
 						// from earlier frames: averaging a screen against what it
 						// showed a second ago is what made them look frozen while
 						// standing still.
-						if (attr.Albedo.w > 0.5)
-							primaryInstance = -2.0 - float(Counts.x);
+						recordData[recordAt(RecordPrimary)] = vec4(origin + direction * t,
+							attr.Albedo.w > 0.5 ? -2.0 - float(Counts.x) : float(rayQueryGetIntersectionInstanceIdEXT(rq, true)));
 					}
 					// Normals are stored in object space, because the same mesh is
 					// instanced at whatever orientation the actor happens to have.
@@ -2699,13 +2733,13 @@ std::string Shaders::Trace()
 					// The engine lays a detail texture over what is in view, a
 					// mirror's reflection included, where the depth is the
 					// reflection's own, as far behind the glass as it looks.
-					if (bounce == firstBounce && attr.UV2Tex.w < 1.5 && attr.CornerOffsets.x != 0u && !inSky)
+					if (bounce == uint(lobePass) && attr.UV2Tex.w < 1.5 && attr.CornerOffsets.x != 0u && !inSky)
 					{
 						float depth = dot(position - CameraOrigin.xyz, CameraForward.xyz);
 						if (lobePass == 1)
 						{
-							vec3 toMirror = surfacePosition - CameraOrigin.xyz;
-							depth = dot(toMirror, CameraForward.xyz) * (1.0 + distance(position, specularOrigin) / max(length(toMirror), 1.0));
+							vec3 toMirror = recordData[recordAt(RecordPosition)].xyz - CameraOrigin.xyz;
+							depth = dot(toMirror, CameraForward.xyz) * (1.0 + distance(position, recordData[recordAt(RecordSpecularOrigin)].xyz) / max(length(toMirror), 1.0));
 						}
 						if (depth > 0.0)
 							attr.Albedo.rgb *= detailFactor(attr, surfaceUV(attr, bary, direction, normal), depth, footprint);
@@ -2806,14 +2840,14 @@ std::string Shaders::Trace()
 							vec3 contribution;
 							if (sprite || attr.Emission.w > 0.5)
 							{
-								contribution = bounce > firstBounce ? ((Disable & 512u) != 0u ? vec3(0.0) : attr.Albedo.rgb * (glow * GlowScale)) : attr.Albedo.rgb * glow;
+								contribution = bounce > uint(lobePass) ? ((Disable & 512u) != 0u ? vec3(0.0) : attr.Albedo.rgb * (glow * GlowScale)) : attr.Albedo.rgb * glow;
 							}
 							else
 							{
 								vec3 surroundings = linearAmbient(attr, rayQueryGetIntersectionInstanceIdEXT(rq, true));
 								vec3 unusedDirection, unusedBase;
 								contribution = attr.Albedo.rgb * directLight(position, normal, mod(attr.Ambient.w, 2.0) > 0.5, true, -1.0, direction,
-									pow(surroundings, vec3(1.0 / 2.2)), 0u, uint(attr.Emission.z + 0.5),
+									surroundings, 0u, uint(attr.Emission.z + 0.5),
 									rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(position, 1.0), unusedDirection, unusedBase);
 								contribution += attr.Albedo.rgb * (EngineLighting ? lightmapAmbient : surroundings);
 								// The flashlight on it too, with no shadow ray,
@@ -2829,7 +2863,7 @@ std::string Shaders::Trace()
 							// the light behind stained glass bounces in coloured,
 							// and a glowing surface behind it is the same colour
 							// whichever way it is found.
-							if (bounce > firstBounce)
+							if (bounce > uint(lobePass))
 								throughput *= glassTransmittance(attributeBase, primitive, rayQueryGetIntersectionBarycentricsEXT(rq, true),
 									direction, mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true)));
 						}
@@ -2843,8 +2877,8 @@ std::string Shaders::Trace()
 							passedCount = 0u;
 						origin = position;
 						rayMin = 0.0;
-						if (passedCount < 8u)
-							passedLayers[passedCount++] = ivec2(rayQueryGetIntersectionInstanceIdEXT(rq, true), primitive);
+						if (passedCount < MaxPassedLayers)
+							passedLayers[passedCount++] = (uint(rayQueryGetIntersectionInstanceIdEXT(rq, true)) << 20) | (uint(primitive) & 0xFFFFFu);
 						else
 							rayMin = 0.01;
 						passingThrough = true;
@@ -2893,7 +2927,7 @@ std::string Shaders::Trace()
 					// The relief, on what the view meets first, in a mirror
 					// too: past that it is lit as flat. Standing water
 					// smooths it over.
-					if (bounce == firstBounce && !inSky && BumpStrength > 0.0)
+					if (bounce == uint(lobePass) && !inSky && BumpStrength > 0.0)
 						normal = reliefNormal(attr, bary, direction, normal, faceNormal, footprint,
 							mat3(rayQueryGetIntersectionWorldToObjectEXT(rq, true)),
 							lobePass == 0 ? dot(position - CameraOrigin.xyz, CameraForward.xyz) : 0.0, wetness.y);
@@ -2908,21 +2942,22 @@ std::string Shaders::Trace()
 					if (reflectedSurface)
 					{
 						reflectionFound = true;
-						reflectionThroughput = throughput;
-						reflectionEmission = radiance;
+						recordData[recordAt(RecordReflectionThroughput)] = vec4(throughput, 0.0);
+						recordData[recordAt(RecordReflectionEmission)] = vec4(radiance, 0.0);
 						radiance = vec3(0.0);
 						throughput = vec3(1.0);
-						reflectionAlbedo = attr.Albedo.rgb * (attr.UV2Tex.w > 2.5 ? 0.5 : 1.0);
-						reflectionNormal = normal;
-						reflectionDistance = distance(position, specularOrigin);
-						hitDistance = 0.0;
+						recordData[recordAt(RecordReflectionNormal)] = vec4(normal, 0.0);
+						recordData[recordAt(RecordEmission)].w = distance(position, recordData[recordAt(RecordSpecularOrigin)].xyz);
+						recordData[recordAt(RecordReflectionAlbedo)] = vec4(attr.Albedo.rgb * (attr.UV2Tex.w > 2.5 ? 0.5 : 1.0), 0.0);
 						wantHitDistance = true;
 					}
+					// All metal: nothing matte left for the diffuse path to find.
+					bool allMetal = false;
 					if (firstSurface)
 					{
 						surfaceFound = true;
-						surfaceThroughput = throughput;
-						emission = radiance;
+						vec3 surfaceThroughput = throughput;
+						vec3 emission = radiance;
 						radiance = vec3(0.0);
 						throughput = vec3(1.0);
 						// A part-mirror surface is half each, as the two halves
@@ -2938,7 +2973,7 @@ std::string Shaders::Trace()
 						vec3 f0, shineAlbedo, diffuseColour;
 						splitColour(material, surfaceColour,
 							max(abs(dot(normal, toEye)), 1.0e-4), f0, shineAlbedo, diffuseColour);
-						diffuseAlbedo = surfaceThroughput * diffuseColour * (mirror ? 0.5 : 1.0);
+						vec3 diffuseAlbedo = surfaceThroughput * diffuseColour * (mirror ? 0.5 : 1.0);
 						// Unlit, its half is exactly its texture: emission, with no
 						// lighting for the denoiser.
 						if (unlitSurface)
@@ -2946,16 +2981,17 @@ std::string Shaders::Trace()
 							emission += diffuseAlbedo * glow;
 							diffuseAlbedo = vec3(0.0);
 						}
-						specularAlbedo = mirror ? surfaceThroughput * mirrorTint * 0.5 : vec3(0.0);
-						surfaceNormal = normal;
+						allMetal = max(diffuseAlbedo.r, max(diffuseAlbedo.g, diffuseAlbedo.b)) <= 0.0;
+						vec3 specularAlbedo = mirror ? surfaceThroughput * mirrorTint * 0.5 : vec3(0.0);
+						vec3 specularOrigin = vec3(0.0), specularDirection = vec3(0.0);
+						vec3 reflectionThroughput = vec3(1.0);
 						if (mirror)
 						{
 							pendingSpecular = true;
 							specularOrigin = lifted + faceNormal * RayEpsilon;
-							specularDirection = aboveFace(reflect(direction, surfaceNormal), faceNormal);
+							specularDirection = aboveFace(reflect(direction, normal), faceNormal);
 						}
-						surfaceRoughness = mirror ? 0.0 : (material.glossy ? material.roughness : 1.0);
-						surfaceMetalness = material.metalness;
+						float surfaceRoughness = mirror ? 0.0 : (material.glossy ? material.roughness : 1.0);
 						// Glossy but too rough to trace, its reflection is what the
 						// lights and the ambient give it directly.
 						glossySurface = material.glossy;
@@ -2965,7 +3001,7 @@ std::string Shaders::Trace()
 						{
 							vec3 weight;
 							vec3 L;
-							if (sampleGlossy(material, f0, surfaceNormal, toEye, L, weight))
+							if (sampleGlossy(material, f0, normal, toEye, L, weight))
 							{
 								pendingGloss = true;
 								specularOrigin = lifted + faceNormal * RayEpsilon;
@@ -2974,10 +3010,18 @@ std::string Shaders::Trace()
 								reflectionThroughput = weight / max(shineAlbedo, vec3(1.0e-4));
 							}
 						}
-						surfacePosition = position;
-						surfaceObject = rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(position, 1.0);
-						surfaceConeWidth = hitWidth;
-						surfaceInstance = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+						recordData[recordAt(RecordDiffuseAlbedo)] = vec4(diffuseAlbedo, material.metalness);
+						recordData[recordAt(RecordSpecularAlbedo)] = vec4(specularAlbedo, wet);
+						recordData[recordAt(RecordNormal)] = vec4(normal, surfaceRoughness);
+						recordData[recordAt(RecordPosition)] = vec4(position, float(rayQueryGetIntersectionInstanceIdEXT(rq, true)));
+						recordData[recordAt(RecordObject)] = vec4(rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(position, 1.0), hitWidth);
+						recordData[recordAt(RecordEmission)] = vec4(emission, 0.0);
+						recordData[recordAt(RecordSpecularOrigin)].xyz = specularOrigin;
+						recordData[recordAt(RecordSpecularDirection)].xyz = specularDirection;
+						recordData[recordAt(RecordReflectionThroughput)] = vec4(reflectionThroughput, wetness.x);
+						recordData[recordAt(RecordReflectionEmission)] = vec4(0.0, 0.0, 0.0, wetness.y);
+						// The first ray off it has not gone anywhere yet.
+						recordData[recordAt(RecordDiffuseRadiance)] = vec4(0.0);
 						wantHitDistance = true;
 					}
 
@@ -3047,8 +3091,8 @@ std::string Shaders::Trace()
 						// to a room.
 						// Found by a bounce, it is weighed against its chance
 						// of having been sampled as a light (glowFound).
-						if (!firstSurface && !(bounce > firstBounce && (Disable & 512u) != 0u))
-							radiance += throughput * attr.Albedo.rgb * (glow * (bounce > firstBounce ? glowFound(attr.Emission.z, position, direction) : 1.0));
+						if (!firstSurface && !(bounce > uint(lobePass) && (Disable & 512u) != 0u))
+							radiance += throughput * attr.Albedo.rgb * (glow * (bounce > uint(lobePass) ? glowFound(attr.Emission.z, position, direction) : 1.0));
 						break;
 					}
 					// Shaded as white on the denoiser's surface: its colour goes back
@@ -3069,7 +3113,7 @@ std::string Shaders::Trace()
 					}
 					vec3 ambient = linearAmbient(attr, hitInstance);
 					vec3 lit = directLight(lifted, normal, mod(attr.Ambient.w, 2.0) > 0.5, false, meshGlow, direction,
-						pow(ambient, vec3(1.0 / 2.2)), firstSurface ? 4u : 1u, uint(attr.Emission.z + 0.5),
+						ambient, firstSurface ? 4u : 1u, uint(attr.Emission.z + 0.5),
 						rayQueryGetIntersectionWorldToObjectEXT(rq, true) * vec4(lifted, 1.0), lightDirection, lightBase);
 					if (meshGlow >= 0.0)
 						lit = meshLight(lit, instanceAmbient[hitInstance].rgb);
@@ -3087,6 +3131,19 @@ std::string Shaders::Trace()
 					if (flashLit)
 						lit += flashBase * dot(normal, flashDir);
 
+					// The wetness again, from the record rather than held through
+					// the light loop; only the view's first surface has any.
+					if (firstSurface)
+					{
+						wet = recordData[recordAt(RecordSpecularAlbedo)].w;
+						wetness = vec2(recordData[recordAt(RecordReflectionThroughput)].w, recordData[recordAt(RecordReflectionEmission)].w);
+					}
+					else
+					{
+						wet = 0.0;
+						wetness = vec2(0.0);
+					}
+
 					// What it is made of, only now the light loop is done with.
 					// A surface seen in a mirror is captured as matte, since its
 					// own reflection would need a pass of its own.
@@ -3097,6 +3154,7 @@ std::string Shaders::Trace()
 					vec3 f0, shineAlbedo, diffuseColour;
 					splitColour(material, surfaceColour, max(dot(normal, toEye), 1.0e-4), f0, shineAlbedo, diffuseColour);
 					bool glossCapture = firstSurface && material.glossy;
+					vec3 glossEmission = vec3(0.0);
 					// Which way the path goes on from here is chosen below, a
 					// glossy surface's in proportion to what each half
 					// reflects; the share going the matte way weighs what the
@@ -3112,7 +3170,7 @@ std::string Shaders::Trace()
 					// Only on the first two surfaces a path meets: past them
 					// what a glowing surface gives is faint, and the bounces
 					// alone find it well enough.
-					if (!inSky && bounce <= firstBounce + 1u)
+					if (!inSky && bounce <= uint(lobePass) + 1u)
 						lit += glowLight(lifted, normal, 1.0 - pShine, luminance(lit));
 					else
 						glowWeights = 0.0;
@@ -3126,7 +3184,7 @@ std::string Shaders::Trace()
 						if (flashLit)
 							shine += flashBase * glossyLight(material, f0, normal, toEye, flashDir);
 						if (glossCapture)
-							reflectionEmission += shine / max(shineAlbedo, vec3(1.0e-4));
+							glossEmission += shine / max(shineAlbedo, vec3(1.0e-4));
 						else
 							radiance += throughput * shine;
 					}
@@ -3144,7 +3202,10 @@ std::string Shaders::Trace()
 					if (meshGlow < 0.0)
 						radiance += throughput * shade * (EngineLighting ? lightmapAmbient : ambient);
 					if (glossCapture)
-						reflectionEmission += ambient;
+					{
+						glossEmission += ambient;
+						recordData[recordAt(RecordReflectionEmission)] = vec4(glossEmission, 0.0);
+					}
 					else if (!captured)
 						radiance += throughput * shineAlbedo * ambient;
 
@@ -3155,8 +3216,7 @@ std::string Shaders::Trace()
 					if (inSky)
 						break;
 
-					// All metal: nothing matte left for the diffuse path to find.
-					if (firstSurface && max(diffuseAlbedo.r, max(diffuseAlbedo.g, diffuseAlbedo.b)) <= 0.0)
+					if (allMetal)
 						break;
 	)";
 
@@ -3209,6 +3269,50 @@ std::string Shaders::Trace()
 				}
 			}
 
+			// The pixel again, from the record's index rather than carried
+			// through the path: two registers.
+			pixel = ivec2(int(recordIndex % uint(size.x)), int(recordIndex / uint(size.x)));
+
+			// What the view met, read back from the pixel's record.
+			vec3 primaryPosition = recordData[recordAt(RecordPrimary)].xyz;
+			float primaryInstance = recordData[recordAt(RecordPrimary)].w;
+			float primaryDistance = recordData[recordAt(RecordSpecularOrigin)].w;
+			float airDistance = recordData[recordAt(RecordSpecularDirection)].w;
+
+			// The denoiser's surface, read back from the pixel's record.
+			vec3 diffuseAlbedo = vec3(0.0), specularAlbedo = vec3(0.0), surfaceNormal = vec3(0.0), emission = vec3(0.0);
+			vec3 surfacePosition = primaryPosition, surfaceObject = primaryPosition;
+			float surfaceRoughness = 1.0, surfaceMetalness = 0.0;
+			int surfaceInstance = -1;
+			vec3 reflectionThroughput = vec3(1.0), reflectionEmission = vec3(0.0), reflectionAlbedo = vec3(0.0), reflectionNormal = vec3(0.0);
+			float reflectionDistance = 0.0;
+			vec3 diffuseRadiance = vec3(0.0);
+			float diffuseHitDistance = 0.0;
+			if (surfaceFound)
+			{
+				vec4 r = recordData[recordAt(RecordDiffuseAlbedo)];
+				diffuseAlbedo = r.xyz;
+				surfaceMetalness = r.w;
+				specularAlbedo = recordData[recordAt(RecordSpecularAlbedo)].xyz;
+				r = recordData[recordAt(RecordNormal)];
+				surfaceNormal = r.xyz;
+				surfaceRoughness = r.w;
+				r = recordData[recordAt(RecordPosition)];
+				surfacePosition = r.xyz;
+				surfaceInstance = int(r.w);
+				surfaceObject = recordData[recordAt(RecordObject)].xyz;
+				r = recordData[recordAt(RecordEmission)];
+				emission = r.xyz;
+				reflectionDistance = r.w;
+				reflectionThroughput = recordData[recordAt(RecordReflectionThroughput)].xyz;
+				reflectionEmission = recordData[recordAt(RecordReflectionEmission)].xyz;
+				reflectionAlbedo = recordData[recordAt(RecordReflectionAlbedo)].xyz;
+				reflectionNormal = recordData[recordAt(RecordReflectionNormal)].xyz;
+				r = recordData[recordAt(RecordDiffuseRadiance)];
+				diffuseRadiance = r.xyz;
+				diffuseHitDistance = r.w;
+			}
+
 			// The picture put back together from the denoiser's parts.
 			vec3 diffuseSignal = vec3(0.0);
 			vec3 specularSignal = vec3(0.0);
@@ -3230,7 +3334,7 @@ std::string Shaders::Trace()
 				if (reflectionFound)
 				{
 					reflectionSignal = radiance;
-					reflectionHitDistance = hitDistance;
+					reflectionHitDistance = recordData[recordAt(RecordReflectionNormal)].w;
 					reflectionRemodulation = specularAlbedo * reflectionThroughput * reflectionAlbedo;
 					specularSignal = reflectionEmission + reflectionThroughput * reflectionAlbedo * reflectionSignal;
 				}
@@ -3243,13 +3347,12 @@ std::string Shaders::Trace()
 			else if (pendingGloss)
 			{
 				glossSignal = reflectionEmission + radiance;
-				glossHitDistance = hitDistance;
+				glossHitDistance = recordData[recordAt(RecordReflectionNormal)].w;
 			}
 			else
 			{
 				glossSignal = glossySurface ? reflectionEmission : vec3(0.0);
 				diffuseRadiance = radiance;
-				diffuseHitDistance = hitDistance;
 			}
 			vec3 emissionPart = emission;
 			if (surfaceFound)

@@ -645,8 +645,27 @@ ComputePipelineBuilder& ComputePipelineBuilder::ComputeShader(VulkanShader* shad
 	return *this;
 }
 
+ComputePipelineBuilder& ComputePipelineBuilder::AddConstant(uint32_t id, uint32_t value)
+{
+	VkSpecializationMapEntry entry = {};
+	entry.constantID = id;
+	entry.offset = (uint32_t)(constantValues.size() * sizeof(uint32_t));
+	entry.size = sizeof(uint32_t);
+	constantEntries.push_back(entry);
+	constantValues.push_back(value);
+	return *this;
+}
+
 std::unique_ptr<VulkanPipeline> ComputePipelineBuilder::Create(VulkanDevice* device)
 {
+	if (!constantEntries.empty())
+	{
+		constantInfo.mapEntryCount = (uint32_t)constantEntries.size();
+		constantInfo.pMapEntries = constantEntries.data();
+		constantInfo.dataSize = constantValues.size() * sizeof(uint32_t);
+		constantInfo.pData = constantValues.data();
+		pipelineInfo.stage.pSpecializationInfo = &constantInfo;
+	}
 	VkPipeline pipeline;
 	vkCreateComputePipelines(device->device, cache ? cache->cache : VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
 	auto obj = std::make_unique<VulkanPipeline>(device, pipeline);

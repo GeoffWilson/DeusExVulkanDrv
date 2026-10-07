@@ -3,6 +3,7 @@
 #include "SceneData.h"
 #include "GpuContext.h"
 #include <chrono>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -158,6 +159,9 @@ private:
 		std::unique_ptr<VulkanImageView> AccumView;
 		std::unique_ptr<VulkanImage> HistoryImage;
 		std::unique_ptr<VulkanImageView> HistoryView;
+		// The trace's SurfaceRecord for each pixel: what it captures of the
+		// denoiser's surface, kept out of registers until the path is done.
+		std::unique_ptr<VulkanBuffer> RecordBuffer;
 		std::unique_ptr<VulkanImage> OutputImage;
 		std::unique_ptr<VulkanImageView> OutputView;
 		int TraceWidth = 0;
@@ -209,6 +213,8 @@ private:
 	};
 
 	void CreateTracePipeline();
+	VulkanPipeline* TracePipelineFor(uint32_t disable);
+	std::string ForDevice(std::string source) const;
 	void CreateCompositePipeline();
 	void CreateFinishPipeline();
 	void Resize(View& view, int renderWidth, int renderHeight, int outputWidth, int outputHeight, bool forRayReconstruction, bool forFsr);
@@ -241,13 +247,17 @@ private:
 		int Height = 0;
 		std::unique_ptr<VulkanImage> Accum, Out, History;
 		std::unique_ptr<VulkanImageView> AccumView, OutView, HistoryView;
+		std::unique_ptr<VulkanBuffer> Records;
 		std::unique_ptr<VulkanDescriptorSet> Set;
 	};
+	// The trace shader's surface record: 14 vec4s a pixel, one array a field.
+	static const size_t SurfaceRecordBytes = 14 * sizeof(vec4);
 	static const int MaxInsets = 4;   // TraceProtocol::MaxInsets
 	Inset Insets[MaxInsets];
 	std::unique_ptr<VulkanPipelineLayout> PipelineLayout;
 	std::unique_ptr<VulkanShader> TraceShader;
-	std::unique_ptr<VulkanPipeline> TracePipeline;
+	// One for each setting of the switches fixed into it, by those bits.
+	std::map<uint32_t, std::unique_ptr<VulkanPipeline>> TracePipelines;
 	std::unique_ptr<VulkanShader> FogShadowShader;
 	std::unique_ptr<VulkanPipeline> FogShadowPipeline;
 	bool DescriptorsDirty = true;

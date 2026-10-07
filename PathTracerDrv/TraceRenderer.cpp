@@ -40,6 +40,56 @@ static std::string DevShaderSource(const char* name, std::string builtin)
 	return builtin;
 }
 
+// The trace pipeline for a setting of the switches: made the first time a
+// frame traces with that setting and kept. The switches fixed into a
+// pipeline (specialization constants, the shader's DisableFixed and
+// DisableMask) are the modes - the materials, the fog, photo mode, PT's
+// toggles - which change rarely; what differs between dispatches within a
+// frame - a view in a HUD window, the denoiser's inputs, the upscaler's
+// jitter - stays in the push constant. The compiler then leaves out what a
+// setting cannot run, and on AMD's GPUs that was the difference between
+// four waves a SIMD and five. A setting costs its compile when first seen:
+// the first frame, and again on entering photo mode or turning a switch.
+static const uint32_t FixedDisableBits = 1u | 2u | 4u | 8u | 32u | 128u | 512u | 1024u | 2048u | 4096u | 8192u | 16384u |
+	65536u | 131072u | 262144u | 524288u | 1048576u | 2097152u;
+
+VulkanPipeline* TraceRenderer::TracePipelineFor(uint32_t disable)
+{
+	const uint32_t fixed = disable & FixedDisableBits;
+	auto it = TracePipelines.find(fixed);
+	if (it == TracePipelines.end())
+	{
+		auto start = std::chrono::steady_clock::now();
+		it = TracePipelines.emplace(fixed, ComputePipelineBuilder()
+			.Layout(PipelineLayout.get())
+			.ComputeShader(TraceShader.get())
+			.AddConstant(0, fixed)
+			.AddConstant(1, FixedDisableBits)
+			.DebugName("PathTracerTracePipeline")
+			.Create(Device)).first;
+		debugf("PathTracer trace pipeline for switches %x made in %.0f ms", fixed,
+			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	}
+	return it->second.get();
+}
+
+// A shader's source as compiled for this device. On AMD's GPUs the trace
+// refuses four passed layers rather than eight (Shaders.cpp,
+// MaxPassedLayers): the four registers that saves are what stand between the
+// trace and another wave a SIMD there, and the fifth decal lying exactly in
+// the plane of four others is not worth a fifth of the GPU.
+std::string TraceRenderer::ForDevice(std::string source) const
+{
+	if (Device->PhysicalDevice.Properties.Properties.vendorID == 0x1002)
+	{
+		const std::string eight = "const uint MaxPassedLayers = 8u;";
+		size_t at = source.find(eight);
+		if (at != std::string::npos)
+			source.replace(at, eight.size(), "const uint MaxPassedLayers = 4u;");
+	}
+	return source;
+}
+
 // A new accumulation and history, cleared and left GENERAL for the trace. Not
 // merely made GENERAL, as everything else is: the accumulation's alpha counts
 // a pixel's frames under a moving shadow, and the trace reads that before it
@@ -159,6 +209,7 @@ void TraceRenderer::CreateTracePipeline()
 		.AddBinding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.AddBinding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT)
+		.AddBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT)
 		.DebugName("PathTracerViewSetLayout")
 		.Create(Device);
 
@@ -167,7 +218,7 @@ void TraceRenderer::CreateTracePipeline()
 	DescriptorPool = DescriptorPoolBuilder()
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, MaxViews)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MaxViews * (2 + GuideImageCount) + 3 * imageSets)
-		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaxViews * 9)
+		.AddPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaxViews * 9 + imageSets)
 		.AddPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxViews * MaxTextures)
 		.MaxSets(MaxViews + imageSets)
 		.DebugName("PathTracerDescriptorPool")
@@ -200,15 +251,13 @@ void TraceRenderer::CreateTracePipeline()
 
 	TraceShader = ShaderBuilder()
 		.Type(ShaderType::Compute)
-		.AddSource("shaders/Trace.comp", DevShaderSource("Trace.comp", Shaders::Trace()))
+		.AddSource("shaders/Trace.comp", ForDevice(DevShaderSource("Trace.comp", Shaders::Trace())))
 		.DebugName("PathTracerTrace")
 		.Create("PathTracerTrace", Device);
 
-	TracePipeline = ComputePipelineBuilder()
-		.Layout(PipelineLayout.get())
-		.ComputeShader(TraceShader.get())
-		.DebugName("PathTracerTracePipeline")
-		.Create(Device);
+	// The pipelines themselves are made as the frames ask for them
+	// (TracePipelineFor).
+	TracePipelines.clear();
 
 	// The fog lights' shadow cubes, with the trace's own bindings.
 	FogShadowShader = ShaderBuilder()
@@ -573,6 +622,15 @@ void TraceRenderer::Resize(View& view, int width, int height, int outputWidth, i
 	// pixel's accumulated history still describes the same thing.
 	makeImage(view.HistoryImage, view.HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, width, height, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerHistory");
 
+	// Each pixel's record of the denoiser's surface, written and read back
+	// within the trace (the shader's SurfaceRecord). Never cleared: a pixel
+	// reads only what it wrote this frame.
+	view.RecordBuffer = BufferBuilder()
+		.Size((size_t)width * height * SurfaceRecordBytes)
+		.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+		.DebugName("PathTracerSurfaceRecords")
+		.Create(Device);
+
 	makeImage(view.OutputImage, view.OutputView, VK_FORMAT_R16G16B16A16_SFLOAT, outputWidth, outputHeight,
 		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerOutput");
 
@@ -770,6 +828,7 @@ void TraceRenderer::UpdateDescriptors()
 			// finishes it there.
 			.AddStorageImage(view.ImageSet.get(), 1, view.TracingForRr ? view.RrColorView.get() : view.TracingForFsr ? view.FsrColorView.get() : view.OutputView.get(), VK_IMAGE_LAYOUT_GENERAL)
 			.AddStorageImage(view.ImageSet.get(), 2, view.HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
+			.AddBuffer(view.ImageSet.get(), 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, view.RecordBuffer.get())
 			.AddStorageImage(set, 23, view.RrDepthView.get(), VK_IMAGE_LAYOUT_GENERAL)
 			.AddStorageImage(set, 24, view.RrMotionView.get(), VK_IMAGE_LAYOUT_GENERAL)
 			.AddBuffer(set, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Accel->GetAttributeBuffer())
@@ -1095,7 +1154,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 		vkCmdPipelineBarrier(commands->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &written, 0, nullptr, 0, nullptr);
 	}
 
-	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
+	commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipelineFor(PushConstants.Disable));
 	for (int v = 0; v < viewCount; v++)
 	{
 		View& view = Views[v];
@@ -1374,10 +1433,16 @@ void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProto
 			makeImage(inset.Accum, inset.AccumView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerInsetAccum");
 			makeImage(inset.Out, inset.OutView, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, "PathTracerInsetOut");
 			makeImage(inset.History, inset.HistoryView, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "PathTracerInsetHistory");
+			inset.Records = BufferBuilder()
+				.Size((size_t)width * height * SurfaceRecordBytes)
+				.Usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+				.DebugName("PathTracerInsetSurfaceRecords")
+				.Create(Device);
 			WriteDescriptors()
 				.AddStorageImage(inset.Set.get(), 0, inset.AccumView.get(), VK_IMAGE_LAYOUT_GENERAL)
 				.AddStorageImage(inset.Set.get(), 1, inset.OutView.get(), VK_IMAGE_LAYOUT_GENERAL)
 				.AddStorageImage(inset.Set.get(), 2, inset.HistoryView.get(), VK_IMAGE_LAYOUT_GENERAL)
+				.AddBuffer(inset.Set.get(), 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, inset.Records.get())
 				.Execute(Device);
 			inset.Width = width;
 			inset.Height = height;
@@ -1404,7 +1469,7 @@ void TraceRenderer::RecordInsets(VulkanCommandBuffer* commands, const TraceProto
 		constants.Counts[3] = fresh ? 0u : view.AccumulatedFrames;
 		constants.Params.w = 0.0f;
 
-		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipeline.get());
+		commands->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, TracePipelineFor(constants.Disable));
 		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 0, Views[0].SceneSet.get());
 		commands->bindDescriptorSet(VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout.get(), 1, inset.Set.get());
 		commands->pushConstants(PipelineLayout.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TracePushConstants), &constants);

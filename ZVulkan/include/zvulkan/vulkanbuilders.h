@@ -277,6 +277,8 @@ public:
 	ComputePipelineBuilder& Cache(VulkanPipelineCache* cache);
 	ComputePipelineBuilder& Layout(VulkanPipelineLayout *layout);
 	ComputePipelineBuilder& ComputeShader(VulkanShader *shader);
+	// A specialization constant (layout(constant_id = id) in the shader).
+	ComputePipelineBuilder& AddConstant(uint32_t id, uint32_t value);
 	ComputePipelineBuilder& DebugName(const char* name) { debugName = name; return *this; }
 
 	std::unique_ptr<VulkanPipeline> Create(VulkanDevice *device);
@@ -284,6 +286,9 @@ public:
 private:
 	VkComputePipelineCreateInfo pipelineInfo = {};
 	VkPipelineShaderStageCreateInfo stageInfo = {};
+	std::vector<VkSpecializationMapEntry> constantEntries;
+	std::vector<uint32_t> constantValues;
+	VkSpecializationInfo constantInfo = {};
 	VulkanPipelineCache* cache = nullptr;
 	const char* debugName = nullptr;
 };
