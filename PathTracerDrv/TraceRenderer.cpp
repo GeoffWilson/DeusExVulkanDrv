@@ -73,19 +73,20 @@ VulkanPipeline* TraceRenderer::TracePipelineFor(uint32_t disable)
 	return it->second.get();
 }
 
-// A shader's source as compiled for this device. On AMD's GPUs the trace
-// refuses four passed layers rather than eight (Shaders.cpp,
-// MaxPassedLayers): the four registers that saves are what stand between the
-// trace and another wave a SIMD there, and the fifth decal lying exactly in
-// the plane of four others is not worth a fifth of the GPU.
+// A shader's source as compiled for this device. On AMD's GPUs the trace is
+// shaped to fit their registers (Shaders.cpp, AmdGpu): it refuses four passed
+// layers rather than eight, and reads a light through a coherent view before
+// its shadow ray. The registers that saves are what stand between the trace
+// and another wave a SIMD there, worth a fifth of the GPU; on NVIDIA's the
+// coherent reads cost as much.
 std::string TraceRenderer::ForDevice(std::string source) const
 {
 	if (Device->PhysicalDevice.Properties.Properties.vendorID == 0x1002)
 	{
-		const std::string eight = "const uint MaxPassedLayers = 8u;";
-		size_t at = source.find(eight);
+		const std::string other = "#define AmdGpu 0";
+		size_t at = source.find(other);
 		if (at != std::string::npos)
-			source.replace(at, eight.size(), "const uint MaxPassedLayers = 4u;");
+			source.replace(at, other.size(), "#define AmdGpu 1");
 	}
 	return source;
 }

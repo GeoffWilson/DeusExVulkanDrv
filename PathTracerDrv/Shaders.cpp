@@ -54,13 +54,16 @@ static std::string TraceCommon()
 
 		layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+		// 1 on AMD's GPUs, where the trace is shaped to fit its registers in
+		// ways that cost NVIDIA's: TraceRenderer rewrites this line for them
+		// (ForDevice).
+#define AmdGpu 0
 		// How many translucent layers lying in one plane a ray refuses by
 		// name as it passes through them (passedLayers in the trace); past
 		// that many it steps on. Eight, and four on AMD's GPUs, where the
 		// trace is a few registers short of another wave a SIMD and that
-		// is worth more than the fifth coplanar decal: TraceRenderer
-		// rewrites this line for them (ForDevice).
-		const uint MaxPassedLayers = 8u;
+		// is worth more than the fifth coplanar decal.
+		const uint MaxPassedLayers = AmdGpu != 0 ? 4u : 8u;
 
 		layout(binding = 0) uniform accelerationStructureEXT topLevel;
 		// The view's own images, a set of their own so that the views the HUD
@@ -123,6 +126,17 @@ static std::string TraceCommon()
 
 		layout(binding = 3, std430) readonly buffer Attributes { TriangleAttributes tris[]; };
 		layout(binding = 4, std430) readonly buffer Lights { SceneLight lights[]; };
+		// The same lights, for a look at one before its shadow ray
+		// (directLight): on AMD's GPUs coherent, so the compiler cannot take
+		// what is read here for what lightAt reads after the ray and hold
+		// the light's fields through it, which cost the fifth wave there.
+		// NVIDIA's reads coherent memory uncached, and the trace there lost
+		// a fifth of its speed to it.
+#if AmdGpu
+		layout(binding = 4, std430) coherent readonly buffer LightsPeek { SceneLight lightsPeek[]; };
+#else
+#define lightsPeek lights
+#endif
 		// Per instance, indexed by the intersection's instance id: what varies
 		// by where a shape is rather than by what it is.
 		layout(binding = 5, std430) readonly buffer InstanceData { vec4 instanceAmbient[]; };
@@ -1165,7 +1179,18 @@ static std::string TraceCommon()
 			return 2.0 * mix(top, bottom, p.f.y) / 255.0;
 		}
 
-		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir, uint lightmapSurface, vec3 lightmapPosition, bool masked,
+		// A baked light's mask where a surface lit by the engine's lighting
+		// takes it (bakedScale), and 2, clear all round, anywhere else.
+		// lightmapSurface is 0 where there is no such surface.
+		float lightMask(uint i, uint lightmapSurface, vec3 lightmapPosition)
+		{
+			float id = lightsPeek[i].Flags.y;
+			return lightmapSurface != 0u && id > 1.5 ? bakedScale(lightmapPoint(lightmapSurface, lightmapPosition), uint(id * 0.5)) : 2.0;
+		}
+
+		// mask is the light's from lightMask, or 2 to take it as clear all
+		// round.
+		bool lightAt(uint i, vec3 position, vec3 normal, bool specialLit, float meshGlow, vec3 viewDir, float mask,
 			out vec3 value, out vec3 base, out vec3 dir, out float distance, out bool behind)
 		{
 			value = vec3(0.0);
@@ -1324,10 +1349,7 @@ static std::string TraceCommon()
 				// bright as the engine draws it. Unless masked, the light is
 				// taken as clear all round: see directLight.
 				float x = reach / radius;
-				float mask = 1.0;
-				if (light.Flags.y > 1.5)
-					mask = masked ? bakedScale(lightmapPoint(lightmapSurface, lightmapPosition), uint(light.Flags.y * 0.5)) : 2.0;
-				float lit = shade * (1.0 - x * x * (3.0 - 2.0 * x)) * mask;
+				float lit = shade * (1.0 - x * x * (3.0 - 2.0 * x)) * (light.Flags.y > 1.5 ? mask : 1.0);
 				base = pow(light.ColorBrightness.rgb, vec3(1.0 / 2.2)) * lit;
 				value = min(base * response, vec3(1.0));
 			}
@@ -1558,7 +1580,7 @@ static std::string TraceCommon()
 				vec3 value, base, dir;
 				float distance;
 				bool behind;
-				if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, lightmapPosition, everyLight, value, base, dir, distance, behind))
+				if (!lightAt(i, position, normal, specialLit, meshGlow, viewDir, everyLight ? lightMask(i, lightmapSurface, lightmapPosition) : 2.0, value, base, dir, distance, behind))
 					continue;
 
 				if (phase == 0u)
@@ -1646,19 +1668,29 @@ static std::string TraceCommon()
 				if (pick && (chosen < 0 || chosenTarget <= 0.0))
 					break;
 				uint i = pick ? uint(chosen) : strongIndex[step];
-				vec3 value, base, dir;
-				float distance;
-				bool behind;
-				lightAt(i, position, normal, specialLit, meshGlow, viewDir, lightmapSurface, lightmapPosition, true, value, base, dir, distance, behind);
-				if (lights[i].Flags.z > 0.5)
+				if (lightsPeek[i].Flags.z > 0.5)
 					litByChangingLight = true;
-				float weight = luminance(value);
-				if (weight <= 0.0)
+				// Only where the light is, and its mask, before the shadow
+				// ray; what it gives is worked out after, so that is not held
+				// through the ray where AMD's registers are tightest. Each
+				// light here gave something when weighed, clear all round, so
+				// only its mask can leave it dark: skipped then, untraced.
+				vec3 toLight = lightsPeek[i].PositionRadius.xyz - position;
+				float distance = length(toLight);
+				vec3 dir = toLight / distance;
+				bool behind = lightsPeek[i].Flags.x <= 0.5 && dot(normal, dir) <= 0.0;
+				float mask = lightMask(i, lightmapSurface, lightmapPosition);
+				if (mask <= 0.0)
 					continue;
 				// Glass tints light as it is, linear; the engine's sum is of
 				// displayed values.
 				vec3 through = lightReaches(position, dir, distance, behind);
 				if (luminance(through) <= 0.0)
+					continue;
+				vec3 value, base;
+				lightAt(i, position, normal, specialLit, meshGlow, viewDir, mask, value, base, dir, distance, behind);
+				float weight = luminance(value);
+				if (weight <= 0.0)
 					continue;
 				if (engineSum)
 					through = pow(through, vec3(1.0 / 2.2));
@@ -2281,12 +2313,27 @@ static std::string TraceCommon()
 			{
 				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 				{
-					int attributeBase = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
-					int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+					// As confirmCandidate decides, from one read of the
+					// triangle and the transform only for environment mapped
+					// art (see occludedBy): held through the ray otherwise,
+					// this was the trace's tightest point on AMD's GPUs.
+					TriangleAttributes above = tris[rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false) + rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)];
 					// Smoke and a lamp's corona keep no rain off.
-					if (tris[attributeBase + primitive].Emission.w < 1.5 &&
-						confirmCandidate(attributeBase, primitive, rayQueryGetIntersectionBarycentricsEXT(rq, false), false, up,
-							mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false))))
+					if (above.Emission.w >= 1.5)
+						continue;
+					// Solid, a mirror and a window onto the sky stop it;
+					// masked and see-through art only where its texel is
+					// there.
+					float kind = above.UV2Tex.w;
+					bool stops = true;
+					int index = int(above.UV2Tex.z);
+					if (kind >= 0.5 && !(kind > 2.5 && (kind < 3.5 || kind > 4.5)) && index >= 0 && uint(index) < TextureCount)
+					{
+						vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+						vec3 aboveNormal = above.Normal.w > 0.5 ? normalize(mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, false)) * above.Normal.xyz) : vec3(0.0, 0.0, 1.0);
+						stops = textureLod(sceneTextures[nonuniformEXT(index)], surfaceUV(above, bary, up, aboveNormal), 0.0).a > 0.5;
+					}
+					if (stops)
 						rayQueryConfirmIntersectionEXT(rq);
 				}
 			}
@@ -2490,7 +2537,6 @@ std::string Shaders::Trace()
 			// width where the ray now starts, coneSpread how fast it widens.
 			float pixelSpread = 2.0 * length(CameraUp.xyz) / float(size.y) * exp2(MipBias);
 			float coneWidth = 0.0;
-			float coneSpread = pixelSpread;
 
 			vec3 radiance = vec3(0.0);
 			vec3 throughput = vec3(1.0);
@@ -2498,7 +2544,6 @@ std::string Shaders::Trace()
 			// with a pane and a frame would otherwise use up the ray's budget
 			// before it reached anything solid. Up to sixteen of them; glows
 			// (glowAlong) are not passed one by one and do not count.
-			uint passes = 0u;
 			// How far along the ray to start looking. Generous for a bounce off
 			// a surface, because these levels are big and a surface acne
 			// artefact is worse than a lost millimetre - but none at all when
@@ -2506,7 +2551,20 @@ std::string Shaders::Trace()
 			// flush against it. A laser dot sits on a wall, and stepping a whole
 			// unit past it skipped the wall entirely and put a hole in the level.
 			// The layer just passed is refused by name instead: see passedLayers.
-			float rayMin = RayEpsilon;
+			//
+			// These, and how many layers have been passed in one plane (see
+			// passedLayers), are packed into one word, for AMD's registers:
+			// the passes in bits 0-4, rayMin in 5-6 (RayEpsilon,
+			// LiftedRayMin, none, 0.01), coneSpread in 7-8 (pixelSpread,
+			// 0.1 for a glossy reflection, 0.25 for a bounce) and the layers
+			// in 9-12. Each is only ever one of those few values.
+			uint pathBits = 0u;
+#define PASSES (pathBits & 31u)
+#define PASSED_COUNT ((pathBits >> 9u) & 15u)
+#define RAY_MIN (((pathBits >> 5u) & 3u) == 0u ? RayEpsilon : ((pathBits >> 5u) & 3u) == 1u ? LiftedRayMin : ((pathBits >> 5u) & 3u) == 2u ? 0.0 : 0.01)
+#define CONE_SPREAD (((pathBits >> 7u) & 3u) == 0u ? pixelSpread : ((pathBits >> 7u) & 3u) == 1u ? 0.1 : 0.25)
+#define SET_RAY_MIN(code) pathBits = (pathBits & ~(3u << 5u)) | ((code) << 5u)
+#define SET_CONE_SPREAD(code) pathBits = (pathBits & ~(3u << 7u)) | ((code) << 7u)
 
 			// What this pixel is looking at, recorded on the first bounce so the
 			// accumulated history can be checked against it: in the record,
@@ -2584,9 +2642,9 @@ std::string Shaders::Trace()
 					direction = recordData[recordAt(RecordSpecularDirection)].xyz;
 					// A mirror keeps the view's cone; a glossy reflection spreads.
 					coneWidth = recordData[recordAt(RecordObject)].w;
-					coneSpread = pendingGloss ? 0.1 : pixelSpread;
-					rayMin = LiftedRayMin;
-					passes = 0u;
+					SET_CONE_SPREAD(pendingGloss ? 1u : 0u);
+					SET_RAY_MIN(1u);
+					pathBits &= ~31u;
 					recordData[recordAt(RecordReflectionNormal)].w = 0.0;
 					wantHitDistance = true;
 				}
@@ -2601,7 +2659,7 @@ std::string Shaders::Trace()
 				// above bit 20: half the registers of a pair, through the
 				// whole path.
 				uint passedLayers[MaxPassedLayers];
-				uint passedCount = 0u;
+				pathBits &= ~(15u << 9u);
 				bool passingThrough = false;
 	)";
 
@@ -2612,7 +2670,7 @@ std::string Shaders::Trace()
 				for (uint bounce = uint(lobePass); bounce < ((lobePass == 1 && pendingGloss) ? min(bounces, 1u + GlossBounces) : bounces); bounce++)
 				{
 					if (!passingThrough)
-						passedCount = 0u;
+						pathBits &= ~(15u << 9u);
 					passingThrough = false;
 					rayQueryEXT rq;
 					// The view's own ray until it first bounces: passing through
@@ -2621,7 +2679,7 @@ std::string Shaders::Trace()
 					// (Disable bit 32768): it sees the player, and neither
 					// the weapon at the player's eyes nor its own camera.
 					uint cullMask = (lobePass == 0 && bounce == 0u) ? ((Disable & 32768u) != 0u ? WindowRays : ViewRays) : BouncedRays;
-					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, cullMask, origin, rayMin, direction, 100000.0);
+					rayQueryInitializeEXT(rq, topLevel, (Disable & 8u) != 0u ? gl_RayFlagsOpaqueEXT : gl_RayFlagsNoneEXT, cullMask, origin, RAY_MIN, direction, 100000.0);
 					// Glows are never stopped at: those before the next thing
 					// the ray does stop at are summed afterwards (glowAlong).
 					bool glowsMet = false;
@@ -2641,7 +2699,7 @@ std::string Shaders::Trace()
 							uint candidateKey = (uint(candidate.x) << 20) | (uint(candidate.y) & 0xFFFFFu);
 							bool passed = false;
 							for (uint p = 0u; p < MaxPassedLayers; p++)
-								passed = passed || (p < passedCount && passedLayers[p] == candidateKey);
+								passed = passed || (p < PASSED_COUNT && passedLayers[p] == candidateKey);
 							if (!passed && confirmCandidate(
 									rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
 									candidate.y,
@@ -2655,7 +2713,7 @@ std::string Shaders::Trace()
 					{
 						bool glowChanged = false;
 						float reach = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 100000.0 : rayQueryGetIntersectionTEXT(rq, true);
-						radiance += throughput * glowAlong(origin, direction, rayMin, reach, cullMask, coneWidth, coneSpread, bounce > uint(lobePass), glowChanged);
+						radiance += throughput * glowAlong(origin, direction, RAY_MIN, reach, cullMask, coneWidth, CONE_SPREAD, bounce > uint(lobePass), glowChanged);
 						// The pixel records what lies behind them as what it
 						// sees, so one arriving would otherwise fade in.
 						if (bounce == 0u && glowChanged)
@@ -2678,7 +2736,7 @@ std::string Shaders::Trace()
 					float t = rayQueryGetIntersectionTEXT(rq, true);
 					// The footprint's width here, which is where the ray carries
 					// on from, through glass or off a bounce.
-					float hitWidth = coneWidth + coneSpread * t;
+					float hitWidth = coneWidth + CONE_SPREAD * t;
 					coneWidth = hitWidth;
 					// How far the first ray off the surface went, which a denoiser
 					// uses to judge how widely that light can be blurred.
@@ -2780,16 +2838,16 @@ std::string Shaders::Trace()
 							glowWeights = 0.0;
 							origin = SkyOrigin.xyz;
 							direction = skyAxes[0].xyz * direction.x + skyAxes[1].xyz * direction.y + skyAxes[2].xyz * direction.z;
-							rayMin = RayEpsilon;
+							SET_RAY_MIN(0u);
 							// The eye is at the sky zone's viewpoint now, so the
 							// cone starts again from a point there. Carried on from
 							// the window, however far off that was, it reached the
 							// skybox - a small room close by - as wide as the
 							// window's distance made it, and blurred the skyline.
 							coneWidth = 0.0;
-							if (passes < 16u)
+							if (PASSES < 16u)
 							{
-								passes++;
+								pathBits++;
 								bounce--;
 							}
 							continue;
@@ -2874,17 +2932,20 @@ std::string Shaders::Trace()
 						// in one plane - blood on blood - the ray steps on past
 						// it rather than meet the ninth over and over.
 						if (t > 0.05)
-							passedCount = 0u;
+							pathBits &= ~(15u << 9u);
 						origin = position;
-						rayMin = 0.0;
-						if (passedCount < MaxPassedLayers)
-							passedLayers[passedCount++] = (uint(rayQueryGetIntersectionInstanceIdEXT(rq, true)) << 20) | (uint(primitive) & 0xFFFFFu);
-						else
-							rayMin = 0.01;
-						passingThrough = true;
-						if (passes < 16u)
+						SET_RAY_MIN(2u);
+						if (PASSED_COUNT < MaxPassedLayers)
 						{
-							passes++;
+							passedLayers[PASSED_COUNT] = (uint(rayQueryGetIntersectionInstanceIdEXT(rq, true)) << 20) | (uint(primitive) & 0xFFFFFu);
+							pathBits += 1u << 9u;
+						}
+						else
+							SET_RAY_MIN(3u);
+						passingThrough = true;
+						if (PASSES < 16u)
+						{
+							pathBits++;
 							bounce--;
 						}
 						continue;
@@ -2920,7 +2981,16 @@ std::string Shaders::Trace()
 					vec2 wetness = vec2(0.0);
 					if (firstSurface && lobePass == 0 && Wetness > 0.0)
 					{
+						// The path's light and throughput wait in the record
+						// while the rain's ray is traced - two places this
+						// surface's capture fills below - rather than in
+						// registers: the ray was the trace's tightest point on
+						// AMD's GPUs.
+						recordData[recordAt(RecordDiffuseRadiance)].xyz = radiance;
+						recordData[recordAt(RecordReflectionThroughput)].xyz = throughput;
 						wet = wetnessAt(attr, position, normal);
+						radiance = recordData[recordAt(RecordDiffuseRadiance)].xyz;
+						throughput = recordData[recordAt(RecordReflectionThroughput)].xyz;
 						if (wet > 0.0)
 							wetness = wetPatches(position, normal, wet);
 					}
@@ -3034,7 +3104,7 @@ std::string Shaders::Trace()
 						// reflection by that made it invisible.
 						throughput *= mirrorTint;
 						origin = lifted + faceNormal * RayEpsilon;
-						rayMin = LiftedRayMin;
+						SET_RAY_MIN(1u);
 						direction = aboveFace(reflect(direction, normal), faceNormal);
 						glowWeights = 0.0;
 						continue;
@@ -3167,6 +3237,17 @@ std::string Shaders::Trace()
 						float matteWeight = luminance(diffuseColour);
 						pShine = matteWeight <= 0.0 ? 1.0 : clamp(shineWeight / max(shineWeight + matteWeight, 1.0e-4), 0.05, 0.95);
 					}
+					// The highlight, worked out before glowLight's shadow ray
+					// so that the light's and the flashlight's directions and
+					// brightness are not held through it, where AMD's
+					// registers are tightest; added in after, as before.
+					vec3 shine = vec3(0.0);
+					if (material.glossy)
+					{
+						shine = lightBase * glossyLight(material, f0, normal, toEye, lightDirection);
+						if (flashLit)
+							shine += flashBase * glossyLight(material, f0, normal, toEye, flashDir);
+					}
 					// Only on the first two surfaces a path meets: past them
 					// what a glowing surface gives is faint, and the bounces
 					// alone find it well enough.
@@ -3180,9 +3261,6 @@ std::string Shaders::Trace()
 					// glossy: one seen in a mirror is matte.
 					if (material.glossy)
 					{
-						vec3 shine = lightBase * glossyLight(material, f0, normal, toEye, lightDirection);
-						if (flashLit)
-							shine += flashBase * glossyLight(material, f0, normal, toEye, flashDir);
 						if (glossCapture)
 							glossEmission += shine / max(shineAlbedo, vec3(1.0e-4));
 						else
@@ -3258,14 +3336,14 @@ std::string Shaders::Trace()
 					}
 
 					origin = lifted + faceNormal * RayEpsilon;
-					rayMin = LiftedRayMin;
+					SET_RAY_MIN(1u);
 					if (!glossyBounce)
 						direction = cosineDirection(normal);
 					direction = aboveFace(direction, faceNormal);
 					// Light bounced off a surface is gathered from all over, and
 					// the fine detail where it lands next hardly shows in it: a
 					// wide cone, and coarse mips that are quicker to read.
-					coneSpread = 0.25;
+					SET_CONE_SPREAD(2u);
 				}
 			}
 
