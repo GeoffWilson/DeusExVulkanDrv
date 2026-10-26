@@ -404,25 +404,31 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("Exposure"), RF_Public) UByteProperty(CPP_PROPERTY(Exposure), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("SkyIntensity"), RF_Public) UByteProperty(CPP_PROPERTY(SkyIntensity), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("MaxAccumulatedFrames"), RF_Public) UIntProperty(CPP_PROPERTY(MaxAccumulatedFrames), TEXT("Display"), CPF_Config);
+	// No two bool properties registered one after the other. The engine
+	// packs a run of them into the first one's word, each a bit further on,
+	// as it does for a script's bools, though these are C++ fields of their
+	// own: the ini and SET then reach only that bit, and a field the
+	// constructor had set to 1 could not be turned off. Denoise and UseVSync,
+	// in a run of five, never could be.
 	new(GetClass(), TEXT("VkDeviceIndex"), RF_Public) UIntProperty(CPP_PROPERTY(VkDeviceIndex), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VkDebug"), RF_Public) UBoolProperty(CPP_PROPERTY(VkDebug), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DebugMode"), RF_Public) UIntProperty(CPP_PROPERTY(DebugMode), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("LightScale"), RF_Public) UIntProperty(CPP_PROPERTY(LightScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("LightScale"), RF_Public) UIntProperty(CPP_PROPERTY(LightScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LogTimings"), RF_Public) UBoolProperty(CPP_PROPERTY(LogTimings), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("Denoise"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDenoiser), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("WidescreenFOV"), RF_Public) UBoolProperty(CPP_PROPERTY(UseWidescreenFOV), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("PinnedUI"), RF_Public) UFloatProperty(CPP_PROPERTY(PinnedUI), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("Denoise"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDenoiser), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LightSize"), RF_Public) UIntProperty(CPP_PROPERTY(LightSize), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("Materials"), RF_Public) UBoolProperty(CPP_PROPERTY(UseMaterials), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("MaxAnisotropy"), RF_Public) UFloatProperty(CPP_PROPERTY(MaxAnisotropy), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("WidescreenFOV"), RF_Public) UBoolProperty(CPP_PROPERTY(UseWidescreenFOV), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseS3TC"), RF_Public) UBoolProperty(CPP_PROPERTY(UseS3TC), TEXT("Display"), CPF_Config);
 	UEnum* lightings = new(GetClass(), TEXT("Lightings"))UEnum(nullptr);
 	new(lightings->Names)FName(TEXT("Linear"));
 	new(lightings->Names)FName(TEXT("Engine"));
 	new(GetClass(), TEXT("Lighting"), RF_Public) UByteProperty(CPP_PROPERTY(Lighting), TEXT("Display"), CPF_Config, lightings);
 	new(GetClass(), TEXT("NeutralToneMap"), RF_Public) UBoolProperty(CPP_PROPERTY(NeutralToneMap), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("GlossBounces"), RF_Public) UIntProperty(CPP_PROPERTY(GlossBounces), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FPSLimit"), RF_Public) UIntProperty(CPP_PROPERTY(FPSLimit), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSS"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDLSS), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("DLSSQuality"), RF_Public) UIntProperty(CPP_PROPERTY(DLSSQuality), TEXT("Display"), CPF_Config);
