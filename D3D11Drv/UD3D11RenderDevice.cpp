@@ -102,12 +102,8 @@ void UD3D11RenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("UseLightmapAtlas"), RF_Public) UBoolProperty(CPP_PROPERTY(UseLightmapAtlas), TEXT("Display"), CPF_Config);
 #endif
 
-	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("UsePrecache"), RF_Public) UBoolProperty(CPP_PROPERTY(UsePrecache), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("GammaCorrectScreenshots"), RF_Public) UBoolProperty(CPP_PROPERTY(GammaCorrectScreenshots), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("UseDebugLayer"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDebugLayer), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("UseVR"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVR), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRWorldScale"), RF_Public) UFloatProperty(CPP_PROPERTY(VRWorldScale), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("UseVR"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVR), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRHudDepth"), RF_Public) UFloatProperty(CPP_PROPERTY(VRHudDepth), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRHudDepthBottom"), RF_Public) UFloatProperty(CPP_PROPERTY(VRHudDepthBottom), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRHudBottomY"), RF_Public) UFloatProperty(CPP_PROPERTY(VRHudBottomY), TEXT("Display"), CPF_Config);
@@ -122,13 +118,21 @@ void UD3D11RenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("VRWeaponIPDScale"), RF_Public) UFloatProperty(CPP_PROPERTY(VRWeaponIPDScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRBrightnessScale"), RF_Public) UFloatProperty(CPP_PROPERTY(VRBrightnessScale), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRBrightnessOffset"), RF_Public) UFloatProperty(CPP_PROPERTY(VRBrightnessOffset), TEXT("Display"), CPF_Config);
-	new(GetClass(), TEXT("VRMirrorMode"), RF_Public) UByteProperty(CPP_PROPERTY(VRMirrorMode), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRScaleHudMeshes"), RF_Public) UBoolProperty(CPP_PROPERTY(VRScaleHudMeshes), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("VRMirrorMode"), RF_Public) UByteProperty(CPP_PROPERTY(VRMirrorMode), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("VRSBSHalf"), RF_Public) UBoolProperty(CPP_PROPERTY(VRSBSHalf), TEXT("Display"), CPF_Config);
+	// No two bool properties registered one after the other: Deus Ex's
+	// engine packs a run of them into one word, a bit each, though each is a
+	// field of its own, and a field set to 1 above could then never be
+	// turned off from the ini (UseVSync and UsePrecache could not).
 	new(GetClass(), TEXT("GammaOffset"), RF_Public) UFloatProperty(CPP_PROPERTY(GammaOffset), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("UseVSync"), RF_Public) UBoolProperty(CPP_PROPERTY(UseVSync), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GammaOffsetRed"), RF_Public) UFloatProperty(CPP_PROPERTY(GammaOffsetRed), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("UsePrecache"), RF_Public) UBoolProperty(CPP_PROPERTY(UsePrecache), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GammaOffsetGreen"), RF_Public) UFloatProperty(CPP_PROPERTY(GammaOffsetGreen), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("GammaCorrectScreenshots"), RF_Public) UBoolProperty(CPP_PROPERTY(GammaCorrectScreenshots), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("GammaOffsetBlue"), RF_Public) UFloatProperty(CPP_PROPERTY(GammaOffsetBlue), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("UseDebugLayer"), RF_Public) UBoolProperty(CPP_PROPERTY(UseDebugLayer), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LinearBrightness"), RF_Public) UByteProperty(CPP_PROPERTY(LinearBrightness), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Contrast"), RF_Public) UByteProperty(CPP_PROPERTY(Contrast), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Saturation"), RF_Public) UByteProperty(CPP_PROPERTY(Saturation), TEXT("Display"), CPF_Config);
@@ -138,8 +142,8 @@ void UD3D11RenderDevice::StaticConstructor()
 #if !defined(OLDUNREAL469SDK)
 	new(GetClass(), TEXT("OccludeLines"), RF_Public) UBoolProperty(CPP_PROPERTY(OccludeLines), TEXT("Display"), CPF_Config);
 #endif
-	new(GetClass(), TEXT("Bloom"), RF_Public) UBoolProperty(CPP_PROPERTY(Bloom), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("BloomAmount"), RF_Public) UByteProperty(CPP_PROPERTY(BloomAmount), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("Bloom"), RF_Public) UBoolProperty(CPP_PROPERTY(Bloom), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("LODBias"), RF_Public) UFloatProperty(CPP_PROPERTY(LODBias), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("RefreshRate"), RF_Public) UIntProperty(CPP_PROPERTY(RefreshRate), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("UseExclusiveFullscreen"), RF_Public) UBoolProperty(CPP_PROPERTY(UseExclusiveFullscreen), TEXT("Display"), CPF_Config);
