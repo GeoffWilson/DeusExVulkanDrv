@@ -109,4 +109,24 @@ if [ -n "$DEV" ]; then
 	done
 fi
 
+# The path tracer's settings in the game's own Settings menu, when
+# build-ptmenu.sh has built them: the package, and the root window that adds
+# them named in the ini. Only the game's own root is replaced; a mod's is left
+# for its owner. The ini must not name the package once it is gone: the game
+# will not start without its root window.
+if [ -f "$BUILD_DIR/PathTracerMenu.u" ]; then
+	cp "$BUILD_DIR/PathTracerMenu.u" "$SYSTEM_DIR/"
+	if [ "$(md5sum < "$BUILD_DIR/PathTracerMenu.u")" != "$(md5sum < "$SYSTEM_DIR/PathTracerMenu.u")" ]; then
+		echo "Deploy of PathTracerMenu.u did not land in $SYSTEM_DIR" >&2
+		exit 1
+	fi
+	installed+=("PathTracerMenu")
+	for f in "${INIS[@]}"; do
+		sed -i "s|^Root=DeusEx.DeusExRootWindow\\($CR\\?\\)\$|Root=PathTracerMenu.PTRootWindow\\1|" "$f"
+		grep -q "^Root=PathTracerMenu.PTRootWindow" "$f" \
+			&& echo "$(basename "$f"): Root=PathTracerMenu.PTRootWindow" \
+			|| echo "$(basename "$f"): Root left as $(grep -m1 '^Root=' "$f" | tr -d "$CR"), not the game's own: no Path Tracer menu" >&2
+	done
+fi
+
 echo "Installed ${installed[*]} into $SYSTEM_DIR (original ini kept as DeusEx.ini.prevulkan)"

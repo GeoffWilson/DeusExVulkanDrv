@@ -482,6 +482,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	HeadsetNow = UseHeadset != 0;
 	HeadsetShowHudNow = HeadsetShowHud != 0;
 	DisableBits = (DisableBits & ~ConfiguredMask) | ConfiguredBits();
+	AppliedConfig = CurrentConfig();
 
 	// Started afresh once per run: the engine can make a new device mid
 	// session, and what led up to that is the part worth keeping.
@@ -2199,6 +2200,7 @@ void UPathTracerRenderDevice::Lock(FPlane InFlashScale, FPlane InFlashFog, FPlan
 				Textures->Clear();
 		}
 
+		ApplyConfigChanges();
 		CreateSwapChainResources();
 		CheckPhoto();
 		UpdateHeadsetHud();
@@ -3295,6 +3297,78 @@ FString UPathTracerRenderDevice::DescribeHeadset() const
 // What PT DENOISE and PT DLSS have asked for, as the next frame will be
 // denoised: NRD, Ray Reconstruction at a quality, or nothing - and NRD in Ray
 // Reconstruction's place, with the helper's reason, where it cannot run.
+UPathTracerRenderDevice::AppliedConfigState UPathTracerRenderDevice::CurrentConfig() const
+{
+	AppliedConfigState state;
+	state.Denoise = UseDenoiser != 0;
+	state.Dlss = UseDLSS != 0;
+	state.Materials = UseMaterials != 0;
+	state.EngineLighting = Lighting != 0;
+	state.NeutralToneMap = NeutralToneMap != 0;
+	state.DlssQuality = Clamp(DLSSQuality, 0, 4);
+	state.FsrMode = Clamp(FsrMode, 0, 2);
+	state.LightSize = Clamp(LightSize, 0, 255);
+	state.Bits = ConfiguredBits();
+	return state;
+}
+
+// The settings read straight from the ini's fields (Bounces, Exposure, HDR,
+// Wetness, BumpMapping and the rest) need nothing here: SET writes the field
+// itself. These are the ones Init copies, each taken as its PT command takes
+// it. The game's menu sets each of its settings in turn as it closes, so only
+// those that changed are taken, and the denoiser is started again once.
+void UPathTracerRenderDevice::ApplyConfigChanges()
+{
+	const AppliedConfigState now = CurrentConfig();
+	const AppliedConfigState was = AppliedConfig;
+	AppliedConfig = now;
+	bool restart = false;
+	if (now.Denoise != was.Denoise)
+	{
+		DenoiseEnabled = now.Denoise;
+		restart = true;
+	}
+	if (now.Dlss != was.Dlss)
+	{
+		DlssEnabled = now.Dlss;
+		restart = true;
+	}
+	if (now.DlssQuality != was.DlssQuality)
+	{
+		DlssQualityNow = now.DlssQuality;
+		restart = true;
+	}
+	if (now.FsrMode != was.FsrMode)
+	{
+		FsrModeNow = now.FsrMode;
+		restart = true;
+	}
+	if (now.Materials != was.Materials)
+		MaterialsEnabled = now.Materials;
+	if (now.EngineLighting != was.EngineLighting)
+	{
+		EngineLightingNow = now.EngineLighting;
+		restart = true;
+	}
+	if (now.NeutralToneMap != was.NeutralToneMap)
+		NeutralToneMapNow = now.NeutralToneMap;
+	if (now.LightSize != was.LightSize)
+	{
+		LightSizeNow = now.LightSize;
+		restart = true;
+	}
+	const uint32_t changedBits = now.Bits ^ was.Bits;
+	if (changedBits)
+		DisableBits = (DisableBits & ~changedBits) | (now.Bits & changedBits);
+	if (restart)
+		DenoiseRestart = true;
+	if (restart || changedBits || now.Materials != was.Materials)
+	{
+		AccumulatedFrames = 0;
+		PathTracerEvent("ini settings changed in game (Denoise %d, DLSS %d, quality %d, FSR %d): %s", (int)now.Denoise, (int)now.Dlss, now.DlssQuality, now.FsrMode, Narrow(*DescribeDenoiser()).c_str());
+	}
+}
+
 FString UPathTracerRenderDevice::DescribeDenoiser() const
 {
 	static const TCHAR* qualityNames[] = { TEXT("DLAA"), TEXT("quality"), TEXT("balanced"), TEXT("performance"), TEXT("ultra performance") };

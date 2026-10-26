@@ -51,6 +51,21 @@ cmake -S . -B build-x64 -G Ninja \
 cmake --build build-x64 --target PathTracerHelper
 ```
 
+The path tracer's settings in the game's own Settings menu are an UnrealScript
+package, `PathTracerMenu/Classes`, compiled with the Deus Ex SDK's `UCC.exe`
+under wine against the installed game's packages:
+
+```sh
+cmake/build-ptmenu.sh ["/path/to/Deus Ex"]
+```
+
+It writes `build-deusex/PathTracerMenu.u`, which `deploy-deusex.sh` installs,
+naming `PathTracerMenu.PTRootWindow` as the ini's `Root` in place of the
+game's `DeusEx.DeusExRootWindow`. That root window opens a Settings menu with
+a Path Tracer button, shown while the path tracer is the renderer. Put `Root`
+back before removing the package: the game will not start without it.
+`UCC=` points the script at a UCC.exe other than `../ReleaseSDK1112f`'s.
+
 `cmake --build build-deusex --target PathTracerHelperTest` builds a 32-bit
 program that drives the helper with a made up scene, as the device would, and
 writes the frame it gets back to `helper-test.ppm`: a check of the helper and

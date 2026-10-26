@@ -300,6 +300,19 @@ private:
 	// (1048576).
 	static const uint32_t ConfiguredMask = 65536u | 131072u | 1048576u;
 	uint32_t ConfiguredBits() const { return (UseFogShadows ? 0u : 65536u) | (UseFlashlight ? 0u : 131072u) | (UseColouredGlass ? 0u : 1048576u); }
+	// The ini's settings the session takes copies of, as last taken. One set
+	// while the game runs - by the game's menu, which sets them as its own
+	// Display settings are set, with SET - reaches the session at the next
+	// frame (ApplyConfigChanges); a PT command's change to the session
+	// stands until its own setting is set.
+	struct AppliedConfigState
+	{
+		bool Denoise, Dlss, Materials, EngineLighting, NeutralToneMap;
+		int DlssQuality, FsrMode, LightSize;
+		uint32_t Bits;
+	} AppliedConfig = {};
+	AppliedConfigState CurrentConfig() const;
+	void ApplyConfigChanges();
 	// The flashlight as last traced, to notice it moving or going out.
 	vec4 LastFlashlight[3] = {};
 	FString DescribeDenoiser() const;
