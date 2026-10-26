@@ -47,6 +47,13 @@ built device into the Steam install and sets both:
 cmake/deploy-deusex.sh "" pathtracer      # or vulkan, d3d11, d3d12
 ```
 
+PathTracerDrv's settings can also be changed in the game, under Settings, with
+`PathTracerMenu.u` in the `System` folder and, in `[Engine.Engine]`,
+`Root=PathTracerMenu.PTRootWindow` in place of `Root=DeusEx.DeusExRootWindow`
+(see [In the game's menu](#in-the-games-menu)). Put that line back before
+removing the package: the game will not start without the root window it
+names.
+
 ## PathTracerDrv
 
 ### Running it
@@ -595,6 +602,25 @@ follows from that:
 - **A mode narrower than the screen** is traced at that mode and letterboxed,
   pinned or not, with the bars cleared rather than showing the last picture
   shown there. A 4:3 mode costs what a 4:3 mode costs.
+
+### In the game's menu
+
+`PathTracerMenu.u`, an UnrealScript package (`PathTracerMenu/Classes`), adds
+a Path Tracer button to the game's Settings menu, after Sound, while the path
+tracer is the renderer. It opens a screen laid out as the game's Display
+settings: the denoiser (off, NRD or DLSS Ray Reconstruction), DLSS and FSR's
+quality, FSR, bounces, exposure, the flashlight, bump mapping, wet streets
+and HDR. Each is the ini setting of the same name below, set at OK with the
+engine's `SET`, as the Display settings set theirs, and taken by the device
+at its next frame; a `PT` command's change to the session stands until its
+own setting is changed.
+
+It hooks in through the ini's `Root`, the class the game makes its root
+window from: `PathTracerMenu.PTRootWindow` is the game's own with its
+Settings menu swapped for one with the extra button, so nothing of the
+game's is changed. A mod that names its own root window cannot have it as
+well. `cmake/build-ptmenu.sh` compiles it with the SDK's `UCC.exe`, and
+`deploy-deusex.sh` installs it and sets `Root`, if it is the game's own.
 
 ### Settings
 
@@ -1170,8 +1196,8 @@ Recommended in `[VulkanDrv.VulkanRenderDevice]`:
 Raise `RenderScale` until the cost shows rather than turning on MSAA as well:
 the game is bound by its own engine long before the GPU. The scene buffers
 also cost the game address space, of which a 32 bit process has 4 GB at most:
-at 3440x1440 with 4x MSAA, `RenderScale=4` left some 430 MB less free than
-`RenderScale=2`. `VulkanDrvEvents.log` records how much is free at each change
+at 3440x1440 with `AntialiasMode=MSAA_4x` - which gave 2x MSAA before 2.4 -
+`RenderScale=4` left some 430 MB less free than `RenderScale=2`. `VulkanDrvEvents.log` records how much is free at each change
 of buffer size, and any fault or C++ exception with the stack that raised it,
 since the engine's own report of a crash leaves out what went wrong.
 
