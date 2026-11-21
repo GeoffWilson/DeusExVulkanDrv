@@ -610,7 +610,9 @@ a Path Tracer button to the game's Settings menu, after Sound, while the path
 tracer is the renderer. It opens a screen laid out as the game's Display
 settings: the denoiser (off, NRD or DLSS Ray Reconstruction), DLSS and FSR's
 quality, FSR, bounces, exposure, the flashlight, bump mapping, wet streets
-and HDR. Each is the ini setting of the same name below, set at OK with the
+and HDR. FSR's row sets `FSR` and `FSRVersion` together - Off, Fallback,
+Always, and Fallback 3.1 and Always 3.1, which keep to FSR 3.1 - the screen
+having room for nine rows and no more. Each is the ini setting of the same name below, set at OK with the
 engine's `SET`, as the Display settings set theirs, and taken by the device
 at its next frame; a `PT` command's change to the session stands until its
 own setting is changed.
