@@ -171,6 +171,15 @@ fp8 on RDNA 4, subgroup size control), wherever they are offered.
 and `spike/fsr4check` (`cmake --build build-x64 --target fsr4check`) answers
 whether FSR 4 runs on a machine at all, without the helper.
 
+**Packaging a release with FSR 4:** AMD's licence lets the DLLs be
+redistributed only with its notice, so a release must carry
+`amd_fidelityfx_license.md` as well as the two DLLs - put the DLLs in the
+package's `System/`, the licence in `Licenses/` (as
+`AMD-FidelityFX-FSR4-LICENSE.md`), and name it in README.txt's LICENCES
+section. It is not the same licence as `FidelityFX-LICENSE.txt`, the MIT one
+for the FSR 3.1 built into the helper, which stays as well. The licence also
+forbids reverse engineering the DLLs.
+
 ### DLSS Ray Reconstruction
 
 The helper can also denoise with NVIDIA's DLSS Ray Reconstruction, when the
