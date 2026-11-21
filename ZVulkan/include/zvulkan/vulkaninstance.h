@@ -15,6 +15,19 @@
 #undef max
 #endif
 
+// VK_EXT_shader_float8 (RDNA4's FP8, for FSR 4) is newer than these headers.
+#ifndef VK_EXT_shader_float8
+#define VK_EXT_shader_float8 1
+#define VK_EXT_SHADER_FLOAT8_EXTENSION_NAME "VK_EXT_shader_float8"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT ((VkStructureType)1000567000)
+typedef struct VkPhysicalDeviceShaderFloat8FeaturesEXT {
+	VkStructureType sType;
+	void* pNext;
+	VkBool32 shaderFloat8;
+	VkBool32 shaderFloat8CooperativeMatrix;
+} VkPhysicalDeviceShaderFloat8FeaturesEXT;
+#endif
+
 #include <functional>
 #include <memory>
 #include <string>
@@ -32,6 +45,17 @@ public:
 	VkPhysicalDeviceDescriptorIndexingFeatures DescriptorIndexing = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT };
 	VkPhysicalDevicePresentIdFeaturesKHR PresentId = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
 	VkPhysicalDevicePresentWaitFeaturesKHR PresentWait = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
+	// What machine-learned upscalers' shaders use (AMD's FSR 4): each is
+	// chained only when its extension is enabled.
+	VkPhysicalDeviceShaderFloat16Int8Features ShaderFloat16Int8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES };
+	VkPhysicalDevice16BitStorageFeatures Storage16Bit = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
+	VkPhysicalDevice8BitStorageFeatures Storage8Bit = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES };
+	VkPhysicalDeviceVulkanMemoryModelFeatures MemoryModel = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES };
+	VkPhysicalDeviceSubgroupSizeControlFeatures SubgroupSizeControl = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES };
+	VkPhysicalDeviceShaderIntegerDotProductFeatures IntegerDotProduct = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES };
+	VkPhysicalDeviceSynchronization2Features Synchronization2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES };
+	VkPhysicalDeviceCooperativeMatrixFeaturesKHR CooperativeMatrix = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+	VkPhysicalDeviceShaderFloat8FeaturesEXT ShaderFloat8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT };
 };
 
 class VulkanDeviceProperties

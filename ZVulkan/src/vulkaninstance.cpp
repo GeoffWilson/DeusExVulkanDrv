@@ -308,6 +308,22 @@ std::vector<VulkanPhysicalDevice> VulkanInstance::GetPhysicalDevices(VkInstance 
 				*next = &dev.Features.PresentWait;
 				next = &dev.Features.PresentWait.pNext;
 			}
+#define ZVULKAN_QUERY_FEATURES(extension, member) \
+			if (checkForExtension(extension)) \
+			{ \
+				*next = &dev.Features.member; \
+				next = &dev.Features.member.pNext; \
+			}
+			ZVULKAN_QUERY_FEATURES(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, ShaderFloat16Int8)
+			ZVULKAN_QUERY_FEATURES(VK_KHR_16BIT_STORAGE_EXTENSION_NAME, Storage16Bit)
+			ZVULKAN_QUERY_FEATURES(VK_KHR_8BIT_STORAGE_EXTENSION_NAME, Storage8Bit)
+			ZVULKAN_QUERY_FEATURES(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, MemoryModel)
+			ZVULKAN_QUERY_FEATURES(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, SubgroupSizeControl)
+			ZVULKAN_QUERY_FEATURES(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, IntegerDotProduct)
+			ZVULKAN_QUERY_FEATURES(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, Synchronization2)
+			ZVULKAN_QUERY_FEATURES(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, CooperativeMatrix)
+			ZVULKAN_QUERY_FEATURES(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME, ShaderFloat8)
+#undef ZVULKAN_QUERY_FEATURES
 
 			vkGetPhysicalDeviceFeatures2(dev.Device, &deviceFeatures2);
 			dev.Features.Features = deviceFeatures2.features;
@@ -317,6 +333,15 @@ std::vector<VulkanPhysicalDevice> VulkanInstance::GetPhysicalDevices(VkInstance 
 			dev.Features.DescriptorIndexing.pNext = nullptr;
 			dev.Features.PresentId.pNext = nullptr;
 			dev.Features.PresentWait.pNext = nullptr;
+			dev.Features.ShaderFloat16Int8.pNext = nullptr;
+			dev.Features.Storage16Bit.pNext = nullptr;
+			dev.Features.Storage8Bit.pNext = nullptr;
+			dev.Features.MemoryModel.pNext = nullptr;
+			dev.Features.SubgroupSizeControl.pNext = nullptr;
+			dev.Features.IntegerDotProduct.pNext = nullptr;
+			dev.Features.Synchronization2.pNext = nullptr;
+			dev.Features.CooperativeMatrix.pNext = nullptr;
+			dev.Features.ShaderFloat8.pNext = nullptr;
 		}
 		else
 		{

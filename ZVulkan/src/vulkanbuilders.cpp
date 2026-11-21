@@ -1817,6 +1817,19 @@ std::vector<VulkanCompatibleDevice> VulkanDeviceBuilder::FindDevices(const std::
 		enabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing = deviceFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing;
 		enabledFeatures.PresentId.presentId = deviceFeatures.PresentId.presentId;
 		enabledFeatures.PresentWait.presentWait = deviceFeatures.PresentWait.presentWait;
+		// What machine-learned upscalers ask of the device (FSR 4): all of each
+		// that it has, used only where the extension was asked for.
+		enabledFeatures.Features.shaderInt16 = deviceFeatures.Features.shaderInt16;
+		enabledFeatures.Features.shaderInt64 = deviceFeatures.Features.shaderInt64;
+		enabledFeatures.ShaderFloat16Int8 = deviceFeatures.ShaderFloat16Int8;
+		enabledFeatures.Storage16Bit = deviceFeatures.Storage16Bit;
+		enabledFeatures.Storage8Bit = deviceFeatures.Storage8Bit;
+		enabledFeatures.MemoryModel = deviceFeatures.MemoryModel;
+		enabledFeatures.SubgroupSizeControl = deviceFeatures.SubgroupSizeControl;
+		enabledFeatures.IntegerDotProduct = deviceFeatures.IntegerDotProduct;
+		enabledFeatures.Synchronization2 = deviceFeatures.Synchronization2;
+		enabledFeatures.CooperativeMatrix = deviceFeatures.CooperativeMatrix;
+		enabledFeatures.ShaderFloat8 = deviceFeatures.ShaderFloat8;
 
 		// Figure out which queue can present
 		if (surface)

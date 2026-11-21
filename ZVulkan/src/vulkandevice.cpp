@@ -147,6 +147,22 @@ void VulkanDevice::CreateDevice()
 		*next = &EnabledFeatures.PresentWait;
 		next = &EnabledFeatures.PresentWait.pNext;
 	}
+#define ZVULKAN_ENABLE_FEATURES(extension, member) \
+	if (SupportsExtension(extension)) \
+	{ \
+		*next = &EnabledFeatures.member; \
+		next = &EnabledFeatures.member.pNext; \
+	}
+	ZVULKAN_ENABLE_FEATURES(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, ShaderFloat16Int8)
+	ZVULKAN_ENABLE_FEATURES(VK_KHR_16BIT_STORAGE_EXTENSION_NAME, Storage16Bit)
+	ZVULKAN_ENABLE_FEATURES(VK_KHR_8BIT_STORAGE_EXTENSION_NAME, Storage8Bit)
+	ZVULKAN_ENABLE_FEATURES(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, MemoryModel)
+	ZVULKAN_ENABLE_FEATURES(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, SubgroupSizeControl)
+	ZVULKAN_ENABLE_FEATURES(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, IntegerDotProduct)
+	ZVULKAN_ENABLE_FEATURES(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, Synchronization2)
+	ZVULKAN_ENABLE_FEATURES(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, CooperativeMatrix)
+	ZVULKAN_ENABLE_FEATURES(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME, ShaderFloat8)
+#undef ZVULKAN_ENABLE_FEATURES
 
 	VkResult result = vkCreateDevice(PhysicalDevice.Device, &deviceCreateInfo, nullptr, &device);
 	CheckVulkanError(result, "Could not create vulkan device");
