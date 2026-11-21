@@ -133,6 +133,16 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND EXISTS "${PATHTRACER_FSR_DIR}/generated/ffx_f
 	target_compile_definitions(ffx_fsr3upscaler PRIVATE FFX_FSR3UPSCALER _UNICODE UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 	target_compile_options(ffx_fsr3upscaler PRIVATE /MT /EHsc /FIvolk/volk.h -Wno-everything)
 endif()
+# AMD's FSR 4, when cmake/fetch-fsr4.sh has fetched FidelityFX SDK v2.4.0:
+# signed DLLs, loaded at run time from beside the program in place of FSR 3.1
+# wherever they offer FSR 4 for the GPU, so only with FSR 3.1 to fall back on.
+set(PATHTRACER_FSR4_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.fsr4" CACHE PATH "Output of cmake/fetch-fsr4.sh")
+set(PATHTRACER_FSR4_BIN "${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/signedbin")
+set(PATHTRACER_FSR4 OFF)
+if(PATHTRACER_FSR AND EXISTS "${PATHTRACER_FSR4_BIN}/amd_fidelityfx_loader_vk.dll")
+	set(PATHTRACER_FSR4 ON)
+endif()
+
 set(PATHTRACERDRV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/PathTracerDrv")
 
 # The tracing: everything that turns the scene into a picture on the GPU, and
@@ -143,6 +153,7 @@ set(PATHTRACER_TRACE_SOURCES
 	"${PATHTRACERDRV_DIR}/Denoiser.cpp"
 	"${PATHTRACERDRV_DIR}/FrameUploads.cpp"
 	"${PATHTRACERDRV_DIR}/FsrUpscaler.cpp"
+	"${PATHTRACERDRV_DIR}/Fsr4Upscaler.cpp"
 	"${PATHTRACERDRV_DIR}/RayReconstruction.cpp"
 	"${PATHTRACERDRV_DIR}/TraceHost.cpp"
 	"${PATHTRACERDRV_DIR}/TraceRenderer.cpp")
@@ -173,6 +184,23 @@ function(link_trace_libraries target)
 		target_link_libraries(${target} PRIVATE ffx_fsr3upscaler)
 	else()
 		message(STATUS "${target}: no FSR at ${PATHTRACER_FSR_DIR}/generated, building without it")
+	endif()
+	if(PATHTRACER_FSR4)
+		message(STATUS "${target}: FSR 4 from ${PATHTRACER_FSR4_DIR}")
+		target_compile_definitions(${target} PRIVATE PATHTRACER_FSR4)
+		set_source_files_properties("${PATHTRACERDRV_DIR}/Fsr4Upscaler.cpp" PROPERTIES
+			INCLUDE_DIRECTORIES "${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/api/include;${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/upscalers/include"
+			COMPILE_DEFINITIONS "_WINDOWS")
+		add_custom_command(TARGET ${target} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${PATHTRACER_FSR4_BIN}/amd_fidelityfx_loader_vk.dll"
+				"${PATHTRACER_FSR4_BIN}/amd_fidelityfx_upscaler_vk.dll"
+				"$<TARGET_FILE_DIR:${target}>"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/docs/license.md"
+				"$<TARGET_FILE_DIR:${target}>/amd_fidelityfx_license.md")
+	else()
+		message(STATUS "${target}: no FSR 4 at ${PATHTRACER_FSR4_BIN}, building without it")
 	endif()
 endfunction()
 
@@ -520,6 +548,24 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
 	set_target_properties(vkxshare PROPERTIES OUTPUT_NAME "vkxshare64")
 else()
 	set_target_properties(vkxshare PROPERTIES OUTPUT_NAME "vkxshare")
+endif()
+
+# Can the path tracer's 64-bit helper run AMD's FSR 4? 64-bit only, as its
+# DLLs are, and only once cmake/fetch-fsr4.sh has fetched them; they are copied
+# beside it.
+#   cmake --build build-x64 --target fsr4check
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND EXISTS "${PATHTRACER_FSR4_BIN}/amd_fidelityfx_loader_vk.dll")
+	add_executable(fsr4check EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/spike/fsr4check.cpp")
+	target_include_directories(fsr4check PRIVATE "${ZVULKAN_DIR}/include"
+		"${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/api/include"
+		"${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/upscalers/include")
+	target_compile_definitions(fsr4check PRIVATE _WINDOWS NOMINMAX)
+	target_compile_options(fsr4check PRIVATE /MT /EHsc)
+	add_custom_command(TARGET fsr4check POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_vk.dll"
+			"${PATHTRACER_FSR4_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll"
+			"$<TARGET_FILE_DIR:fsr4check>")
 endif()
 
 # Can the path tracer's 64-bit helper run DLSS Ray Reconstruction? 64-bit only,

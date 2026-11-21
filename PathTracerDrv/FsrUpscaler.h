@@ -4,10 +4,12 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 class VulkanDevice;
 class VulkanCommandBuffer;
 class VulkanImage;
+class Fsr4Upscaler;
 
 // AMD's FSR 3.1 upscaler, from FidelityFX SDK v1.1.4 (cmake/fetch-fsr.sh):
 // for a GPU Ray Reconstruction cannot run on, the trace and NRD run at a
@@ -21,14 +23,29 @@ class VulkanImage;
 //
 // Built only when the SDK has been fetched and its shaders compiled; otherwise
 // Available() says so.
+//
+// Wherever AMD's DLLs offer FSR 4 for the GPU (Fsr4Upscaler: RDNA 2 or
+// later, the DLLs beside the program) it hands the frames to FSR 4 instead,
+// unless Prefer(3) has asked for 3.1. dllDir is where to look for them.
 class FsrUpscaler
 {
 public:
-	explicit FsrUpscaler(VulkanDevice* device);
+	FsrUpscaler(VulkanDevice* device, const std::wstring& dllDir);
 	~FsrUpscaler();
 
-	bool Available() const { return Ready; }
+	bool Available() const;
 	const char* Status() const { return StatusText.c_str(); }
+
+	// The device extensions FSR 4 needs, to ask for wherever offered when the
+	// device is made.
+	static void RequiredExtensions(std::vector<std::string>& device);
+
+	// 4 for FSR 4 wherever it runs, 3 for FSR 3.1 always: the device's
+	// FSRVersion. Taking effect makes each view's context again, so
+	// NeedsContext says so.
+	void Prefer(int version) { Wanted = version; }
+	// What upscales now: 4 or 3, 0 for neither.
+	int Version() const;
 
 	// Qualities as the device's DLSSQuality setting numbers them, which FSR's
 	// own follow: 0 native (antialiasing alone), 1 quality (1.5x a side), 2
@@ -73,10 +90,14 @@ public:
 	struct Impl;
 
 private:
+	// FSR 3.1's context for a view.
 	void ReleaseContext(int view);
 
 	VulkanDevice* Device = nullptr;
 	std::unique_ptr<Impl> I;
+	std::unique_ptr<Fsr4Upscaler> Fsr4;
+	int Wanted = 4;
+	int ViewVersion[MaxViews] = {};
 	bool Ready = false;
 	std::string StatusText = "not started";
 	bool LoggedFailure = false;

@@ -2,6 +2,7 @@
 #include "TraceProtocol.h"
 #include "TraceHost.h"
 #include "RayReconstruction.h"
+#include "FsrUpscaler.h"
 #include "HeadsetOutput.h"
 #include <cstdarg>
 #include <numeric>
@@ -235,6 +236,11 @@ void Helper::CreateDevice(const std::string& uuid, bool vkDebug)
 	builder.RequireExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
 	builder.RequireExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
 	for (const std::string& name : ngxDevice)
+		builder.OptionalExtension(name);
+	// FSR 4's likewise, wherever offered.
+	std::vector<std::string> fsrDevice;
+	FsrUpscaler::RequiredExtensions(fsrDevice);
+	for (const std::string& name : fsrDevice)
 		builder.OptionalExtension(name);
 	for (const std::string& name : HeadsetDeviceExtensions)
 	{

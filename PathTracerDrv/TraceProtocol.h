@@ -35,7 +35,7 @@
 namespace TraceProtocol
 {
 	static const uint32_t Magic = 0x31485450;   // "PTH1"
-	static const uint32_t Version = 23;
+	static const uint32_t Version = 24;
 
 	// TraceCommand::Denoise.
 	enum DenoiserChoice : uint32_t
@@ -47,6 +47,8 @@ namespace TraceProtocol
 		// Reported only (Header's DenoisedWith): NRD at the render size, and
 		// FSR 3.1 bringing the picture up to the output's.
 		DenoiseNrdFsr = 3,
+		// The same, with FSR 4 (TraceCommand::UpscalerVersion).
+		DenoiseNrdFsr4 = 4,
 	};
 
 	// TraceCommand::Upscaler: whether NRD's picture is traced at a fraction
@@ -361,6 +363,8 @@ namespace TraceProtocol
 		uint32_t DlssQuality;       // 0 DLAA, 1 quality, 2 balanced, 3 performance, 4 ultra performance
 		uint32_t Upscaler;          // an UpscalerChoice
 		float UpscaleSharpness;     // FSR's sharpening, 0 none to 1
+		uint32_t UpscalerVersion;   // 4: FSR 4 wherever AMD's DLLs offer it for the GPU, 3: FSR 3.1 always
+		uint32_t UpscalerPad;       // keeps the command a multiple of 8 bytes
 		uint32_t LightSize;         // radius shadows are cast from around each light, in world units; 0 a point
 		uint32_t MaxAnisotropy;     // most samples the texture filter takes along a footprint; 1 or less, none
 		// 1 when the level's surfaces take their lights as the engine's

@@ -6,6 +6,7 @@
 #include "HeadsetSeat.h"
 #ifdef PATHTRACER_LOCAL
 #include "RayReconstruction.h"
+#include "FsrUpscaler.h"
 #include <cstdarg>
 #endif
 #include <stdexcept>
@@ -371,6 +372,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	DLSSQuality = 1;
 	FsrMode = 1;
 	FsrSharpness = 0.2f;
+	FsrVersion = 4;
 	DetailTextures = 1;
 	// As the other devices have them: the engine's lens flares round lights,
 	// and the game's full effects (see Init).
@@ -434,6 +436,7 @@ void UPathTracerRenderDevice::StaticConstructor()
 	new(GetClass(), TEXT("DLSSQuality"), RF_Public) UIntProperty(CPP_PROPERTY(DLSSQuality), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FSR"), RF_Public) UIntProperty(CPP_PROPERTY(FsrMode), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FSRSharpness"), RF_Public) UFloatProperty(CPP_PROPERTY(FsrSharpness), TEXT("Display"), CPF_Config);
+	new(GetClass(), TEXT("FSRVersion"), RF_Public) UIntProperty(CPP_PROPERTY(FsrVersion), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("Flashlight"), RF_Public) UBoolProperty(CPP_PROPERTY(UseFlashlight), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FlashlightBrightness"), RF_Public) UIntProperty(CPP_PROPERTY(FlashlightBrightness), TEXT("Display"), CPF_Config);
 	new(GetClass(), TEXT("FlashlightHaze"), RF_Public) UIntProperty(CPP_PROPERTY(FlashlightHaze), TEXT("Display"), CPF_Config);
@@ -472,6 +475,7 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 	DenoiseEnabled = UseDenoiser != 0;
 	DlssEnabled = UseDLSS != 0;
 	FsrModeNow = Clamp(FsrMode, 0, 2);
+	FsrVersionNow = FsrVersion == 3 ? 3 : 4;
 	DlssQualityNow = Clamp(DLSSQuality, 0, 4);
 	MaterialsEnabled = UseMaterials != 0;
 	WidescreenFovEnabled = UseWidescreenFOV != 0;
@@ -538,6 +542,11 @@ UBOOL UPathTracerRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, I
 		deviceBuilder.OptionalRayQuery();
 		deviceBuilder.OptionalDescriptorIndexing();
 		for (const std::string& name : ngxDevice)
+			deviceBuilder.OptionalExtension(name);
+		// FSR 4's likewise, wherever offered.
+		std::vector<std::string> fsrDevice;
+		FsrUpscaler::RequiredExtensions(fsrDevice);
+		for (const std::string& name : fsrDevice)
 			deviceBuilder.OptionalExtension(name);
 #else
 		// This device only presents: the tracing is the helper's. What it does
@@ -1814,13 +1823,13 @@ void UPathTracerRenderDevice::LogBench()
 	if (Bench.Results.empty())
 		return;
 	const TraceProtocol::Header* status = (Tracer && Tracer->Alive()) ? &Tracer->Status() : nullptr;
-	static const char* denoisers[] = { "off", "NRD", "DLSS-RR", "NRD+FSR" };
+	static const char* denoisers[] = { "off", "NRD", "DLSS-RR", "NRD+FSR", "NRD+FSR4" };
 	const TCHAR* map = (Viewport && Viewport->Actor && Viewport->Actor->XLevel && Viewport->Actor->XLevel->GetOuter())
 		? Viewport->Actor->XLevel->GetOuter()->GetName() : TEXT("?");
 	char line[512];
 	snprintf(line, sizeof(line), "PT BENCH: %s, %dx%d traced at %ux%u, denoiser %s, materials %s, bounces %d, %d instances, %d lights, vsync %s",
 		Narrow(map).c_str(), TraceWidth, TraceHeight, status ? status->RenderWidth : 0u, status ? status->RenderHeight : 0u,
-		denoisers[Min<uint32_t>(status ? status->DenoisedWith : 0u, 3)], MaterialsEnabled ? "on" : "off", BouncesInUse(),
+		denoisers[Min<uint32_t>(status ? status->DenoisedWith : 0u, 4)], MaterialsEnabled ? "on" : "off", BouncesInUse(),
 		(int)Scene.Instances.size(), (int)Scene.Lights.size(), UsingVsync ? "on" : "off");
 	WriteTimingLine(line);
 	WriteTimingLine("PT BENCH:                                     GPU ms (trace)   collect ms   frame ms   fps    change: GPU, frame");
@@ -2633,6 +2642,7 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				frame.DlssQuality = (uint32_t)DlssQualityInUse();
 				frame.Upscaler = (uint32_t)FsrModeNow;
 				frame.UpscaleSharpness = Clamp(FsrSharpness, 0.0f, 1.0f);
+				frame.UpscalerVersion = (uint32_t)FsrVersionNow;
 				frame.LightSize = (uint32_t)LightSizeNow;
 				frame.MaxAnisotropy = (uint32_t)Clamp(appRound(MaxAnisotropy), 0, 16);
 				frame.Lighting = EngineLightingNow ? 1 : 0;
@@ -3099,12 +3109,12 @@ void UPathTracerRenderDevice::Unlock(UBOOL Blit)
 				{
 					const double g = Timings.GpuFrames;
 					const TraceProtocol::Header& status = Tracer->Status();
-					static const char* denoisers[] = { "off", "NRD", "DLSS-RR", "NRD+FSR" };
+					static const char* denoisers[] = { "off", "NRD", "DLSS-RR", "NRD+FSR", "NRD+FSR4" };
 					snprintf(line, sizeof(line), "PathTracer GPU ms/frame (helper): build %.2f trace %.2f denoise %.2f composite %.2f | total %.2f at %dx%d traced at %ux%u, bounces %d, glossy bounces %d, materials %s, denoiser %s",
 						Timings.GpuBuild / g, Timings.GpuTrace / g, Timings.GpuDenoise / g, Timings.GpuComposite / g,
 						(Timings.GpuBuild + Timings.GpuTrace + Timings.GpuDenoise + Timings.GpuComposite) / g,
 						TraceWidth, TraceHeight, status.RenderWidth, status.RenderHeight, BouncesInUse(), (int)GlossBounces,
-						MaterialsEnabled ? "on" : "off", denoisers[Min<uint32_t>(status.DenoisedWith, 3)]);
+						MaterialsEnabled ? "on" : "off", denoisers[Min<uint32_t>(status.DenoisedWith, 4)]);
 					WriteTimingLine(line);
 				}
 			}
@@ -3307,6 +3317,7 @@ UPathTracerRenderDevice::AppliedConfigState UPathTracerRenderDevice::CurrentConf
 	state.NeutralToneMap = NeutralToneMap != 0;
 	state.DlssQuality = Clamp(DLSSQuality, 0, 4);
 	state.FsrMode = Clamp(FsrMode, 0, 2);
+	state.FsrVersion = FsrVersion == 3 ? 3 : 4;
 	state.LightSize = Clamp(LightSize, 0, 255);
 	state.Bits = ConfiguredBits();
 	return state;
@@ -3341,6 +3352,11 @@ void UPathTracerRenderDevice::ApplyConfigChanges()
 	if (now.FsrMode != was.FsrMode)
 	{
 		FsrModeNow = now.FsrMode;
+		restart = true;
+	}
+	if (now.FsrVersion != was.FsrVersion)
+	{
+		FsrVersionNow = now.FsrVersion;
 		restart = true;
 	}
 	if (now.Materials != was.Materials)
@@ -3383,15 +3399,17 @@ FString UPathTracerRenderDevice::DescribeDenoiser() const
 	const char* status = Tracer->Status().DlssStatus;
 	// What the last frame was denoised with says whether FSR took the
 	// picture up to size.
-	const bool upscaled = Tracer->Status().DenoisedWith == TraceProtocol::DenoiseNrdFsr;
+	const uint32_t with = Tracer->Status().DenoisedWith;
+	const bool upscaled = with == TraceProtocol::DenoiseNrdFsr || with == TraceProtocol::DenoiseNrdFsr4;
+	const TCHAR* fsr = with == TraceProtocol::DenoiseNrdFsr4 ? TEXT("FSR 4") : with == TraceProtocol::DenoiseNrdFsr ? TEXT("FSR 3.1") : TEXT("FSR");
 	if (FsrModeNow == 2)
-		return FString::Printf(TEXT("denoising with NRD and upscaling with FSR 3.1, %s%s"), *quality, upscaled ? TEXT("") : TEXT(" (not running yet, or unavailable: see PathTracerHelper.log)"));
+		return FString::Printf(TEXT("denoising with NRD and upscaling with %s, %s%s"), fsr, *quality, upscaled ? TEXT("") : TEXT(" (not running yet, or unavailable: see PathTracerHelper.log)"));
 	// Started the first time a frame asks for it, so on the frame after this
 	// one; until then there is nothing to report either way.
 	if (!strcmp(status, "ready") || !strcmp(status, "not asked for yet"))
 		return FString::Printf(TEXT("denoising with DLSS Ray Reconstruction, %s"), *quality);
 	if (upscaled)
-		return FString::Printf(TEXT("DLSS Ray Reconstruction cannot run (%s): denoising with NRD and upscaling with FSR 3.1, %s"), *Widen(status), *quality);
+		return FString::Printf(TEXT("DLSS Ray Reconstruction cannot run (%s): denoising with NRD and upscaling with %s, %s"), *Widen(status), fsr, *quality);
 	return FString::Printf(TEXT("DLSS Ray Reconstruction asked for, %s, but NRD stands in: %s"), *quality, *Widen(status));
 }
 
@@ -4170,27 +4188,38 @@ UBOOL UPathTracerRenderDevice::Exec(const TCHAR* Cmd, FOutputDevice& Ar)
 			Ar.Logf(TEXT("PT: %s  (PT DLSS [DLAA | QUALITY | BALANCED | PERFORMANCE | ULTRAPERFORMANCE])"), *DescribeDenoiser());
 			handled = true;
 		}
-		// FSR 3.1: never, where Ray Reconstruction cannot run, or always in
-		// its place; on its own, from one to the next.
+		// FSR: never, where Ray Reconstruction cannot run, or always in
+		// its place; on its own, from one to the next. 3 or 4 picks which
+		// FSR instead, 4 wherever it runs.
 		if (ParseCommand(&Cmd, TEXT("FSR")))
 		{
-			if (ParseCommand(&Cmd, TEXT("OFF")))
-				FsrModeNow = 0;
-			else if (ParseCommand(&Cmd, TEXT("AUTO")))
-				FsrModeNow = 1;
-			else if (ParseCommand(&Cmd, TEXT("ON")))
-				FsrModeNow = 2;
-			else
-				FsrModeNow = (FsrModeNow + 1) % 3;
-			// FSR upscales NRD's picture: on, it asks for denoising.
-			if (FsrModeNow == 2)
+			const int version = ParseCommand(&Cmd, TEXT("3")) ? 3 : ParseCommand(&Cmd, TEXT("4")) ? 4 : 0;
+			if (version)
 			{
-				DenoiseEnabled = true;
-				DlssEnabled = true;
+				FsrVersionNow = version;
+				DenoiseRestart = true;
+				Ar.Logf(TEXT("PT: FSR %s wherever it runs; %s  (PT FSR [3 | 4])"), version == 3 ? TEXT("3.1") : TEXT("4"), *DescribeDenoiser());
 			}
-			DenoiseRestart = true;
-			static const TCHAR* modes[] = { TEXT("off"), TEXT("where Ray Reconstruction cannot run"), TEXT("always") };
-			Ar.Logf(TEXT("PT: FSR %s; %s  (PT FSR [OFF | AUTO | ON])"), modes[FsrModeNow], *DescribeDenoiser());
+			else
+			{
+				if (ParseCommand(&Cmd, TEXT("OFF")))
+					FsrModeNow = 0;
+				else if (ParseCommand(&Cmd, TEXT("AUTO")))
+					FsrModeNow = 1;
+				else if (ParseCommand(&Cmd, TEXT("ON")))
+					FsrModeNow = 2;
+				else
+					FsrModeNow = (FsrModeNow + 1) % 3;
+				// FSR upscales NRD's picture: on, it asks for denoising.
+				if (FsrModeNow == 2)
+				{
+					DenoiseEnabled = true;
+					DlssEnabled = true;
+				}
+				DenoiseRestart = true;
+				static const TCHAR* modes[] = { TEXT("off"), TEXT("where Ray Reconstruction cannot run"), TEXT("always") };
+				Ar.Logf(TEXT("PT: FSR %s; %s  (PT FSR [OFF | AUTO | ON | 3 | 4])"), modes[FsrModeNow], *DescribeDenoiser());
+			}
 			handled = true;
 		}
 		if (ParseCommand(&Cmd, TEXT("DENOISE")))

@@ -955,10 +955,16 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 	if (wantFsr && !FsrTried)
 	{
 		FsrTried = true;
-		Fsr.reset(new FsrUpscaler(Device));
+		wchar_t exe[MAX_PATH] = {};
+		GetModuleFileNameW(nullptr, exe, MAX_PATH);
+		std::wstring dir = exe;
+		dir = dir.substr(0, dir.find_last_of(L'\\'));
+		Fsr.reset(new FsrUpscaler(Device, dir));
 		debugf("PathTracer FSR: %s", Fsr->Status());
 	}
 	const bool useFsr = wantFsr && Fsr && Fsr->Available();
+	if (Fsr)
+		Fsr->Prefer(frame.UpscalerVersion == 3 ? 3 : 4);
 
 	// The views: the screen's, or the headset's eyes. Going from one to the
 	// other, every view's history describes some other view.
@@ -1248,7 +1254,7 @@ bool TraceRenderer::Record(VulkanCommandBuffer* commands, const TraceProtocol::T
 				const float fovY = 2.0f * std::atan(length(up));
 				if (Fsr->Evaluate(commands, v, fsrInputs, view.TraceWidth, view.TraceHeight, view.OutputWidth, view.OutputHeight,
 					jitter, restart, frameMs, fsrNear, fovY, frame.UnitsPerMetre > 0.0f ? frame.UnitsPerMetre : 52.5f, frame.UpscaleSharpness))
-					denoisedWith = DenoiseNrdFsr;
+					denoisedWith = Fsr->Version() == 4 ? DenoiseNrdFsr4 : DenoiseNrdFsr;
 				VkMemoryBarrier upscaled = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
 				upscaled.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
 				upscaled.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;

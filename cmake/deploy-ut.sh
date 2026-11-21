@@ -46,6 +46,10 @@ copy() {
 copy "$BUILD_DIR/PathTracerDrv.dll"
 copy "$SRC/PathTracerDrv.int"
 [ -f "$BUILD_DIR/nvngx_dlssd.dll" ] && copy "$BUILD_DIR/nvngx_dlssd.dll"
+# AMD's FSR 4, loaded from beside the game's executable, with its licence.
+for f in amd_fidelityfx_loader_vk.dll amd_fidelityfx_upscaler_vk.dll amd_fidelityfx_license.md; do
+	[ -f "$BUILD_DIR/$f" ] && copy "$BUILD_DIR/$f"
+done
 
 case "$SELECT" in
 	pathtracer) DEV="PathTracerDrv.PathTracerRenderDevice" ;;

@@ -165,6 +165,10 @@ public:
 	// default). PT FSR [OFF | AUTO | ON] switches it for the session.
 	INT FsrMode;
 	FLOAT FsrSharpness;
+	// Which FSR: 4 (the default), AMD's machine-learned FSR 4 wherever its
+	// DLLs offer it for the GPU - an AMD GPU of RDNA 2 or later - and 3.1
+	// everywhere else; 3, FSR 3.1 always. PT FSR [3 | 4] for the session.
+	INT FsrVersion;
 	// Use the S3TC textures a package carries beside its originals - New
 	// Vision's, eight times the size - as OpenGLDrv's UseS3TC does. On by
 	// default: a package without them is unaffected. Only the trace reads
@@ -308,7 +312,7 @@ private:
 	struct AppliedConfigState
 	{
 		bool Denoise, Dlss, Materials, EngineLighting, NeutralToneMap;
-		int DlssQuality, FsrMode, LightSize;
+		int DlssQuality, FsrMode, FsrVersion, LightSize;
 		uint32_t Bits;
 	} AppliedConfig = {};
 	AppliedConfigState CurrentConfig() const;
@@ -424,6 +428,7 @@ private:
 	bool DlssEnabled = true;
 	int DlssQualityNow = 1;
 	int FsrModeNow = 1;
+	int FsrVersionNow = 4;
 	// What a frame is traced with: VR's own (HeadsetDlssQuality,
 	// HeadsetBounces) while it is on, otherwise the screen's.
 	int DlssQualityInUse() const { return Clamp(HeadsetNow ? (int)HeadsetDlssQuality : DlssQualityNow, 0, 4); }

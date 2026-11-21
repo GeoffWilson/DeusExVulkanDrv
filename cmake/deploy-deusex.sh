@@ -59,6 +59,15 @@ if [ -f "$BUILD_DIR/PathTracerDrv.dll" ]; then
 			cp "$HELPER_DIR/nvngx_dlssd.dll" "$SYSTEM_DIR/"
 			installed+=("nvngx_dlssd")
 		fi
+		# AMD's FSR 4, when the helper was built with it: the helper loads
+		# the loader from beside itself, and the loader the upscaler; the
+		# licence they ship under goes with them.
+		for f in amd_fidelityfx_loader_vk.dll amd_fidelityfx_upscaler_vk.dll amd_fidelityfx_license.md; do
+			if [ -f "$HELPER_DIR/$f" ]; then
+				cp "$HELPER_DIR/$f" "$SYSTEM_DIR/"
+				installed+=("${f%.*}")
+			fi
+		done
 		# The OpenXR loader, when the helper was built for headsets: the
 		# helper opens it from beside itself when VR is asked for.
 		if [ -f "$HELPER_DIR/openxr_loader.dll" ]; then

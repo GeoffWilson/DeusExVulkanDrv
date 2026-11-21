@@ -276,3 +276,38 @@ The path tracer now uses it (`DLSS=True`). In the game, from Steam under
 Proton-CachyOS, the helper inherits what it needs from the game: NGX found its
 core through the environment Proton sets
 (`/run/host/usr/lib/nvidia/wine`) and Ray Reconstruction ran.
+
+## fsr4check
+
+Does AMD's FSR 4 run from the helper's process on this machine?
+
+FidelityFX SDK v2.4.0 brought FSR 4 to Vulkan as signed Windows DLLs, and AMD
+says nothing about RADV or Proton. This makes a Vulkan 1.3 device with the
+extensions the upscaler DLL names (`VK_KHR_cooperative_matrix`,
+`VK_KHR_shader_float16_int8`, `VK_EXT_subgroup_size_control`), asks the loader
+which upscalers it offers for that device, and for each one makes a context,
+upscales a flat colour for 70 frames, times the dispatches and reads the
+middle pixel back.
+
+```sh
+cmake/fetch-fsr4.sh
+cmake --build build-x64 --target fsr4check     # copies the two DLLs beside it
+fsr4check.exe [outputWidth outputHeight [scale [--all]]]
+```
+
+On the Steam Machine (Navi 33, RADV, Mesa 26.2-devel) under Proton-CachyOS,
+2026-11-21:
+
+	upscalers offered without the device (0): [3.1.6] [2.3.4]
+	upscalers offered with the device (0): [4.1.2] [3.1.6] [2.3.4]
+	1920x1080 from 960x540 (2.00x)
+	  4.1.2: median 3.765 ms  => WORKS
+	  3.1.6: median 0.938 ms  => WORKS
+	  2.3.4: median 0.845 ms  => WORKS
+
+FSR 4's cost follows the output size, not the render size: 3.73 ms from 720p,
+3.65 from 360p, 13.99 ms for 4K output from 1080p. On an RTX 4090 under wine
+only 3.1.6 and 2.3.4 are offered. FSR 4 is listed only when the query is
+given the device.
+
+The path tracer now uses it (`FSRVersion=4`, the default).

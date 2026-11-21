@@ -135,8 +135,8 @@ the helper builds without the denoiser and `PT DENOISE` says it is missing.
 
 For GPUs Ray Reconstruction cannot run on, the helper can upscale NRD's
 picture with AMD's FSR 3.1, built in from FidelityFX SDK v1.1.4 - the last
-with a Vulkan backend; the FSR 4 SDKs are DirectX 12 only. Fetch it once,
-before configuring:
+with a Vulkan backend of the open-source kind - and, on AMD GPUs of RDNA 2 or
+later, with FSR 4. Fetch it once, before configuring:
 
 ```sh
 cmake/fetch-fsr.sh          # into ../.fsr, beside .xwin; needs wine
@@ -150,6 +150,26 @@ passes as the SDK's own build does, into `../.fsr/generated`. Configure
 share are built as `ffx_fsr3upscaler.lib`, against ZVulkan's Vulkan headers,
 with `volk/volk.h` forced in so the backend's own Vulkan calls go through
 volk. `PathTracerHelperTest --fsr quality` runs it on any GPU.
+
+FSR 4 came to Vulkan in FidelityFX SDK v2.4.0, as AMD's signed DLLs only:
+
+```sh
+cmake/fetch-fsr4.sh         # into ../.fsr4: the ffx-api headers and the two _vk DLLs
+```
+
+It takes only the headers, `amd_fidelityfx_loader_vk.dll`,
+`amd_fidelityfx_upscaler_vk.dll` (36 MB) and the licence. With FSR 3.1 also
+fetched, CMake reports `PathTracerHelper: FSR 4`, builds `Fsr4Upscaler.cpp`
+against the headers, and copies the DLLs and `amd_fidelityfx_license.md`
+beside the helper (and beside `PathTracerDrv.dll` for UT 469); the deploy
+scripts take them from there. At run time the helper loads the loader from
+beside itself and asks it, for the game's GPU, which upscalers it offers; if
+FSR 4 is one of them, the frames go to it instead of 3.1. The device is made
+with the extensions FSR 4's shaders use (cooperative matrices, int8/fp16,
+fp8 on RDNA 4, subgroup size control), wherever they are offered.
+`PathTracerHelperTest --fsr quality --fsr-version 3|4` picks between the two,
+and `spike/fsr4check` (`cmake --build build-x64 --target fsr4check`) answers
+whether FSR 4 runs on a machine at all, without the helper.
 
 ### DLSS Ray Reconstruction
 

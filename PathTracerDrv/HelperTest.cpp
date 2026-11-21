@@ -7,7 +7,7 @@
 // semaphores. What it cannot check is the engine's end - LevelScene and the
 // textures - which only the game can.
 //
-//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--fsr quality] [--still] [--pan d] [--pan-angle a]
+//   PathTracerHelperTest.exe [frames] [width] [height] [--dlss quality] [--fsr quality] [--fsr-version 3|4] [--still] [--pan d] [--pan-angle a]
 //                            [--lightsize radius] [--reference] [--backlight]
 //                            [--fog] [--flashlight] [--dark] [--glow] [--glow-unsampled]
 //                            [--photo aperture] [--glass] [--wet percent] [--view n]
@@ -19,7 +19,8 @@
 // --dlss denoises with DLSS Ray Reconstruction at that quality (0 DLAA to
 // 4 ultra performance) rather than NRD, where it can run. --fsr denoises
 // with NRD at the render size that quality gives and upscales with AMD's
-// FSR 3.1, on any GPU.
+// FSR - FSR 4 where AMD's DLLs offer it for the GPU, otherwise 3.1, on any
+// GPU; --fsr-version 3 asks for 3.1 regardless.
 //
 // --lights crowds the scene with n more lights, each reaching all of it, so
 // every cell of the light grid holds them all, and the trace draws from a
@@ -141,6 +142,7 @@ void VulkanError(const char* text)
 // Built with the tracing in it (PathTracerLocalTest), as a 64-bit game's
 // device is: its log comes here.
 #include "RayReconstruction.h"
+#include "FsrUpscaler.h"
 #include <cstdarg>
 void HelperLog(const char* format, ...)
 {
@@ -220,6 +222,7 @@ int main(int argc, char** argv)
 	std::vector<const char*> args;
 	int dlss = -1;
 	int fsr = -1;
+	int fsrVersion = 4;
 	bool still = false, reference = false, backlight = false, detail = false, bc1 = false;
 	uint32_t lightSize = 0;
 	uint32_t engineLighting = 0;
@@ -247,6 +250,8 @@ int main(int argc, char** argv)
 			dlss = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--fsr") && i + 1 < argc)
 			fsr = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--fsr-version") && i + 1 < argc)
+			fsrVersion = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--still"))
 			still = true;
 		else if (!strcmp(argv[i], "--pan") && i + 1 < argc)
@@ -340,6 +345,10 @@ int main(int argc, char** argv)
 		builder.OptionalRayQuery();
 		builder.OptionalDescriptorIndexing();
 		for (const std::string& name : ngxDevice)
+			builder.OptionalExtension(name);
+		std::vector<std::string> fsrDevice;
+		FsrUpscaler::RequiredExtensions(fsrDevice);
+		for (const std::string& name : fsrDevice)
 			builder.OptionalExtension(name);
 #else
 		auto instance = VulkanInstanceBuilder().Create();
@@ -799,6 +808,7 @@ int main(int argc, char** argv)
 		frame.Lighting = engineLighting;
 		frame.DlssQuality = (uint32_t)std::max(fsr >= 0 ? fsr : dlss, 0);
 		frame.Upscaler = fsr >= 0 ? TraceProtocol::UpscaleAlways : TraceProtocol::UpscaleNone;
+		frame.UpscalerVersion = (uint32_t)fsrVersion;
 		frame.Materials = (uint32_t)materials;
 		frame.DisableBits = (fogUnshadowed ? 65536u : 0u) | (glowUnsampled ? 262144u : 0u) | (everyLight ? 2097152u : 0u) | (neutral ? 8192u : 0u);
 		frame.ToneCeiling = toneCeiling;
@@ -1112,10 +1122,10 @@ int main(int argc, char** argv)
 			}
 			if (i == 0 || i == frames / 2 || i == frames - 1)
 			{
-				static const char* denoisers[] = { "none", "NRD", "DLSS-RR", "NRD+FSR" };
+				static const char* denoisers[] = { "none", "NRD", "DLSS-RR", "NRD+FSR", "NRD+FSR4" };
 				printf("frame %d: %ux%u traced at %ux%u, %u lights, %u textures, %u shapes, %u instances, denoised with %s (NRD %s, DLSS %s), GPU build %.2f trace %.2f denoise %.2f composite %.2f ms%s\n",
 					i, client.OutputWidth(), client.OutputHeight(), s.RenderWidth, s.RenderHeight, s.LightCount, s.TextureCount, s.BottomCount, s.InstanceCount,
-					denoisers[std::min(s.DenoisedWith, 3u)], s.DenoiserStatus, s.DlssStatus, s.GpuBuildMs, s.GpuTraceMs, s.GpuDenoiseMs, s.GpuCompositeMs,
+					denoisers[std::min(s.DenoisedWith, 4u)], s.DenoiserStatus, s.DlssStatus, s.GpuBuildMs, s.GpuTraceMs, s.GpuDenoiseMs, s.GpuCompositeMs,
 					s.GpuTimed ? "" : " (not timed)");
 			}
 		}

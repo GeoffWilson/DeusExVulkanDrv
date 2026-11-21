@@ -682,7 +682,7 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   run; on by default, at Quality. `DLSSQuality` is how far it upscales: 0 DLAA
   (not at all), 1 Quality, 2 Balanced, 3 Performance, 4 Ultra Performance.
   `PT DLSS` switches it for the session.
-- `FSR`: AMD's FSR 3.1 upscaler. Where Ray Reconstruction cannot run - any AMD
+- `FSR`: AMD's FSR upscaler. Where Ray Reconstruction cannot run - any AMD
   or Intel GPU - the trace and NRD run at the size `DLSSQuality` gives and FSR
   brings the picture up to the screen's, at the same ratios (0 native, 1
   Quality 1.5x, 2 Balanced 1.7x, 3 Performance 2x, 4 Ultra Performance 3x).
@@ -690,6 +690,14 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   its place. `FSRSharpness`, 0 to 1, sharpens what it gives; 0.2 by default.
   On the Steam Machine (Navi 33) at 1080p it took the test scene from 20.2 ms
   a frame to 10.0 at Quality and 6.0 at Performance.
+- `FSRVersion`: which FSR. 4 (the default) is AMD's machine-learned FSR 4
+  wherever its DLLs offer it for the GPU - an AMD GPU of RDNA 2 or later, on
+  Windows or under Proton with RADV - and FSR 3.1 everywhere else; 3 is FSR
+  3.1 always. FSR 4 is sharper and steadier at edges, but it costs more: on the
+  Steam Machine it takes about 3.7 ms at 1080p output where 3.1 takes 0.9,
+  and about 14 ms at 4K. The helper's log says which one runs. In the game on
+  the Steam Machine (November 2026) even Ultra Performance looked acceptable
+  with FSR 4, at around 80-90 fps.
 - `LogTimings`: logs where each frame's time goes, averaged every few hundred
   frames: the CPU's side and the helper's, the GPU's own time on the scene
   build, the trace, the denoiser and the pass that puts the picture back
@@ -901,7 +909,8 @@ In the `[PathTracerDrv.PathTracerRenderDevice]` section:
   the quality is the headset's (`VRDLSSQuality`).
 - `PT FSR [OFF | AUTO | ON]`: FSR never, where Ray Reconstruction cannot run,
   or always, in Ray Reconstruction's place even where it could run; on its own,
-  from one to the next. Its quality is `PT DLSS`'s.
+  from one to the next. Its quality is `PT DLSS`'s. `PT FSR 3` and `PT FSR 4`
+  pick which FSR for the session, as `FSRVersion` does.
 - `PT LIGHTING [ENGINE | LINEAR]`: the level lit as `Lighting` says, or the
   other way.
 - `PT EXPOSURE n`, `PT TONEMAP`: the exposure, as `Exposure`, and the tone
@@ -1043,7 +1052,12 @@ it as a 64 bit library for the helper (and a 32 bit one as well), and
 `cmake/fetch-dlss.sh` fetches a pinned release of the DLSS SDK: NGX's loader,
 which the helper links, and Ray Reconstruction's runtime, `nvngx_dlssd.dll`,
 which goes beside it. `cmake/fetch-fsr.sh` fetches AMD's FidelityFX SDK v1.1.4
-and compiles FSR 3.1's shaders, which the helper builds in. Without any of
+and compiles FSR 3.1's shaders, which the helper builds in, and
+`cmake/fetch-fsr4.sh` fetches FidelityFX SDK v2.4.0's FSR 4 for Vulkan: AMD's
+signed DLLs, `amd_fidelityfx_loader_vk.dll` and
+`amd_fidelityfx_upscaler_vk.dll`, which go beside the helper with their
+licence (`amd_fidelityfx_license.md`, which a release must carry); FSR 4 is
+built in only alongside FSR 3.1, its fallback. Without any of
 them the path tracer still builds and runs, just without that denoiser or
 upscaler. See
 [cmake/README-crossbuild.md](cmake/README-crossbuild.md).

@@ -1,5 +1,6 @@
 #include "TracePrecomp.h"
 #include "FsrUpscaler.h"
+#include "Fsr4Upscaler.h"
 
 void HelperLog(const char* format, ...);
 
@@ -71,8 +72,28 @@ vec2 FsrUpscaler::Jitter(uint32_t frame, uint32_t renderWidth, uint32_t outputWi
 	return vec2(x, y);
 }
 
-FsrUpscaler::FsrUpscaler(VulkanDevice* device) : Device(device), I(new Impl())
+void FsrUpscaler::RequiredExtensions(std::vector<std::string>& device)
 {
+	Fsr4Upscaler::RequiredExtensions(device);
+}
+
+bool FsrUpscaler::Available() const
+{
+	return Ready || (Fsr4 && Fsr4->Available());
+}
+
+int FsrUpscaler::Version() const
+{
+	if (Fsr4 && Fsr4->Available() && (Wanted >= 4 || !Ready))
+		return 4;
+	return Ready ? 3 : 0;
+}
+
+FsrUpscaler::FsrUpscaler(VulkanDevice* device, const std::wstring& dllDir) : Device(device), I(new Impl())
+{
+	Fsr4.reset(new Fsr4Upscaler(device, dllDir));
+	HelperLog("PathTracer FSR 4: %s", Fsr4->Status());
+
 	VkDeviceContext context = {};
 	context.vkDevice = device->device;
 	context.vkPhysicalDevice = device->PhysicalDevice.Device;
@@ -83,10 +104,14 @@ FsrUpscaler::FsrUpscaler(VulkanDevice* device) : Device(device), I(new Impl())
 	if (r != FFX_OK)
 	{
 		StatusText = "the FidelityFX Vulkan backend did not start (" + std::to_string((int)r) + ")";
+		if (Fsr4->Available())
+			StatusText = std::string(Fsr4->Status()) + "; FSR 3.1: " + StatusText;
 		return;
 	}
 	const FfxVersionNumber version = ffxFsr3UpscalerGetEffectVersion();
 	StatusText = "FSR " + std::to_string((version >> 22) & 1023) + "." + std::to_string((version >> 12) & 1023) + "." + std::to_string(version & 4095) + " ready";
+	if (Fsr4->Available())
+		StatusText = std::string(Fsr4->Status()) + ", and " + StatusText;
 	Ready = true;
 }
 
@@ -94,6 +119,7 @@ FsrUpscaler::~FsrUpscaler()
 {
 	for (int v = 0; v < MaxViews; v++)
 		ReleaseContext(v);
+	Fsr4.reset();
 }
 
 void FsrUpscaler::ReleaseContext(int view)
@@ -109,7 +135,15 @@ void FsrUpscaler::ReleaseContext(int view)
 
 bool FsrUpscaler::NeedsContext(int view, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight) const
 {
-	if (!Ready || view < 0 || view >= MaxViews)
+	if (view < 0 || view >= MaxViews)
+		return false;
+	// Going from one FSR to the other drops the context of the one before.
+	const int version = Version();
+	if (version != ViewVersion[view] && ViewVersion[view] != 0)
+		return true;
+	if (version == 4)
+		return Fsr4->NeedsContext(view, renderWidth, renderHeight, outputWidth, outputHeight);
+	if (!Ready)
 		return false;
 	const Impl::View& v = I->Views[view];
 	return !v.Made || v.Render[0] != renderWidth || v.Render[1] != renderHeight || v.Output[0] != outputWidth || v.Output[1] != outputHeight;
@@ -135,7 +169,22 @@ bool FsrUpscaler::Evaluate(VulkanCommandBuffer* commands, int view, const Inputs
 	uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight,
 	vec2 jitter, bool reset, float frameMs, float nearPlane, float fovY, float unitsPerMetre, float sharpness)
 {
-	if (!Ready || view < 0 || view >= MaxViews || !inputs.Color.Image || !inputs.Depth.Image || !inputs.Motion.Image || !inputs.Output.Image)
+	if (view < 0 || view >= MaxViews)
+		return false;
+	const int version = Version();
+	if (version != ViewVersion[view])
+	{
+		if (ViewVersion[view] == 4)
+			Fsr4->ReleaseContext(view);
+		else if (ViewVersion[view] == 3)
+			ReleaseContext(view);
+		ViewVersion[view] = version;
+		reset = true;
+	}
+	if (version == 4)
+		return Fsr4->Evaluate(commands, view, inputs, renderWidth, renderHeight, outputWidth, outputHeight,
+			jitter, reset, frameMs, nearPlane, fovY, unitsPerMetre, sharpness);
+	if (!Ready || !inputs.Color.Image || !inputs.Depth.Image || !inputs.Motion.Image || !inputs.Output.Image)
 		return false;
 
 	Impl::View& v = I->Views[view];
@@ -224,8 +273,11 @@ bool FsrUpscaler::Evaluate(VulkanCommandBuffer* commands, int view, const Inputs
 #else
 
 struct FsrUpscaler::Impl {};
-FsrUpscaler::FsrUpscaler(VulkanDevice* device) : Device(device) { StatusText = "built without the FidelityFX SDK (see cmake/fetch-fsr.sh)"; }
+FsrUpscaler::FsrUpscaler(VulkanDevice* device, const std::wstring&) : Device(device) { StatusText = "built without the FidelityFX SDK (see cmake/fetch-fsr.sh)"; }
 FsrUpscaler::~FsrUpscaler() {}
+void FsrUpscaler::RequiredExtensions(std::vector<std::string>&) {}
+bool FsrUpscaler::Available() const { return false; }
+int FsrUpscaler::Version() const { return 0; }
 void FsrUpscaler::ReleaseContext(int) {}
 void FsrUpscaler::RenderSize(uint32_t width, uint32_t height, int, uint32_t& renderWidth, uint32_t& renderHeight) { renderWidth = width; renderHeight = height; }
 vec2 FsrUpscaler::Jitter(uint32_t, uint32_t, uint32_t) { return vec2(0.0f, 0.0f); }
